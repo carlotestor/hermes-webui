@@ -495,6 +495,275 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
     return projected
 
 
+# Safety belt for the ancestor walk below. Real delegation nests at most
+# ``max_spawn_depth`` (2) levels, so 8 hops is far beyond any legitimate chain;
+# it exists purely so a corrupt/cyclic ``parent_session_id`` chain in state.db
+# can never spin the sidebar request forever.
+_SUBAGENT_ANCESTOR_MAX_HOPS = 8
+
+
+def _rescue_row_source(row: dict) -> str:
+    """Return the raw source name used by the ancestor-rescue stop rules.
+
+    ``_with_normalized_source`` collapses unknown raws (including ``subagent``)
+    into ``session_source='other'``, so the coarse bucket cannot drive these
+    rules. Read the raw value the SQL filters also see, falling back to the
+    normalized copies for rows that only carry those.
+    """
+    for key in ('source', 'raw_source', 'session_source'):
+        name = _normalize_source_name(row.get(key))
+        if name:
+            return name
+    return ""
+
+
+def _rescue_row_passes_source_filters(
+    row: dict,
+    included: tuple[str, ...],
+    excluded: tuple[str, ...],
+) -> bool:
+    """Mirror this call's own ``include_sources``/``exclude_sources`` SQL filter.
+
+    An ancestor rescued from outside the candidate window must never smuggle a
+    source the caller explicitly filtered out (e.g. a cron/webhook parent) past
+    that filter. Compared exactly (case-sensitively) against the raw
+    ``sessions.source`` value, because that is precisely what the ``s.source IN
+    (...)`` / ``s.source NOT IN (...)`` clauses compare.
+    """
+    source = str(row.get('source') or '')
+    if included and source not in included:
+        return False
+    if excluded and source in excluded:
+        return False
+    return True
+
+
+def _index_rows_for_ancestor_lookup(rows: list[dict]) -> dict[str, dict]:
+    """Map every id a ``parent_session_id`` may point at to its projected row.
+
+    ``_project_agent_session_rows`` collapses a compression chain into ONE row
+    whose ``id`` is the latest importable segment, so a ``parent_session_id``
+    that names the chain head (or any middle segment) will not match any
+    projected ``id``. Index the lineage root/tip aliases as well so such a
+    parent resolves to the row that actually represents that conversation
+    instead of being re-fetched and emitted as a duplicate sidebar row.
+    Real ids win over aliases: fill them first, then alias with ``setdefault``.
+    """
+    index: dict[str, dict] = {}
+    for row in rows:
+        row_id = row.get('id')
+        if row_id:
+            index[str(row_id)] = row
+    for row in rows:
+        for alias in (row.get('_lineage_root_id'), row.get('_lineage_tip_id')):
+            if alias:
+                index.setdefault(str(alias), row)
+    return index
+
+
+def _fetch_ancestor_session_rows(
+    cur,
+    session_ids: list[str],
+    *,
+    select_sql: str,
+    join_clause: str,
+    group_by_clause: str,
+    log=None,
+) -> list[dict]:
+    """Read specific ancestor sessions with the main projection's columns.
+
+    Reuses the caller's already-open READ-ONLY cursor (#5455: the listing path
+    must not open a write-capable handle on the live WAL state.db) and the very
+    same ``select_sql``/join/group-by the main query built, so a rescued row
+    carries byte-identical columns to a row that made the window on its own.
+
+    Ids are bound as parameters, never interpolated (see
+    ``tests/test_issue3930_source_filter_pushdown.py``, which asserts the
+    listing path pushes filters down as bound parameters).
+
+    Any ``sqlite3.Error`` degrades to "no rescue" rather than propagating: this
+    function is the ONLY source of agent rows for the sidebar, so an exception
+    escaping here would empty the sidebar entirely — strictly worse than the
+    orphaned-child rendering this rescue exists to fix.
+    """
+    ids = [str(sid) for sid in session_ids if sid]
+    if not ids:
+        return []
+    placeholders = ", ".join("?" for _ in ids)
+    try:
+        cur.execute(
+            f"""
+            {select_sql}
+            FROM sessions s
+            {join_clause}
+            WHERE s.id IN ({placeholders})
+            {group_by_clause}
+            """,
+            ids,
+        )
+        return [dict(row) for row in cur.fetchall()]
+    except sqlite3.Error as exc:
+        (log or logger).warning(
+            "subagent ancestor rescue lookup failed (%s); listing %d subagent parent id(s) "
+            "un-rescued this pass",
+            exc,
+            len(ids),
+        )
+        return []
+
+
+def _rescue_missing_subagent_ancestors(
+    selected: list[dict],
+    projected: list[dict],
+    candidate_rows: list[dict],
+    cur,
+    *,
+    select_sql: str,
+    join_clause: str,
+    group_by_clause: str,
+    included: tuple[str, ...] = (),
+    excluded: tuple[str, ...] = (),
+    log=None,
+) -> list[dict]:
+    """Re-add the parent rows a visible ``subagent`` row needs to stay nested.
+
+    Why this exists: the sidebar window is recency-ordered and hard-sliced at
+    ``limit`` (20 for ``get_cli_sessions``). A frozen ``delegate_task``
+    orchestrator stops writing messages the moment its leaves take over, so the
+    still-streaming leaves keep the recency they inherited while the quiet
+    orchestrator parent sinks below the cut — recency-window eviction. The leaf
+    still carries ``relationship_type='child_session'`` + ``parent_session_id``,
+    but with the parent ROW gone from the payload
+    ``static/sessions.js::_attachChildSessionsToSidebarRows`` cannot resolve
+    ``visibleBySid.get(parentSid)`` and promotes the leaf to a contextless
+    top-level "Subagent Session" row with a branch icon.
+
+    Contract: if a ``source='subagent'`` row is returned, every ancestor on its
+    ``parent_session_id`` chain is returned too, unless the walk legitimately
+    stops (see the stop rules below). Ancestors are ADDED, never substituted:
+    a visible leaf is never evicted to make room for its parent, so the returned
+    list MAY exceed ``limit`` by the number of rescued ancestors. That is
+    intended — an over-long list renders correctly, a half-nested one does not.
+
+    Stop rules (break the walk, append nothing further):
+      * parent row missing/deleted, or not projectable (e.g. zero messages, so
+        ``_project_agent_session_rows`` drops it) — an unprojectable parent
+        leaves the leaf orphaned exactly as it is today (pre-existing
+        behaviour), and continuing to the grandparent would not help because the
+        client nests strictly by ``parent_session_id``.
+      * parent is a WebUI session — do NOT append. The WebUI parent chat is
+        already in the ``/api/sessions`` payload from its own JSON sidecar
+        (``all_sessions()``); a second state.db projection of it would render as
+        a ghost CLI duplicate (see ``represented_webui_ids`` /
+        ``_is_duplicate_webui_state_projection`` in ``api/routes.py``).
+      * parent's source is filtered out by this call's own
+        ``include_sources``/``exclude_sources``.
+      * parent fails ``is_cli_session_row_visible()``.
+      * parent already present in the result (contract already satisfied).
+      * the chain revisits an id (cycle) or exceeds ``_SUBAGENT_ANCESTOR_MAX_HOPS``.
+
+    No-op guarantee: when the selected window holds no ``subagent`` row, the
+    ORIGINAL ``selected`` list object is returned untouched and no extra SQL is
+    issued, so non-delegating deployments see byte-identical output and cost.
+    """
+    if not selected:
+        return selected
+
+    # Only walk parents of rows ALREADY selected — never import the whole
+    # subagent table. No subagent leaf in the window ⇒ nothing can be orphaned.
+    walks: list[tuple[str, set[str]]] = []
+    for row in selected:
+        if _rescue_row_source(row) != 'subagent':
+            continue
+        parent_id = row.get('parent_session_id')
+        row_id = row.get('id')
+        if parent_id:
+            walks.append((str(parent_id), {str(row_id)} if row_id else set()))
+    if not walks:
+        return selected
+
+    have = {str(row['id']) for row in selected if row.get('id')}
+    result = list(selected)
+    rescued_any = False
+    # Resolve from the limit*8 oversample first: the parent is usually just
+    # below the slice, already projected and normalized, so the common case
+    # costs one dict lookup and zero extra SQL.
+    rows_by_id = _index_rows_for_ancestor_lookup(projected)
+
+    for _hop in range(_SUBAGENT_ANCESTOR_MAX_HOPS):
+        if not walks:
+            break
+
+        # One targeted query per hop level for the ids the oversample missed.
+        unresolved = []
+        for parent_id, _seen in walks:
+            if parent_id not in rows_by_id and parent_id not in unresolved:
+                unresolved.append(parent_id)
+        if unresolved:
+            fetched = _fetch_ancestor_session_rows(
+                cur,
+                unresolved,
+                select_sql=select_sql,
+                join_clause=join_clause,
+                group_by_clause=group_by_clause,
+                log=log,
+            )
+            if fetched:
+                # Project the fetched ancestors ALONGSIDE the candidate rows so
+                # they pick up the same lineage/relationship metadata the main
+                # path would have given them had they made the window. Copies
+                # are projected so the candidate dicts stay untouched, and only
+                # the requested ancestor ids are harvested — the already
+                # selected rows are never re-derived.
+                reprojected = _project_agent_session_rows(
+                    [dict(row) for row in candidate_rows] + [dict(row) for row in fetched]
+                )
+                reprojected = [_with_normalized_source(row) for row in reprojected]
+                reprojected_by_id = _index_rows_for_ancestor_lookup(reprojected)
+                for parent_id in unresolved:
+                    resolved = reprojected_by_id.get(parent_id)
+                    if resolved is not None:
+                        rows_by_id.setdefault(parent_id, resolved)
+
+        next_walks: list[tuple[str, set[str]]] = []
+        for parent_id, seen in walks:
+            if parent_id in seen:
+                continue  # cycle in parent_session_id — stop this walk
+            parent = rows_by_id.get(parent_id)
+            if parent is None:
+                continue  # missing/deleted or unprojectable parent — stop
+            resolved_id = str(parent.get('id') or parent_id)
+            if resolved_id in have:
+                continue  # already satisfied
+            if _rescue_row_source(parent) == 'webui':
+                continue  # WebUI parent ships via its own sidecar — stop, no dup
+            if not _rescue_row_passes_source_filters(parent, included, excluded):
+                continue  # never smuggle a filtered-out source past the caller
+            if not is_cli_session_row_visible(parent):
+                continue  # hidden parent cannot host the child row anyway
+
+            result.append(parent)
+            have.add(resolved_id)
+            rescued_any = True
+
+            grandparent_id = parent.get('parent_session_id')
+            if grandparent_id:
+                next_walks.append((str(grandparent_id), seen | {parent_id, resolved_id}))
+        walks = next_walks
+
+    if not rescued_any:
+        return selected
+
+    # Keep the payload recency-ordered with the SAME key the projection used, so
+    # a rescued parent lands at its own last-activity position instead of being
+    # tacked onto the end of the sidebar.
+    result.sort(
+        key=lambda row: _as_score(row.get('last_activity'), row.get('started_at')),
+        reverse=True,
+    )
+    return result
+
+
 def read_importable_agent_session_rows(
     db_path: Path,
     limit: int | None = 200,
@@ -517,6 +786,15 @@ def read_importable_agent_session_rows(
     ``exclude_sources=None``. ``include_sources`` is an additional narrowing
     filter; callers that want an include-only query should explicitly pass
     ``exclude_sources=None`` so the default exclusions do not also apply.
+
+    ``limit`` bounds the recency window, but the returned list MAY exceed it:
+    when a visible ``source='subagent'`` row would otherwise be returned without
+    its ``parent_session_id`` ancestor (recency-window eviction of a frozen
+    delegate_task orchestrator), those ancestors are ADDED back so the client can
+    still nest the child instead of promoting it to a top-level orphan row. No
+    selected row is ever evicted to make room, and with no subagent rows in the
+    window the result is exactly ``projected[:limit]`` as before. See
+    ``_rescue_missing_subagent_ancestors`` for the walk's stop rules.
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -637,6 +915,7 @@ def read_importable_agent_session_rows(
         where_clauses = ["s.source IS NOT NULL"]
         params: list[object] = []
         included = ()
+        excluded = ()
         if include_sources:
             included = tuple(str(source) for source in include_sources if source)
             if included:
@@ -761,12 +1040,35 @@ def read_importable_agent_session_rows(
                 """,
                 params,
             )
-        projected = _project_agent_session_rows([dict(row) for row in cur.fetchall()])
+        candidate_rows = [dict(row) for row in cur.fetchall()]
+        projected = _project_agent_session_rows([dict(row) for row in candidate_rows])
         projected = [_with_normalized_source(row) for row in projected]
         projected = [row for row in projected if is_cli_session_row_visible(row)]
         if limit is None:
             return projected
-        return projected[:max(0, int(limit))]
+        selected = projected[:max(0, int(limit))]
+        # A delegated ``subagent`` leaf is rendered NESTED under its parent row.
+        # The hard slice above is recency-ordered, and a frozen delegate_task
+        # orchestrator loses recency to its still-writing leaves — so the leaf
+        # survives the window while its parent is evicted, and the client
+        # (static/sessions.js::_attachChildSessionsToSidebarRows) promotes the
+        # parentless leaf to a contextless top-level "Subagent Session" row.
+        # Re-add (never substitute) the ancestors those visible leaves need.
+        # Runs inside the `with closing(conn):` block on purpose: ancestors that
+        # fell outside the oversampled candidate window need this same
+        # already-open READ-ONLY cursor (#5455).
+        return _rescue_missing_subagent_ancestors(
+            selected,
+            projected,
+            candidate_rows,
+            cur,
+            select_sql=select_sql,
+            join_clause=join_clause,
+            group_by_clause=group_by_clause,
+            included=included,
+            excluded=excluded,
+            log=log,
+        )
 
 
 
