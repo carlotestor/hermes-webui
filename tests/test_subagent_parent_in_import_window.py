@@ -80,3 +80,68 @@ def test_webui_parent_is_not_force_imported(tmp_path):
     # The webui sidebar bucket already owns its own rows; don't duplicate them.
     assert "orch" not in {r["id"] for r in rows}
     assert {f"leaf{i}" for i in range(3)} <= {r["id"] for r in rows}
+
+
+def test_recovered_parent_is_returned_beyond_limit(tmp_path):
+    """`limit` bounds the recency slice, not the row count (documented contract)."""
+    db = tmp_path / "state.db"
+    _lineage_db(db)
+
+    rows = read_importable_agent_session_rows(db, limit=3, exclude_sources=None)
+
+    # 3 sliced leaves + 1 re-added anchor: callers must iterate, not assume <= limit.
+    assert len(rows) == 4
+    assert {r["id"] for r in rows} == {"leaf0", "leaf1", "leaf2", "orch"}
+
+
+def _window_db(path, filler):
+    """Quiet parent, `filler` newer unrelated rows, one hot child of that parent."""
+    sessions: list[tuple[str, str, str, str | None]] = [("orch", "Orchestrator", "subagent", None)]
+    messages = [("orch", "user", 100.0), ("orch", "assistant", 100.5)]
+    for i in range(filler):
+        sessions.append((f"fill{i}", f"Filler {i}", "subagent", None))
+        messages += [(f"fill{i}", "user", 200.0 + i), (f"fill{i}", "assistant", 200.5 + i)]
+    sessions.append(("leaf", "Leaf", "subagent", "orch"))
+    messages += [("leaf", "user", 9000.0), ("leaf", "assistant", 9001.0)]
+    _make_db(path, sessions, messages)
+
+
+def test_parent_inside_candidate_oversample_is_recovered(tmp_path):
+    """The oversample is limit * 8, so a parent ranked within it is still restored."""
+    db = tmp_path / "state.db"
+    _window_db(db, filler=22)  # orch is candidate #24 of 24
+
+    rows = read_importable_agent_session_rows(db, limit=3, exclude_sources=None)
+
+    assert "orch" in {r["id"] for r in rows}
+
+
+def test_parent_beyond_candidate_oversample_stays_unresolved(tmp_path):
+    """Documented bound: recovery reuses the limit * 8 candidate set, never a new query.
+
+    A parent ranked below that oversample is not fetched, so its child renders
+    top-level — the pre-existing behaviour. This pins the boundary so widening
+    it becomes a deliberate `candidate_limit` change, not an accidental one.
+    """
+    db = tmp_path / "state.db"
+    _window_db(db, filler=23)  # orch is pushed to candidate #25 of 24
+
+    rows = read_importable_agent_session_rows(db, limit=3, exclude_sources=None)
+    ids = {r["id"] for r in rows}
+
+    assert "leaf" in ids
+    assert "orch" not in ids
+
+
+def test_parent_cycle_does_not_hang(tmp_path):
+    """A corrupt self/mutual parent link must not spin the ancestor walk."""
+    db = tmp_path / "state.db"
+    _make_db(
+        db,
+        [("a", "A", "subagent", "b"), ("b", "B", "subagent", "a")],
+        [("a", "user", 900.0), ("a", "assistant", 901.0), ("b", "user", 100.0), ("b", "assistant", 101.0)],
+    )
+
+    rows = read_importable_agent_session_rows(db, limit=1, exclude_sources=None)
+
+    assert {r["id"] for r in rows} == {"a", "b"}

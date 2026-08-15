@@ -517,6 +517,19 @@ def read_importable_agent_session_rows(
     ``exclude_sources=None``. ``include_sources`` is an additional narrowing
     filter; callers that want an include-only query should explicitly pass
     ``exclude_sources=None`` so the default exclusions do not also apply.
+
+    ``limit`` bounds the *recency slice*, not the returned row count. Subagent
+    rows only render as children when their parent row is in the same payload,
+    so subagent ancestors of selected rows are re-added afterwards and the
+    result can exceed ``limit`` by the number of such anchors. Callers must
+    therefore iterate the result rather than assume ``len(rows) <= limit``.
+
+    That recovery is deliberately bounded by the oversampled candidate set
+    (``limit * 8`` newest sessions): it re-uses rows the projection already
+    fetched and never issues an extra query, so an ancestor older than the
+    oversample stays unresolved and its children render top-level, exactly as
+    they did before. Widening that window is a ``candidate_limit`` change, not
+    a change to this walk.
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -776,6 +789,14 @@ def read_importable_agent_session_rows(
         # promoted to top-level sidebar rows. Re-add subagent parents that the
         # oversampled candidate set already projected (no extra query); webui
         # ancestors are left out because that sidebar bucket already has them.
+        #
+        # Bounded by construction: ``by_id`` only holds the ``limit * 8``
+        # newest candidates, so an ancestor older than that oversample is not
+        # recovered and its children stay top-level — the pre-existing
+        # behaviour, narrowed rather than fixed. Resolving those would need an
+        # unbounded per-row ancestor query on the hot sidebar path; widen
+        # ``candidate_limit`` instead if the window proves too tight.
+        # NOTE: this can return more than ``limit`` rows (see docstring).
         have = {row.get('id') for row in selected}
         by_id = {row.get('id'): row for row in projected if row.get('id')}
         pending = list(selected)
