@@ -766,7 +766,35 @@ def read_importable_agent_session_rows(
         projected = [row for row in projected if is_cli_session_row_visible(row)]
         if limit is None:
             return projected
-        return projected[:max(0, int(limit))]
+        selected = projected[:max(0, int(limit))]
+
+        # The recency slice is per-row, but subagent rows are only renderable as
+        # children: the sidebar nests a child under its parent solely when that
+        # parent row is present in the same payload. A frozen orchestrator stops
+        # writing while its leaves keep streaming, so the leaves win the recency
+        # race and the parent falls outside the window — leaving the leaves to be
+        # promoted to top-level sidebar rows. Re-add subagent parents that the
+        # oversampled candidate set already projected (no extra query); webui
+        # ancestors are left out because that sidebar bucket already has them.
+        have = {row.get('id') for row in selected}
+        by_id = {row.get('id'): row for row in projected if row.get('id')}
+        pending = list(selected)
+        while pending:
+            row = pending.pop()
+            if str(row.get('raw_source') or row.get('source') or '').strip().lower() != 'subagent':
+                continue
+            parent_id = row.get('parent_session_id')
+            if not parent_id or parent_id in have:
+                continue
+            parent = by_id.get(parent_id)
+            if parent is None:
+                continue
+            if str(parent.get('raw_source') or parent.get('source') or '').strip().lower() != 'subagent':
+                continue
+            selected.append(parent)
+            have.add(parent_id)
+            pending.append(parent)
+        return selected
 
 
 
