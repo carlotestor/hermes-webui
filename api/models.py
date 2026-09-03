@@ -2401,12 +2401,37 @@ def _find_existing_assistant_for_journal_content(
     *,
     max_index: int | None = None,
     excluded_indexes: set[int] | None = None,
+    stream_id: str | None = None,
+    turn_start=None,
 ) -> int | None:
+    """Find an earlier assistant row this segment may collapse into.
+
+    Claimable only with proven ownership: this stream's tag, or at/after
+    ``turn_start``. ``turn_start=None`` is quiescent = legacy session-wide.
+    """
     candidate = _normalize_journal_recovery_text(content)
     if not candidate:
         return None
     messages = session.messages or []
     stop = len(messages) if max_index is None else min(len(messages), max_index)
+    window_ambiguous = turn_start is _TURN_WINDOW_AMBIGUOUS
+    window_index = None if window_ambiguous else turn_start
+    legacy_scope = turn_start is None
+
+    def _owns_turn(idx: int) -> bool:
+        if legacy_scope:
+            return True
+        message = messages[idx]
+        existing_stream = message.get('_recovered_stream_id')
+        if existing_stream:
+            # Only the same stream may collapse onto its own recovered output.
+            return bool(stream_id) and str(existing_stream) == str(stream_id)
+        # Untagged rows are core/live transcript: current-turn only when the
+        # window is known and they sit inside it. Otherwise fail closed.
+        if window_index is None:
+            return False
+        return idx >= window_index
+
     substring_match = None
     for idx in range(stop):
         if excluded_indexes and idx in excluded_indexes:
@@ -2420,8 +2445,15 @@ def _find_existing_assistant_for_journal_content(
         if not existing:
             continue
         if existing == candidate:
-            return idx
-        if substring_match is None and len(candidate) >= 24 and candidate in existing:
+            if _owns_turn(idx):
+                return idx
+            continue
+        if (
+            substring_match is None
+            and len(candidate) >= 24
+            and candidate in existing
+            and _owns_turn(idx)
+        ):
             substring_match = idx
     return substring_match
 
@@ -2432,27 +2464,19 @@ def _journal_tool_already_present(
     preview: str,
     *,
     stream_id: str | None = None,
+    turn_start=None,
 ) -> bool:
     """Return True when an equivalent tool card already exists.
 
-    Matching rule:
-
-    * If the existing tool card carries ``_recovered_stream_id``, that means a
-      previous journal-recovery run materialized it.  The retry can safely
-      collapse against it only when both stream ids match — otherwise a
-      legitimately-repeated tool (e.g. a second ``terminal: ls`` in a
-      different turn) would be dropped.
-    * If the existing tool card has no ``_recovered_stream_id`` (a live tool
-      card, or a tool card carried over from a core transcript that pre-dates
-      stream-id tagging), the legacy name+preview match still wins.  This
-      preserves the "core transcript already has this tool, don't duplicate
-      it" invariant the original repair path established.
-    * When ``stream_id`` is omitted, the helper degrades cleanly to its
-      pre-fix session-wide behaviour.
+    Branches on the EXISTING card: foreign stream never, ours always, untagged
+    only inside ``turn_start``. Legacy scope needs ``turn_start is None``.
     """
     candidate_name = str(name or '')
     candidate_preview = _normalize_journal_recovery_text(preview)
     candidate_stream = str(stream_id) if stream_id else None
+    window_ambiguous = turn_start is _TURN_WINDOW_AMBIGUOUS
+    window_index = None if window_ambiguous else turn_start
+    legacy_scope = turn_start is None
     for tool_call in session.tool_calls or []:
         if not isinstance(tool_call, dict):
             continue
@@ -2463,15 +2487,19 @@ def _journal_tool_already_present(
         )
         if existing_preview != candidate_preview:
             continue
-        if candidate_stream is not None:
-            existing_stream = tool_call.get('_recovered_stream_id')
-            # A tool card explicitly tagged with a recovered_stream_id that
-            # differs from ours belongs to another retry's turn — don't let
-            # it pre-empt this retry.  Untagged tool cards (live or carried
-            # over from the core transcript) still match.
-            if existing_stream and str(existing_stream) != candidate_stream:
+        existing_stream = tool_call.get('_recovered_stream_id')
+        if existing_stream:
+            if candidate_stream is None or str(existing_stream) != candidate_stream:
                 continue
-        return True
+            return True
+        if legacy_scope:
+            return True
+        if window_index is None:
+            # Nothing proves this untagged card belongs to the current turn.
+            continue
+        owner_idx = tool_call.get('assistant_msg_idx')
+        if isinstance(owner_idx, int) and owner_idx >= window_index:
+            return True
     return False
 
 
@@ -2653,6 +2681,80 @@ def _pending_recovery_turn_start(session) -> int | None:
     return None
 
 
+class _TurnWindowAmbiguous:
+    """Sentinel: a turn is recovering but its opening row is not locatable.
+
+    Unlike ``None`` (no pending turn, legacy session-wide scope), nothing may
+    be claimed by position — only a same-stream tag may match.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return '<turn-window-ambiguous>'
+
+
+_TURN_WINDOW_AMBIGUOUS = _TurnWindowAmbiguous()
+
+
+def _pending_recovery_turn_window_start(session):
+    """Opening index of the recovering turn, in ORIGINAL message coordinates.
+
+    Opens at the EARLIEST exact checkpoint so a turn's own core output stays
+    claimable (#3929); untimed core rows extend it back, text-only fallback
+    takes the LATEST match, unmatched turns are _TURN_WINDOW_AMBIGUOUS."""
+    pending_text = getattr(session, 'pending_user_message', None)
+    if not pending_text:
+        return None
+    messages = session.messages or []
+
+    def _has_usable_timestamp(message) -> bool:
+        try:
+            int(message.get('timestamp'))
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    exact_match = None
+    fallback_match = None
+    for idx, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if _message_matches_pending_checkpoint(
+            message,
+            pending_text,
+            session.pending_started_at,
+            session.pending_user_source,
+            session.pending_attachments,
+        ):
+            if exact_match is None:
+                exact_match = idx
+        elif _message_matches_pending_text(message, pending_text):
+            fallback_match = idx
+    if exact_match is not None:
+        window = exact_match
+        for idx in range(exact_match - 1, -1, -1):
+            message = messages[idx]
+            if not isinstance(message, dict):
+                continue
+            if message.get('role') != 'user':
+                # Assistant/tool rows sit inside the turn being walked back over.
+                continue
+            if (
+                _message_matches_pending_text(message, pending_text)
+                and not _has_usable_timestamp(message)
+            ):
+                # Untimed core row for this same prompt: same turn, keep going.
+                window = idx
+                continue
+            # Any other user row is a provable turn boundary.
+            break
+        return window
+    if fallback_match is not None:
+        return fallback_match
+    return _TURN_WINDOW_AMBIGUOUS
+
+
 def _materialize_unsaved_gateway_terminal_error(
     session,
     stream_id: str | None,
@@ -2706,7 +2808,7 @@ def _recover_journaled_output_and_terminal_error(
     session,
     stream_id: str | None,
     *,
-    dedupe_existing: bool = False,
+    dedupe_existing: bool = True,
     terminal_recovery: dict | None = None,
 ) -> tuple[bool, bool]:
     """Recover readable activity first, then append its authoritative terminal error."""
@@ -2760,7 +2862,7 @@ def _append_journaled_partial_output(
     session,
     stream_id: str | None,
     *,
-    dedupe_existing: bool = False,
+    dedupe_existing: bool = True,
 ) -> bool:
     """Recover already-emitted visible output from a dead stream journal.
 
@@ -2864,12 +2966,18 @@ def _append_journaled_partial_output(
         if dedupe_existing and content:
             search_excluded = set(claimed_existing_assistant_indexes)
             existing_idx = None
+            # Turn-ownership scope: only rows owned by the turn being recovered
+            # may absorb this segment. Without a provable window, matching
+            # degrades to stream-tag-only.
+            turn_start = _pending_recovery_turn_window_start(session)
             while True:
                 candidate_idx = _find_existing_assistant_for_journal_content(
                     session,
                     content,
                     max_index=initial_message_count,
                     excluded_indexes=search_excluded,
+                    stream_id=stream_id,
+                    turn_start=turn_start,
                 )
                 if candidate_idx is None:
                     break
@@ -3008,7 +3116,11 @@ def _append_journaled_partial_output(
             name = str(payload.get('name') or 'tool')
             preview = str(payload.get('preview') or '')
             if dedupe_existing and _journal_tool_already_present(
-                session, name, preview, stream_id=stream_id,
+                session,
+                name,
+                preview,
+                stream_id=stream_id,
+                turn_start=_pending_recovery_turn_window_start(session),
             ):
                 current_assistant_idx = anchor_idx
                 continue
@@ -3439,6 +3551,7 @@ def _apply_core_sync_or_error_marker(
             _recover_journaled_output_and_terminal_error(
                 session,
                 _stream_id,
+                dedupe_existing=True,
                 terminal_recovery=_terminal_recovery,
             )
         )
