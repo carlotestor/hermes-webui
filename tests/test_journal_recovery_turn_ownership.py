@@ -16,8 +16,10 @@ from api.models import (
     _append_journaled_partial_output,
     _find_existing_assistant_for_journal_content,
     _journal_tool_already_present,
+    _normalize_journal_recovery_text,
     _pending_recovery_turn_window_start,
 )
+from api.process_event_utils import build_active_turn_token
 from api.run_journal import append_run_event
 
 STREAM_ID = "stream-current"
@@ -59,7 +61,7 @@ def _assistant(content, ts, **extra):
     return row
 
 
-def _session(sid, messages, *, pending_started_at, tool_calls=None):
+def _session(sid, messages, *, pending_started_at, tool_calls=None, active_stream_id=None):
     return Session(
         session_id=sid,
         title="gate",
@@ -69,6 +71,7 @@ def _session(sid, messages, *, pending_started_at, tool_calls=None):
         pending_started_at=pending_started_at,
         pending_user_source="webui",
         pending_attachments=[],
+        active_stream_id=active_stream_id,
     )
 
 
@@ -84,14 +87,17 @@ def test_recovered_echo_and_real_submission_open_the_same_turn(hermes_home):
     the core output between them must stay claimable (#3929).
     """
     ts = 1_700_000_000
+    token = build_active_turn_token(STREAM_ID, ts)
     messages = [
         _user("an earlier, different prompt", ts - 500),   # 0
         _assistant(ANSWER, ts - 499),                      # 1 historical answer
-        _user(PROMPT, ts),                                 # 2 real submission
+        _user(PROMPT, ts, _active_turn_token=token),       # 2 real submission
         _assistant("core output for this turn", ts + 1),   # 3 current-turn core
-        _user(PROMPT, ts, _recovered=True),                # 4 repair echo
+        _user(PROMPT, ts, _recovered=True, _active_turn_token=token),  # 4 echo
     ]
-    session = _session("gate1-echo", messages, pending_started_at=ts)
+    session = _session(
+        "gate1-echo", messages, pending_started_at=ts, active_stream_id=STREAM_ID,
+    )
 
     window = _pending_recovery_turn_window_start(session)
 
@@ -458,4 +464,103 @@ def test_repeated_answer_across_turns_survives(hermes_home):
     ]
     assert len(answers_after) == 2, (
         f"replay grew answers to {len(answers_after)}; recovery must be idempotent"
+    )
+
+
+def test_same_second_historical_real_and_current_echo_does_not_claim_history(
+    hermes_home,
+):
+    """Same-second historical real + current echo must not claim history."""
+    sid = "gate4-collision"
+    append_run_event(sid, STREAM_ID, "token", {"text": ANSWER})
+    _write_tool_journal(sid, STREAM_ID)
+    ts = 1_700_001_100
+    session = _session(
+        sid,
+        [
+            _user(PROMPT, ts),
+            _assistant(ANSWER, ts),
+            _user(PROMPT, ts, _recovered=True),
+        ],
+        pending_started_at=ts,
+        tool_calls=[
+            {
+                "name": TOOL_NAME,
+                "preview": TOOL_PREVIEW,
+                "snippet": TOOL_PREVIEW,
+                "assistant_msg_idx": 1,
+            }
+        ],
+    )
+    assert _normalize_journal_recovery_text(TOOL_PREVIEW) == (
+        _normalize_journal_recovery_text(session.tool_calls[0].get("preview"))
+    ), "fixture preview must be signature-equal or this gate is vacuous"
+
+    window = _pending_recovery_turn_window_start(session)
+    assert window is _TURN_WINDOW_AMBIGUOUS, (
+        f"window opened at {window}; colliding exact checkpoints must fail closed"
+    )
+
+    _append_journaled_partial_output(session, STREAM_ID, dedupe_existing=True)
+    answers = [
+        m for m in session.messages
+        if m.get("role") == "assistant"
+        and str(m.get("content") or "").strip() == ANSWER
+    ]
+    tools = [tc for tc in session.tool_calls if tc.get("name") == TOOL_NAME]
+    assert len(answers) == 2, (
+        f"expected historical plus recovered current answer, got {len(answers)}"
+    )
+    assert len(tools) == 2, (
+        f"expected historical plus recovered current tool, got {len(tools)}"
+    )
+
+    for _ in range(3):
+        _append_journaled_partial_output(session, STREAM_ID, dedupe_existing=True)
+    answers_after = [
+        m for m in session.messages
+        if m.get("role") == "assistant"
+        and str(m.get("content") or "").strip() == ANSWER
+    ]
+    tools_after = [tc for tc in session.tool_calls if tc.get("name") == TOOL_NAME]
+    assert len(answers_after) == 2, (
+        f"replay grew answers to {len(answers_after)}; recovery must be idempotent"
+    )
+    assert len(tools_after) == 2, (
+        f"replay grew tools to {len(tools_after)}; recovery must be idempotent"
+    )
+
+
+def test_tool_only_dedupe_does_not_allocate_blank_anchor(hermes_home):
+    """A current-window untagged tool must not grow messages on replay."""
+    sid = "gate4-tool-anchor"
+    _write_tool_journal(sid, STREAM_ID)
+    ts = 1_700_001_200
+    session = _session(
+        sid,
+        [_user(PROMPT, ts), _assistant("", ts + 1)],
+        pending_started_at=ts,
+        tool_calls=[
+            {
+                "name": TOOL_NAME,
+                "preview": TOOL_PREVIEW,
+                "snippet": TOOL_PREVIEW,
+                "assistant_msg_idx": 1,
+            }
+        ],
+    )
+    assert _normalize_journal_recovery_text(TOOL_PREVIEW) == (
+        _normalize_journal_recovery_text(session.tool_calls[0].get("preview"))
+    ), "fixture preview must be signature-equal or this gate is vacuous"
+
+    before_messages = len(session.messages)
+    before_tools = len(session.tool_calls)
+    for _ in range(4):
+        _append_journaled_partial_output(session, STREAM_ID, dedupe_existing=True)
+    assert len(session.tool_calls) == before_tools, (
+        f"tool cards grew {before_tools} -> {len(session.tool_calls)}"
+    )
+    assert len(session.messages) == before_messages, (
+        f"messages grew {before_messages} -> {len(session.messages)}; "
+        "deduped tool recovery must not allocate a blank assistant anchor"
     )

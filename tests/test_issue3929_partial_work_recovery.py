@@ -11,6 +11,7 @@ from api.models import (
     _append_journaled_partial_output,
     _apply_core_sync_or_error_marker,
 )
+from api.process_event_utils import build_active_turn_token
 from api.run_journal import append_run_event
 import api.streaming as streaming
 from api.streaming import _sanitize_messages_for_api
@@ -540,17 +541,24 @@ def test_reasoning_backfill_accepts_core_row_before_recovered_owner_echo():
     pending_started_at = 3_000
     recovered_text = "The core transcript already contains this partial output."
     core_assistant = {"role": "assistant", "content": recovered_text}
+    turn_token = build_active_turn_token(stream_id, pending_started_at)
     session = Session(
         session_id=session_id,
         title="Core owner echo",
         messages=[
-            {"role": "user", "content": pending_text, "timestamp": pending_started_at},
+            {
+                "role": "user",
+                "content": pending_text,
+                "timestamp": pending_started_at,
+                "_active_turn_token": turn_token,
+            },
             core_assistant,
             {
                 "role": "user",
                 "content": pending_text,
                 "timestamp": pending_started_at,
                 "_recovered": True,
+                "_active_turn_token": turn_token,
             },
         ],
         context_messages=[
@@ -559,6 +567,7 @@ def test_reasoning_backfill_accepts_core_row_before_recovered_owner_echo():
         ],
         pending_user_message=pending_text,
         pending_started_at=pending_started_at,
+        active_stream_id=stream_id,
     )
     append_run_event(
         session_id,

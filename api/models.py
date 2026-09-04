@@ -44,7 +44,7 @@ from api.agent_sessions import (
     read_importable_agent_session_rows,
     read_session_lineage_metadata,
 )
-from api.process_event_utils import stamp_message_source
+from api.process_event_utils import build_active_turn_token, stamp_message_source
 
 logger = logging.getLogger(__name__)
 CLI_VISIBLE_SESSION_LIMIT = 20
@@ -926,7 +926,14 @@ def _append_recovered_pending_turn(session, *, timestamp: int | None = None) -> 
         '_recovered': True,
     }
     pending_source = getattr(session, 'pending_user_source', None)
-    stamp_message_source(recovered, pending_source)
+    stamp_message_source(
+        recovered,
+        pending_source,
+        active_turn_token=build_active_turn_token(
+            getattr(session, 'active_stream_id', None),
+            getattr(session, 'pending_started_at', None),
+        ),
+    )
     if session.pending_attachments:
         recovered['attachments'] = list(session.pending_attachments)
     session.messages.append(recovered)
@@ -2700,9 +2707,9 @@ _TURN_WINDOW_AMBIGUOUS = _TurnWindowAmbiguous()
 def _pending_recovery_turn_window_start(session):
     """Opening index of the recovering turn, in ORIGINAL message coordinates.
 
-    Opens at the EARLIEST exact checkpoint so a turn's own core output stays
-    claimable (#3929); untimed core rows extend it back, text-only fallback
-    takes the LATEST match, unmatched turns are _TURN_WINDOW_AMBIGUOUS."""
+    One exact match opens there (untimed same-text rows extend back). Several
+    exact matches fail closed unless ``_active_turn_token`` uniquely identifies
+    the current turn; unmatched pending turns are ``_TURN_WINDOW_AMBIGUOUS``."""
     pending_text = getattr(session, 'pending_user_message', None)
     if not pending_text:
         return None
@@ -2715,7 +2722,7 @@ def _pending_recovery_turn_window_start(session):
             return False
         return True
 
-    exact_match = None
+    exact_matches = []
     fallback_match = None
     for idx, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -2727,10 +2734,27 @@ def _pending_recovery_turn_window_start(session):
             session.pending_user_source,
             session.pending_attachments,
         ):
-            if exact_match is None:
-                exact_match = idx
+            exact_matches.append(idx)
         elif _message_matches_pending_text(message, pending_text):
             fallback_match = idx
+    exact_match = None
+    if len(exact_matches) == 1:
+        exact_match = exact_matches[0]
+    elif len(exact_matches) > 1:
+        token = build_active_turn_token(
+            getattr(session, 'active_stream_id', None),
+            getattr(session, 'pending_started_at', None),
+        )
+        token_hits = [
+            idx for idx in exact_matches
+            if token and messages[idx].get('_active_turn_token') == token
+        ]
+        if len(token_hits) == 1:
+            exact_match = token_hits[0]
+        elif len(token_hits) > 1:
+            exact_match = token_hits[0]
+        else:
+            return _TURN_WINDOW_AMBIGUOUS
     if exact_match is not None:
         window = exact_match
         for idx in range(exact_match - 1, -1, -1):
@@ -3110,9 +3134,6 @@ def _append_journaled_partial_output(
             flush_assistant()
             continue
         if event_name == 'tool':
-            anchor_idx = flush_assistant()
-            if anchor_idx is None:
-                anchor_idx = ensure_assistant_anchor(created_at)
             name = str(payload.get('name') or 'tool')
             preview = str(payload.get('preview') or '')
             if dedupe_existing and _journal_tool_already_present(
@@ -3122,8 +3143,13 @@ def _append_journaled_partial_output(
                 stream_id=stream_id,
                 turn_start=_pending_recovery_turn_window_start(session),
             ):
-                current_assistant_idx = anchor_idx
+                # Ownership is already proven; do not allocate an empty
+                # recovered anchor just to discover a duplicate tool.
+                flush_assistant()
                 continue
+            anchor_idx = flush_assistant()
+            if anchor_idx is None:
+                anchor_idx = ensure_assistant_anchor(created_at)
             recovered_tool_calls.append({
                 'name': name,
                 'preview': preview,
@@ -3542,6 +3568,14 @@ def _apply_core_sync_or_error_marker(
                 '_recovered': True,
             }
             pending_source = getattr(session, 'pending_user_source', None)
+            stamp_message_source(
+                recovered,
+                pending_source,
+                active_turn_token=build_active_turn_token(
+                    getattr(session, 'active_stream_id', None),
+                    getattr(session, 'pending_started_at', None),
+                ),
+            )
             if pending_source and pending_source != 'webui':
                 recovered['_source'] = pending_source
             if session.pending_attachments:
