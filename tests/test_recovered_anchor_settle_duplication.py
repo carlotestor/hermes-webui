@@ -1,8 +1,7 @@
 """Geometric duplication of recovered reasoning-only rows at turn settle.
 
-Refs #7388 (empty ``_recovered_from_run_journal`` rows) and #7416 (linear
-journal-replay growth). This is the INDEPENDENT geometric leg: every settled
-turn re-appended each empty recovered anchor once more, doubling per turn.
+Refs #7388 / #7416 (linear journal replay). This is the INDEPENDENT geometric
+leg: each settled turn re-appended every empty recovered anchor once more.
 """
 from __future__ import annotations
 
@@ -57,9 +56,8 @@ def _clone_blocks(messages) -> list[int]:
 def _compacted_history() -> tuple[list[dict], list[dict]]:
     """Display transcript with a recovered anchor + a COMPACTED model context.
 
-    The context no longer contains the turn the anchor belonged to (it was
-    compressed away), which is exactly the production shape: the anchor's
-    API-safe position is beyond the end of ``result_messages``.
+    The anchor's turn was compressed out of the context, so its API-safe
+    position lies beyond the end of ``result_messages`` (production shape).
     """
     display = [
         {"role": "user", "content": "reload the webui", "timestamp": 1788356170},
