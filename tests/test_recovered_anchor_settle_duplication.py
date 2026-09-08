@@ -262,7 +262,7 @@ def _settled_session(monkeypatch, display, context, result_ids=()):
         {"role": "user", "content": "continue", "timestamp": 10},
         {"role": "assistant", "content": "new answer", "timestamp": 15},
     ]
-    for row, rid in zip(result, result_ids):
+    for row, rid in zip(result, result_ids, strict=False):
         if rid is not None:
             row["id"] = rid
     _settle_result_messages(
