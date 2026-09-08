@@ -237,6 +237,114 @@ def test_successor_alignment_prefers_stable_ids_over_content():
 _REAL_SIDECAR = os.environ.get("HERMES_WEBUI_REAL_CLONE_SIDECAR", "")
 
 
+def _identity_hole_history(successor_id) -> tuple[list[dict], list[dict]]:
+    """Historical successor carries ``successor_id``; anchor sits right before it."""
+    display = [
+        {"role": "user", "content": "older turn", "timestamp": 1},
+        {"role": "assistant", "content": "older answer", "timestamp": 2},
+        {"role": "assistant", "content": "", "timestamp": 3, "reasoning": "historical card"},
+        {"role": "user", "content": "continue", "timestamp": 4, "id": successor_id},
+        {"role": "assistant", "content": "first answer", "timestamp": 5},
+    ]
+    context = [copy.deepcopy(display[-2]), copy.deepcopy(display[-1])]
+    return display, context
+
+
+def _reasoning_cards(messages) -> list:
+    return [m.get("reasoning") for m in messages]
+
+
+def _settled_session(monkeypatch, display, context, result_ids=()):
+    monkeypatch.setattr(_streaming, "_annotate_media_snapshots_for_settled_messages", lambda m: None)
+    session = Session(session_id="b" * 12, title="t", messages=copy.deepcopy(display))
+    session.context_messages = copy.deepcopy(context)
+    result = copy.deepcopy(context) + [
+        {"role": "user", "content": "continue", "timestamp": 10},
+        {"role": "assistant", "content": "new answer", "timestamp": 15},
+    ]
+    for row, rid in zip(result, result_ids):
+        if rid is not None:
+            row["id"] = rid
+    _settle_result_messages(
+        session, list(session.messages), list(session.context_messages), result, "continue", "webui", None,
+    )
+    return session, result
+
+
+# The new "continue" is a distinct turn: exactly one historical card may survive.
+_ONE_CARD = [None, None, "historical card", None, None, None, None]
+
+
+def test_bool_successor_id_never_matches_integer_one(monkeypatch):
+    display, context = _identity_hole_history(True)
+    session, result = _settled_session(monkeypatch, display, context, result_ids=(None, None, 1, 2))
+    assert True == 1 and result[2]["id"] == 1  # noqa: E712 - the hole being closed
+    assert _reasoning_cards(session.messages) == _ONE_CARD
+    assert all(type(m["id"]) is int for m in result)  # replayed True row re-minted
+
+
+def test_bool_successor_id_never_matches_minted_integer_one(monkeypatch):
+    display, context = _identity_hole_history(True)
+    session, result = _settled_session(monkeypatch, display, context)
+    assert _reasoning_cards(session.messages) == _ONE_CARD
+    assert all(type(m["id"]) is int for m in result)
+
+
+def test_float_successor_id_never_matches_integer_one(monkeypatch):
+    display, context = _identity_hole_history(1.0)
+    session, result = _settled_session(monkeypatch, display, context, result_ids=(None, None, 1, 2))
+    assert 1.0 == 1 and result[2]["id"] == 1
+    assert _reasoning_cards(session.messages) == _ONE_CARD
+    assert all(type(m["id"]) is int for m in result)
+
+
+def test_reused_positive_id_cannot_establish_successor_ownership(monkeypatch):
+    display, context = _identity_hole_history(7)
+    display[0]["id"] = 7  # the same id is owned by two API-safe historical rows
+    session, result = _settled_session(monkeypatch, display, context, result_ids=(7, 8, 7, 9))
+    assert [m["id"] for m in result] == [7, 8, 7, 9]
+    assert _reasoning_cards(session.messages) == _ONE_CARD
+
+
+def test_unique_stable_id_control_still_restores_before_its_own_successor(monkeypatch):
+    display, context = _identity_hole_history(3)
+    display[0]["id"], display[1]["id"], display[4]["id"] = 1, 2, 4
+    context[1]["id"] = 4
+    session, result = _settled_session(monkeypatch, display, context)
+    assert [m["id"] for m in result] == [3, 4, 5, 6]
+    assert _reasoning_cards(session.messages) == _ONE_CARD
+    assert session.messages[2]["reasoning"] == "historical card"
+
+
+def test_bool_ids_do_not_survive_save_load_into_minted_collision(tmp_path, monkeypatch):
+    from api import models, run_journal
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    monkeypatch.setattr(run_journal, "_default_session_dir", lambda: sessions)
+    monkeypatch.setattr(models, "SESSION_DIR", sessions)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", sessions / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", type(models.SESSIONS)())
+
+    display, context = _identity_hole_history(True)
+    persisted = Session(session_id="c" * 12, title="t", messages=copy.deepcopy(display))
+    persisted.context_messages = copy.deepcopy(context)
+    persisted.save()
+    loaded = Session.load("c" * 12)
+    assert loaded is not None and loaded.messages[3]["id"] is True  # survives save/load
+
+    session, result = _settled_session(
+        monkeypatch, loaded.messages, loaded.context_messages, result_ids=(None, None, 1, 2),
+    )
+    assert result[2]["id"] == 1 and _reasoning_cards(session.messages) == _ONE_CARD
+    session.save()
+    reloaded = Session.load("b" * 12)
+    assert reloaded is not None
+    assert _reasoning_cards(reloaded.messages) == _ONE_CARD
+    assert [m["id"] for m in reloaded.messages[-2:]] == [1, 2]
+    assert all(type(m["id"]) is int for m in result)  # replayed True row re-minted
+
+
 @pytest.mark.skipif(
     not _REAL_SIDECAR or not pathlib.Path(_REAL_SIDECAR).is_file(),
     reason="set HERMES_WEBUI_REAL_CLONE_SIDECAR to a captured sidecar to run",
