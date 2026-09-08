@@ -12,10 +12,14 @@ import pathlib
 
 import pytest
 
+from api.models import Session
 from api.streaming import (
+    _assign_stable_message_ids,
     _merge_display_messages_after_agent_result,
     _restore_display_reasoning_metadata,
+    _settle_result_messages,
 )
+from api import streaming as _streaming
 
 STREAM_ID = "34d53038e2d3485cb67cd90ef8408faf"
 
@@ -134,6 +138,100 @@ def test_reasoning_only_row_still_restored_when_its_successor_is_present():
         "old turn", "", "old answer", "new turn", "new answer",
     ]
     assert restored[1]["reasoning"] == "visible thinking card"
+
+
+def _repeated_prompt_history(n_anchors: int) -> tuple[list[dict], list[dict]]:
+    display = [
+        {"role": "user", "content": "older turn", "timestamp": 1788356100, "id": 1},
+        {"role": "assistant", "content": "older answer", "timestamp": 1788356200, "id": 2},
+        *[_recovered_anchor(f"recovered thinking {i}", 1788356394 + i) for i in range(n_anchors)],
+        {"role": "user", "content": "continue", "timestamp": 1788357000, "id": 3},
+        {"role": "assistant", "content": "first answer", "timestamp": 1788357010, "id": 4},
+    ]
+    context = [copy.deepcopy(display[-2]), copy.deepcopy(display[-1])]
+    return display, context
+
+
+def _settle_session_turn(session, turn: int, prompt: str, answer: str):
+    """Production order: ids minted on result rows, then restore -> merge."""
+    previous = list(session.messages)
+    previous_context = list(session.context_messages)
+    ts = 1788440000 + turn * 10
+    result = copy.deepcopy(previous_context) + [
+        {"role": "user", "content": prompt, "timestamp": ts},
+        {"role": "assistant", "content": answer, "timestamp": ts + 5},
+    ]
+    _settle_result_messages(session, previous, previous_context, result, prompt, "webui", None)
+
+
+def test_repeated_prompt_with_distinct_stable_id_does_not_realign_anchors(monkeypatch):
+    monkeypatch.setattr(_streaming, "_annotate_media_snapshots_for_settled_messages", lambda m: None)
+    display, context = _repeated_prompt_history(64)
+    session = Session(session_id="a" * 12, title="t", messages=copy.deepcopy(display))
+    session.context_messages = copy.deepcopy(context)
+    assert sum(_is_clone(m) for m in session.messages) == 64
+
+    # Guard the fixture: the new "continue" row is a DIFFERENT turn (id 5) that
+    # is content-identical to the historical successor (id 3).
+    probe = copy.deepcopy(context) + [
+        {"role": "user", "content": "continue", "timestamp": 1788440000},
+        {"role": "assistant", "content": "a different new answer", "timestamp": 1788440005},
+    ]
+    _assign_stable_message_ids(probe, display, context)
+    assert (display[-2]["id"], probe[2]["id"]) == (3, 5)
+    assert _streaming._message_identity(display[-2]) == _streaming._message_identity(probe[2])
+
+    for turn in range(1, 4):
+        _settle_session_turn(session, turn, "continue", f"a different new answer {turn}")
+        assert sum(_is_clone(m) for m in session.messages) == 64, (
+            f"turn {turn}: clone blocks {_clone_blocks(session.messages)}"
+        )
+        assert session.messages[-1]["content"] == f"a different new answer {turn}"
+    # Anchors stay in their original block, right after "older answer".
+    assert _clone_blocks(session.messages) == [64]
+    assert session.messages[1]["content"] == "older answer" and _is_clone(session.messages[2])
+
+
+def test_successor_alignment_prefers_stable_ids_over_content():
+    previous = [
+        {"role": "user", "content": "older turn", "timestamp": 1, "id": 1},
+        {"role": "assistant", "content": "older answer", "timestamp": 2, "id": 2},
+        {"role": "assistant", "content": "", "timestamp": 3, "reasoning": "card"},
+        {"role": "user", "content": "continue", "timestamp": 4, "id": 3},
+        {"role": "assistant", "content": "first answer", "timestamp": 5, "id": 4},
+    ]
+
+    def restore(prev, successor_id, prompt="continue"):
+        row = {"role": "user", "content": prompt}
+        if successor_id is not None:
+            row["id"] = successor_id
+        updated = [
+            {"role": "user", "content": "older turn", "id": 1},
+            {"role": "assistant", "content": "older answer", "id": 2},
+            row,
+            {"role": "assistant", "content": "new answer"},
+        ]
+        restored = _restore_display_reasoning_metadata(copy.deepcopy(prev), updated)
+        return [m.get("content") for m in restored]
+
+    restored_shape = ["older turn", "older answer", "", "continue", "new answer"]
+    skipped_shape = ["older turn", "older answer", "continue", "new answer"]
+    assert restore(previous, 3) == restored_shape
+    assert restore(previous, 5) == skipped_shape
+    # Exactly one side carries an id -> rejected, never a content fallback.
+    # (A workspace-prefixed prompt is identity-equal but escapes id carry-forward.)
+    prefixed = "[Workspace::v1: /tmp/ws] continue"
+    assert _streaming._message_identity({"role": "user", "content": prefixed}) == (
+        _streaming._message_identity(previous[3])
+    )
+    assert restore(previous, None, prefixed) == [
+        "older turn", "older answer", prefixed, "new answer",
+    ]
+    idless = copy.deepcopy(previous)
+    del idless[3]["id"]
+    assert restore(idless, 3) == skipped_shape
+    # Neither side carries an id -> legacy content identity still restores.
+    assert restore(idless, None) == restored_shape
 
 
 _REAL_SIDECAR = os.environ.get("HERMES_WEBUI_REAL_CLONE_SIDECAR", "")

@@ -5951,9 +5951,19 @@ def _restore_display_reasoning_metadata(previous_messages, updated_messages):
         # historical row after the new reply and re-add it every turn.
         if anchor_pos >= len(prev_safe) or not isinstance(existing, dict):
             continue
-        anchor_key = _message_identity(previous_messages[prev_safe[anchor_pos][0]])
-        if anchor_key is None or anchor_key != _message_identity(existing):
-            continue
+        successor = previous_messages[prev_safe[anchor_pos][0]]
+        # Stable ids (#context-message-stable-id) win over content identity:
+        # repeated prompts ("continue") make a distinct current row look like
+        # the historical successor and misplace every anchor before it.
+        successor_id = successor.get('id')
+        existing_id = existing.get('id')
+        if successor_id is not None or existing_id is not None:
+            if successor_id is None or existing_id is None or successor_id != existing_id:
+                continue
+        else:
+            anchor_key = _message_identity(successor)
+            if anchor_key is None or anchor_key != _message_identity(existing):
+                continue
         updated_messages.insert(safe_pos, copy.deepcopy(prev_msg))
         inserted_reasoning_only += 1
     return updated_messages
