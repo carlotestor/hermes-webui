@@ -24492,7 +24492,7 @@ def _handle_chat_sync(handler, body):
                 _dedupe_replayed_context_messages,
                 _merge_display_messages_after_agent_result,
                 _restore_display_reasoning_metadata,
-                _restore_reasoning_metadata,
+                _restore_reasoning_metadata_before_boundary,
                 _sanitize_messages_for_agent,
                 _compact_session_image_parts_for_persistence,
                 _context_messages_for_new_turn,
@@ -24554,10 +24554,10 @@ def _handle_chat_sync(handler, body):
         _turn_boundary = _active_turn_boundary(
             _result_messages, _previous_context_messages, None, msg,
         )
-        _next_context_messages = _restore_reasoning_metadata(
+        _next_context_messages = _restore_reasoning_metadata_before_boundary(
             _previous_context_messages,
             _result_messages,
-            current_turn_boundary=_turn_boundary,
+            _turn_boundary,
         )
         # Mint ids on the shared result rows BEFORE dedupe deep-copies any
         # stale-user boundary row, so both arrays share the id (#5564).

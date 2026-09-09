@@ -2051,8 +2051,8 @@ def _prepare_marker_clean_writeback(
         )
         return (
             cleaned,
-            _restore_reasoning_metadata(
-                previous_context_messages, cleaned, current_turn_boundary=boundary,
+            _restore_reasoning_metadata_before_boundary(
+                previous_context_messages, cleaned, boundary,
             ),
             provenance,
             boundary,
@@ -5932,7 +5932,7 @@ def _estimate_post_compression_context_tokens(agent, context_messages, system_me
         return None
 
 
-def _restore_reasoning_metadata(previous_messages, updated_messages, *, current_turn_boundary=None):
+def _restore_reasoning_metadata(previous_messages, updated_messages):
     """Carry forward display-only metadata lost during API-safe history sanitization.
 
     The provider-facing history strips WebUI-only fields like `reasoning`. When the
@@ -5944,6 +5944,13 @@ def _restore_reasoning_metadata(previous_messages, updated_messages, *, current_
     `timestamp` can be re-stamped with the current time on every new assistant
     response, making prior messages appear to "move" in time.
     """
+    return _restore_reasoning_metadata_before_boundary(previous_messages, updated_messages)
+
+
+def _restore_reasoning_metadata_before_boundary(
+    previous_messages, updated_messages, current_turn_boundary=None,
+):
+    """Boundary-aware core: rows at/after ``current_turn_boundary`` get nothing historical."""
     if not previous_messages or not updated_messages:
         return updated_messages
     updated_messages = list(updated_messages)
@@ -6000,8 +6007,8 @@ def _restore_reasoning_metadata(previous_messages, updated_messages, *, current_
 
 def _restore_display_reasoning_metadata(previous_messages, updated_messages, *, current_turn_boundary=None):
     """Restore display-only thinking rows for visible transcript persistence."""
-    updated_messages = _restore_reasoning_metadata(
-        previous_messages, updated_messages, current_turn_boundary=current_turn_boundary,
+    updated_messages = _restore_reasoning_metadata_before_boundary(
+        previous_messages, updated_messages, current_turn_boundary,
     )
     if not previous_messages or not updated_messages:
         return updated_messages
