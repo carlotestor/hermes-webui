@@ -237,6 +237,77 @@ def test_successor_alignment_prefers_stable_ids_over_content():
 _REAL_SIDECAR = os.environ.get("HERMES_WEBUI_REAL_CLONE_SIDECAR", "")
 
 
+def _assistant_successor_history(n_anchors: int) -> tuple[list[dict], list[dict]]:
+    """64 anchors before a historical assistant ``"Done."`` (id 2); compacted context."""
+    display = [
+        {"role": "user", "content": "do it", "timestamp": 1788356100, "id": 1},
+        *[_recovered_anchor(f"recovered thinking {i}", 1788356394 + i) for i in range(n_anchors)],
+        {"role": "assistant", "content": "Done.", "timestamp": 1788357010, "id": 2},
+    ]
+    context = [copy.deepcopy(display[0]), copy.deepcopy(display[-1])]
+    return display, context
+
+
+def _settle_replacing_result(monkeypatch, display, context, result, prompt):
+    """Result that REPLACES the compacted context (does not extend it)."""
+    monkeypatch.setattr(_streaming, "_annotate_media_snapshots_for_settled_messages", lambda m: None)
+    session = Session(session_id="d" * 12, title="t", messages=copy.deepcopy(display))
+    session.context_messages = copy.deepcopy(context)
+    _settle_result_messages(
+        session, list(session.messages), list(session.context_messages), result, prompt, "webui", None,
+    )
+    return session
+
+
+def test_historical_assistant_successor_with_same_content_does_not_forge_current_id(monkeypatch):
+    display, context = _assistant_successor_history(64)
+    assert sum(_is_clone(m) for m in display) == 64
+    result = [
+        {"role": "user", "content": "do it again", "timestamp": 1788440000},
+        {"role": "assistant", "content": "Done.", "timestamp": 1788440005},
+    ]
+    session = _settle_replacing_result(monkeypatch, display, context, result, "do it again")
+    assert sum(_is_clone(m) for m in session.messages) == 64, _clone_blocks(session.messages)
+    # The distinct current "Done." must NOT inherit the historical successor's id 2.
+    assert result[-1]["id"] != 2 and _streaming._is_stable_message_id(result[-1]["id"])
+    assert _clone_blocks(session.messages) == [64]
+    assert session.messages[-1]["content"] == "Done." and session.messages[-2]["content"] == "do it again"
+
+
+def test_whole_repeated_user_assistant_pair_does_not_forge_or_double(monkeypatch):
+    display, context = _assistant_successor_history(64)
+    result = [
+        {"role": "user", "content": "do it", "timestamp": 1788440000},
+        {"role": "assistant", "content": "Done.", "timestamp": 1788440005},
+    ]
+    session = _settle_replacing_result(monkeypatch, display, context, result, "do it")
+    assert sum(_is_clone(m) for m in session.messages) == 64, _clone_blocks(session.messages)
+    assert [m["id"] for m in result] != [1, 2]
+    assert result[-1]["id"] != 2
+    assert _clone_blocks(session.messages) == [64]
+
+
+def test_assistant_only_result_has_boundary_zero_and_inherits_nothing(monkeypatch):
+    display, context = _assistant_successor_history(4)
+    result = [{"role": "assistant", "content": "Done.", "timestamp": 1788440005}]
+    session = _settle_replacing_result(monkeypatch, display, [context[-1]], result, "do it again")
+    assert result[0]["id"] != 2
+    assert sum(_is_clone(m) for m in session.messages) == 4
+
+
+def test_active_turn_boundary_contract():
+    boundary = _streaming._active_turn_boundary
+    prev = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
+    assert boundary([], prev, None, "x") == 0
+    assert boundary([{"role": "assistant", "content": "Done."}], prev, None, "x") == 0
+    extended = prev + [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]
+    assert boundary(extended, prev, None, "x") == 2
+    replaced = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]
+    assert boundary(replaced, prev, None, "x") == 0
+    tokened = [{"role": "user", "content": "x", "_active_turn_token": "tok"}, {"role": "assistant", "content": "y"}]
+    assert boundary(prev + tokened, prev, {"token": "tok"}, "x") == 2
+
+
 def _identity_hole_history(successor_id) -> tuple[list[dict], list[dict]]:
     """Historical successor carries ``successor_id``; anchor sits right before it."""
     display = [

@@ -1867,6 +1867,46 @@ def _find_active_turn_checkpoint_index(result_messages, previous_context, identi
     return None
 
 
+def _active_turn_boundary(result_messages, previous_context, identity, msg_text):
+    """Index in ``result_messages`` where the current turn starts (0 = all current).
+
+    Proof: active-turn token, then previous context as a strict prefix, then the
+    last user row matching the prompt; else 0. Rows at/after it get nothing historical.
+    """
+    result_messages = list(result_messages or [])
+    if not result_messages:
+        return 0
+    checkpoint_idx = _find_active_turn_checkpoint_index(
+        result_messages, previous_context, identity, msg_text,
+    )
+    if checkpoint_idx is not None:
+        return checkpoint_idx
+    has_user_row = any(
+        isinstance(m, dict) and m.get('role') == 'user' for m in result_messages
+    )
+    if not has_user_row:
+        return 0  # assistant-only result: no independent proof of ownership
+    previous_context = list(previous_context or [])
+    if (
+        previous_context
+        and len(result_messages) > len(previous_context)
+        and _messages_have_prefix(result_messages, previous_context)
+    ):
+        return len(previous_context)
+    expected_text = identity.get('text') if isinstance(identity, dict) else None
+    expected = _normalize_user_text(expected_text if expected_text is not None else msg_text)
+    if expected:
+        for idx in range(len(result_messages) - 1, -1, -1):
+            message = result_messages[idx]
+            if (
+                isinstance(message, dict)
+                and message.get('role') == 'user'
+                and _normalize_user_text(_message_text(message.get('content'))) == expected
+            ):
+                return idx
+    return 0
+
+
 def _materialize_active_turn_user(identity, msg_text, source):
     checkpoint = identity.get('checkpoint') if isinstance(identity, dict) else None
     message = (
@@ -1986,8 +2026,9 @@ def _prepare_marker_clean_writeback(
     previous_context_messages,
     result_messages,
     active_turn_identity=None,
+    msg_text=None,
 ):
-    """Return marker-cleaned rows, next context rows, and nudge provenance."""
+    """Return marker-cleaned rows, next context rows, nudge provenance, boundary."""
     cleaned, has_verification_nudge = _clean_synthetic_control_messages_with_provenance(
         result_messages
     )
@@ -2000,14 +2041,23 @@ def _prepare_marker_clean_writeback(
             cleaned,
             list(previous_context_messages or []),
             provenance,
+            0,
         )
     if cleaned:
+        # The boundary is resolved BEFORE any restoration and reused by every
+        # restore below, so the contract is decided once per settle.
+        boundary = _active_turn_boundary(
+            cleaned, previous_context_messages, active_turn_identity, msg_text,
+        )
         return (
             cleaned,
-            _restore_reasoning_metadata(previous_context_messages, cleaned),
+            _restore_reasoning_metadata(
+                previous_context_messages, cleaned, current_turn_boundary=boundary,
+            ),
             provenance,
+            boundary,
         )
-    return [], list(previous_context_messages or []), provenance
+    return [], list(previous_context_messages or []), provenance, 0
 
 
 def _annotate_media_snapshots_for_settled_messages(messages) -> None:
@@ -2041,10 +2091,12 @@ def _settle_result_messages(
         result_messages,
         next_context_messages,
         verification_nudge_provenance,
+        current_turn_boundary,
     ) = _prepare_marker_clean_writeback(
         previous_context_messages,
         result_messages,
         active_turn_identity,
+        msg_text,
     )
     if result_messages:
         _assign_stable_message_ids(
@@ -2085,7 +2137,9 @@ def _settle_result_messages(
     session.messages = _merge_display_messages_after_agent_result(
         previous_display_for_writeback,
         previous_context_messages,
-        _restore_display_reasoning_metadata(previous_messages, result_messages),
+        _restore_display_reasoning_metadata(
+            previous_messages, result_messages, current_turn_boundary=current_turn_boundary,
+        ),
         msg_text,
         source=source,
         verification_nudge_provenance=verification_nudge_provenance,
@@ -5878,7 +5932,7 @@ def _estimate_post_compression_context_tokens(agent, context_messages, system_me
         return None
 
 
-def _restore_reasoning_metadata(previous_messages, updated_messages):
+def _restore_reasoning_metadata(previous_messages, updated_messages, *, current_turn_boundary=None):
     """Carry forward display-only metadata lost during API-safe history sanitization.
 
     The provider-facing history strips WebUI-only fields like `reasoning`. When the
@@ -5910,7 +5964,9 @@ def _restore_reasoning_metadata(previous_messages, updated_messages):
         return projected
 
     safe_pos = 0
-    while safe_pos < len(prev_safe):
+    # Rows at/after the active-turn boundary belong to the current turn: never
+    # carry historical ids/metadata onto them (same-content successor forgery).
+    while safe_pos < len(prev_safe) and (current_turn_boundary is None or safe_pos < current_turn_boundary):
         prev_idx, _ = prev_safe[safe_pos]
         prev_msg = previous_messages[prev_idx]
         cur_msg = updated_messages[safe_pos] if safe_pos < len(updated_messages) else None
@@ -5942,9 +5998,11 @@ def _restore_reasoning_metadata(previous_messages, updated_messages):
     return updated_messages
 
 
-def _restore_display_reasoning_metadata(previous_messages, updated_messages):
+def _restore_display_reasoning_metadata(previous_messages, updated_messages, *, current_turn_boundary=None):
     """Restore display-only thinking rows for visible transcript persistence."""
-    updated_messages = _restore_reasoning_metadata(previous_messages, updated_messages)
+    updated_messages = _restore_reasoning_metadata(
+        previous_messages, updated_messages, current_turn_boundary=current_turn_boundary,
+    )
     if not previous_messages or not updated_messages:
         return updated_messages
     prev_safe = _api_safe_message_positions(previous_messages)
@@ -5962,6 +6020,9 @@ def _restore_display_reasoning_metadata(previous_messages, updated_messages):
         if prev_idx in safe_indices or not _is_reasoning_only_assistant_message(prev_msg):
             continue
         anchor_pos = sum(1 for idx, _ in prev_safe if idx < prev_idx)
+        # A historical reasoning-only row never restores into the current-turn slice.
+        if current_turn_boundary is not None and anchor_pos >= current_turn_boundary:
+            continue
         safe_pos = anchor_pos + inserted_reasoning_only
         existing = updated_messages[safe_pos] if safe_pos < len(updated_messages) else None
         if isinstance(existing, dict) and _is_reasoning_only_assistant_message(existing):
