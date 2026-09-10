@@ -1870,8 +1870,8 @@ def _find_active_turn_checkpoint_index(result_messages, previous_context, identi
 def _active_turn_boundary(result_messages, previous_context, identity, msg_text):
     """Index in ``result_messages`` where the current turn starts (0 = all current).
 
-    Proof: active-turn token, then previous context as a strict prefix, then the
-    last user row matching the prompt; else 0. Rows at/after it get nothing historical.
+    Proof: active-turn token/index authority, else the last prompt-matching user
+    row AT OR AFTER a content-matching previous-context prefix; else 0 (fail closed).
     """
     result_messages = list(result_messages or [])
     if not result_messages:
@@ -1881,22 +1881,20 @@ def _active_turn_boundary(result_messages, previous_context, identity, msg_text)
     )
     if checkpoint_idx is not None:
         return checkpoint_idx
-    has_user_row = any(
-        isinstance(m, dict) and m.get('role') == 'user' for m in result_messages
-    )
-    if not has_user_row:
-        return 0  # assistant-only result: no independent proof of ownership
+    # A content-only prefix is NOT ownership proof: _message_identity ignores
+    # ids/timestamps, so a compacted current-only result can echo old context.
     previous_context = list(previous_context or [])
+    candidate_start = 0
     if (
         previous_context
         and len(result_messages) > len(previous_context)
         and _messages_have_prefix(result_messages, previous_context)
     ):
-        return len(previous_context)
+        candidate_start = len(previous_context)
     expected_text = identity.get('text') if isinstance(identity, dict) else None
     expected = _normalize_user_text(expected_text if expected_text is not None else msg_text)
     if expected:
-        for idx in range(len(result_messages) - 1, -1, -1):
+        for idx in range(len(result_messages) - 1, candidate_start - 1, -1):
             message = result_messages[idx]
             if (
                 isinstance(message, dict)

@@ -24491,6 +24491,7 @@ def _handle_chat_sync(handler, body):
                 _assign_stable_message_ids,
                 _dedupe_replayed_context_messages,
                 _merge_display_messages_after_agent_result,
+                _resolve_active_turn_authority,
                 _restore_display_reasoning_metadata,
                 _restore_reasoning_metadata_before_boundary,
                 _sanitize_messages_for_agent,
@@ -24550,9 +24551,15 @@ def _handle_chat_sync(handler, body):
                 os.environ["HERMES_SESSION_KEY"] = old_session_key
     with _get_session_agent_lock(s.session_id):
         _result_messages = result.get("messages") or _previous_context_messages
-        # Active-turn boundary is fixed BEFORE any restoration (same as streaming).
+        # Active-turn boundary is fixed BEFORE any restoration (same as streaming),
+        # using whatever exact turn authority the result/Agent pair exported.
+        _active_turn_identity = _resolve_active_turn_authority(
+            {"token": None, "text": msg, "current_turn_user_idx": None, "turn_id": ""},
+            result=result,
+            agent=agent,
+        )
         _turn_boundary = _active_turn_boundary(
-            _result_messages, _previous_context_messages, None, msg,
+            _result_messages, _previous_context_messages, _active_turn_identity, msg,
         )
         _next_context_messages = _restore_reasoning_metadata_before_boundary(
             _previous_context_messages,
