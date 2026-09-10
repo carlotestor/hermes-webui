@@ -38,6 +38,7 @@ from api.config import (
     _set_thread_env, _clear_thread_env,
     register_active_run, update_active_run, unregister_active_run,
     unregister_stream_owner,
+    peek_stream,
     stream_owner_session_id,
     session_writeback_owner,
     clear_session_writeback_owner_if_owned,
@@ -189,17 +190,40 @@ def _compact_for_echo_compare(value: str) -> str:
 
 
 def _strip_compact_echo_suffix(value: str, suffix: str, *, search_window: int = 4096) -> tuple[str, bool]:
-    """Remove ``suffix`` from ``value`` when they match after whitespace folding."""
+    """Remove ``suffix`` from ``value`` when they match after whitespace folding.
+
+    The search window is folded once and the cut point is then located by
+    walking backwards across the echo itself. The previous implementation
+    probed every candidate cut index and re-folded the whole remaining tail for
+    each probe, which is quadratic in the window size: a 6000-character final
+    message cost seconds of CPU, held under the GIL, stalling every other
+    stream in the process.
+
+    ``str.isspace`` is used for the backwards walk instead of the ``\\s``
+    pattern used by :func:`_compact_for_echo_compare`. The two agree on every
+    Unicode code point, so the folded view and the walk stay consistent.
+    """
     raw = str(value or '')
     candidate = _compact_for_echo_compare(suffix)
     if not raw or not candidate:
         return raw, False
     tail = raw[-max(len(str(suffix or '')) * 3, search_window):]
     offset = len(raw) - len(tail)
-    for idx in range(len(tail) + 1):
-        if _compact_for_echo_compare(tail[idx:]) == candidate:
-            return raw[: offset + idx].rstrip(), True
-    return raw, False
+    compact_tail = _compact_for_echo_compare(tail)
+    if len(candidate) > len(compact_tail) or not compact_tail.endswith(candidate):
+        return raw, False
+    # Consume exactly as many non-whitespace characters as the folded suffix
+    # holds; ``idx`` then sits on the first character of the echo. Whitespace
+    # sitting between the kept text and the echo is removed by ``rstrip``,
+    # which is why this lands on the same result as the leftmost cut index the
+    # probing loop used to return.
+    remaining = len(candidate)
+    idx = len(tail)
+    while remaining and idx:
+        idx -= 1
+        if not tail[idx].isspace():
+            remaining -= 1
+    return raw[: offset + idx].rstrip(), True
 
 
 def _redacted_session_payload_with_full_messages(session, *, tool_calls=None) -> dict | None:
@@ -2800,11 +2824,11 @@ def _reset_streaming_hermes_home_override(override_mod, override_token, override
 # the _run_agent_streaming thread (concurrent tool batches use
 # contextvars.copy_context() so children inherit this binding); binding the
 # context-local here makes the capture task/thread-local and race-immune.
-def _set_turn_session_identity(session_id: str):
+def _set_turn_session_identity(session_id: str, workspace: str = ""):
     """Bind THIS turn's session identity to the current (task/thread-local)
     context and return an opaque token for _reset_turn_session_identity.
 
-    Binds three context-locals so every session-key / UI-owner consumer is
+    Binds four context-locals so every session-key / UI-owner consumer is
     covered without a race:
       * ``tools.approval._approval_session_key`` — checked FIRST by
         ``get_current_session_key`` (the exact call terminal_tool.py makes for
@@ -2815,6 +2839,18 @@ def _set_turn_session_identity(session_id: str):
         return address stamped onto ProcessSession.origin_ui_session_id and
         completion events by modern hermes-agent builds. Authoritative for
         wakeup routing when present (see ``_resolve_completion_target``).
+      * ``agent.runtime_cwd._SESSION_CWD`` — this turn's workspace, when
+        *workspace* is given. The WebUI runs the agent IN-PROCESS, so
+        ``os.getcwd()`` is the server's launch directory, not the workspace the
+        user selected. Anything resolving a default working directory from the
+        process therefore lands in the Hermes install tree: measured, every
+        conductor child spawned from a WebUI session recorded
+        ``workdir=~/.hermes/hermes-agent`` while the selected workspace was
+        ``~/workspace``, which also fed those children the install tree's own
+        contributor ``AGENTS.md`` as workspace doctrine. ``TERMINAL_CWD`` is
+        already set per turn for the same purpose but is a process-global that
+        concurrent turns overwrite; this contextvar is task-local, so it is
+        race-immune for exactly the reason the three bindings above are.
 
     It deliberately does NOT call ``gateway.session_context.set_session_vars``:
     that blanket setter also zeroes the platform/chat_id/user contextvars,
@@ -2839,6 +2875,16 @@ def _set_turn_session_identity(session_id: str):
         tokens["ui_session_id"] = _UI_SID.set(sid)
     except Exception:
         logger.debug("per-turn _SESSION_UI_SESSION_ID bind failed", exc_info=True)
+    if workspace:
+        # Bound via the ContextVar directly, not ``set_session_cwd``, so the
+        # reset below can use reset-token semantics like every sibling above.
+        # ``clear_session_cwd()`` would instead pin "" and mask the CLI/cron
+        # env fallback for a reused thread-pool worker.
+        try:
+            from agent.runtime_cwd import _SESSION_CWD as _SCWD
+            tokens["session_cwd"] = _SCWD.set(str(workspace))
+        except Exception:
+            logger.debug("per-turn _SESSION_CWD bind failed", exc_info=True)
     return tokens
 
 
@@ -2853,6 +2899,13 @@ def _reset_turn_session_identity(tokens) -> None:
     """
     if not tokens:
         return
+    tok = tokens.get("session_cwd")
+    if tok is not None:
+        try:
+            from agent.runtime_cwd import _SESSION_CWD as _SCWD
+            _SCWD.reset(tok)
+        except Exception:
+            logger.debug("per-turn _SESSION_CWD reset failed", exc_info=True)
     tok = tokens.get("ui_session_id")
     if tok is not None:
         try:
@@ -3872,6 +3925,71 @@ def _strip_workspace_prefix(text: str, *, include_legacy: bool = False) -> str:
     return stripped.strip()
 
 
+_TITLE_ATTACHMENT_SUFFIX_RE = re.compile(
+    r'(?:\n\n|\r\n\r\n)\[Attached files(?: for this steer)?: [^\]]+\]\s*$'
+)
+
+
+def _strip_title_attachment_suffix(text) -> str:
+    """Remove one exact WebUI-generated terminal attachment suffix."""
+    return _TITLE_ATTACHMENT_SUFFIX_RE.sub('', str(text or ''))
+
+
+def _strip_title_input_metadata(text) -> str:
+    """Remove only internal title metadata from one selected text value."""
+    value = _strip_title_attachment_suffix(text)
+    return _strip_workspace_prefix(value).strip()
+
+
+def _title_structured_text_parts(
+    content, allowed_types, *, normalize_types: bool = False
+) -> list[str]:
+    """Sanitize accepted structured title parts without mutating the content."""
+    parts = []
+    workspace_prefix_stripped = False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = str(part.get('type') or '').lower() if normalize_types else part.get('type')
+        if part_type not in allowed_types:
+            continue
+        text = (
+            str(part.get('text') or '')
+            if not normalize_types
+            else _message_content_part_text(part)
+        )
+        if text.strip() and not workspace_prefix_stripped:
+            text = _strip_title_input_metadata(text)
+            workspace_prefix_stripped = bool(text)
+        parts.append(text)
+    return parts
+
+
+def _title_input_text(content) -> str:
+    """Extract raw title text using the same content rules as title_from."""
+    if content is None:
+        return ''
+    if isinstance(content, list):
+        return ' '.join(
+            _title_structured_text_parts(content, ('text',), normalize_types=False)
+        ).strip()
+    return _strip_title_input_metadata(str(content))
+
+
+_TITLE_MIXED_PART_TYPES = ('', 'text', 'input_text', 'output_text')
+
+
+def _title_exchange_input_text(content) -> str:
+    """Extract sanitized first/latest-exchange title input text."""
+    if isinstance(content, list):
+        return '\n'.join(
+            _title_structured_text_parts(
+                content, _TITLE_MIXED_PART_TYPES, normalize_types=True
+            )
+        ).strip()
+    return _strip_title_input_metadata(str(content or '').strip())
+
+
 def _looks_like_current_user_turn(msg, msg_text) -> bool:
     """Match the current human turn even if an internal workspace tag leaked mid-text.
 
@@ -3906,7 +4024,7 @@ def _first_exchange_snippets(messages):
             continue
         role = m.get('role')
         if role == 'user':
-            candidate = _message_text(m.get('content'))
+            candidate = _strip_thinking_markup(_title_exchange_input_text(m.get('content')))
             if not user_text and candidate:
                 user_text = candidate
                 continue
@@ -3947,9 +4065,13 @@ def _latest_exchange_snippets(messages):
                 continue
             if candidate:
                 asst_text = candidate
-        elif role == 'user' and not user_text:
-            candidate = _message_text(m.get('content'))
-            if candidate:
+        elif role == 'user':
+            candidate = _strip_thinking_markup(_title_exchange_input_text(m.get('content')))
+            if not candidate:
+                user_text = ''
+                asst_text = ''
+                break
+            if not user_text:
                 user_text = candidate
         if user_text and asst_text:
             break
@@ -3982,14 +4104,51 @@ def _get_title_refresh_interval() -> int:
 
 def _is_provisional_title(current_title: str, messages) -> bool:
     """Heuristic: title equals first-message substring placeholder."""
-    derived = title_from(messages, '') or ''
-    if not derived:
+    first_user_text = ''
+    for message in messages or []:
+        if not isinstance(message, dict) or message.get('role') != 'user':
+            continue
+        first_user_text = _title_input_text(message.get('content'))
+        if first_user_text:
+            break
+    if not first_user_text:
         return False
+    sanitized_derived = title_from([{'role': 'user', 'content': first_user_text}], '') or ''
+    raw_derived = title_from(messages or [], '') or ''
+    if not sanitized_derived:
+        return False
+
+    def _normalize_candidate(value):
+        return re.sub(r'\s+', ' ', str(value or '')[:64]).strip()
+
     current = re.sub(r'\s+', ' ', str(current_title or '')).strip()
-    candidate = re.sub(r'\s+', ' ', str(derived[:64] or '')).strip()
-    if not current or not candidate:
+    candidates = (
+        _normalize_candidate(sanitized_derived),
+        _normalize_candidate(raw_derived),
+    )
+    if not current:
         return False
-    return current == candidate
+    return any(candidate and current == candidate for candidate in candidates)
+
+
+def _background_title_generation_inputs(session):
+    """Return sanitized first-exchange inputs when background title generation is eligible."""
+    messages = getattr(session, 'messages', None) or []
+    title = getattr(session, 'title', '')
+    invalid_existing_title = _looks_invalid_generated_title(title)
+    eligible_title = (
+        title == 'Untitled'
+        or title == 'New Chat'
+        or not title
+        or _is_provisional_title(title, messages)
+        or invalid_existing_title
+    )
+    if not eligible_title or (
+        getattr(session, 'llm_title_generated', False) and not invalid_existing_title
+    ):
+        return None
+    user_text, assistant_text = _first_exchange_snippets(messages)
+    return (user_text, assistant_text) if user_text and assistant_text else None
 
 
 def _detect_title_language(text: str) -> str:
@@ -4488,12 +4647,12 @@ def generate_title_raw_via_agent(agent, user_text: str, assistant_text: str) -> 
                         if 'max_output_tokens' in codex_kwargs:
                             codex_kwargs['max_output_tokens'] = max_tokens
                         resp = agent._run_codex_stream(codex_kwargs)
-                        assistant_message, _ = agent._normalize_codex_response(resp)
-                        raw = (assistant_message.content or '') if assistant_message else ''
+                        normalized = agent._get_transport('codex_responses').normalize_response(resp)
+                        raw = (normalized.content or '') if normalized else ''
                         if not raw:
                             empty_status = 'llm_empty'
                     elif getattr(agent, 'api_mode', '') == 'anthropic_messages':
-                        from agent.anthropic_adapter import build_anthropic_kwargs, normalize_anthropic_response
+                        from agent.anthropic_adapter import build_anthropic_kwargs
                         ant_kwargs = build_anthropic_kwargs(
                             model=agent.model,
                             messages=api_messages,
@@ -4505,10 +4664,10 @@ def generate_title_raw_via_agent(agent, user_text: str, assistant_text: str) -> 
                             base_url=getattr(agent, '_anthropic_base_url', None),
                         )
                         resp = agent._anthropic_messages_create(ant_kwargs)
-                        assistant_message, _ = normalize_anthropic_response(
+                        normalized = agent._get_transport().normalize_response(
                             resp, strip_tool_prefix=getattr(agent, '_is_anthropic_oauth', False)
                         )
-                        raw = (assistant_message.content or '') if assistant_message else ''
+                        raw = (normalized.content or '') if normalized else ''
                         if not raw:
                             empty_status = 'llm_empty'
                     else:
@@ -4589,7 +4748,7 @@ def _generate_llm_session_title_for_agent(agent, user_text: str, assistant_text:
     return None, 'llm_invalid', str(raw)[:120]
 
 
-def _generate_llm_session_title_via_aux(user_text: str, assistant_text: str, agent=None, *, use_agent_model: bool = False) -> tuple[Optional[str], str, str]:
+def _generate_llm_session_title_via_aux(user_text: str, assistant_text: str, agent=None, *, use_agent_model: bool = False, conversation_id: str = '') -> tuple[Optional[str], str, str]:
     """Generate a title via dedicated auxiliary LLM route, then sanitize/validate result.
 
     When use_agent_model is False (default), the auxiliary client resolves
@@ -4597,6 +4756,11 @@ def _generate_llm_session_title_via_aux(user_text: str, assistant_text: str, age
     prevents the session's chat model (e.g. a Chinese model) from overriding
     the dedicated title model.  When True, the agent's attrs are passed through
     (legacy fallback behaviour).
+
+    conversation_id republishes the webui session id as the Agent's ambient
+    conversation context for the duration of the aux call, so OpenCode relay
+    targets receive the same ``x-opencode-session`` sticky key as the session's
+    main turns (#7470). The context is reset in all exit paths.
     """
     if use_agent_model and agent:
         provider = getattr(agent, 'provider', '')
@@ -4606,13 +4770,30 @@ def _generate_llm_session_title_via_aux(user_text: str, assistant_text: str, age
         provider = ''
         model = ''
         base_url = ''
-    raw, status = generate_title_raw_via_aux(
-        user_text,
-        assistant_text,
-        provider=provider,
-        model=model,
-        base_url=base_url,
-    )
+    ctx_token = None
+    if conversation_id:
+        try:
+            from agent.portal_tags import set_conversation_context
+            ctx_token = set_conversation_context(str(conversation_id))
+        except Exception:
+            # Older/absent agent runtime: proceed without conversation context
+            # (previous behaviour) rather than failing title generation.
+            ctx_token = None
+    try:
+        raw, status = generate_title_raw_via_aux(
+            user_text,
+            assistant_text,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+        )
+    finally:
+        if ctx_token is not None:
+            try:
+                from agent.portal_tags import reset_conversation_context
+                reset_conversation_context(ctx_token)
+            except Exception:
+                pass
     if not raw:
         return None, status, ''
     title = _sanitize_generated_title(raw)
@@ -4762,9 +4943,9 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
             if agent and not aux_title_configured:
                 next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
                 if not next_title and llm_status in ('llm_error', 'llm_invalid'):
-                    next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, use_agent_model=True)
+                    next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, use_agent_model=True, conversation_id=session_id)
             else:
-                next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text)
+                next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, conversation_id=session_id)
                 if not next_title and agent and llm_status in ('llm_error_aux', 'llm_invalid_aux'):
                     next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
             source = llm_status
@@ -4860,9 +5041,9 @@ def _run_background_title_refresh(session_id: str, user_text: str, assistant_tex
             if agent and not aux_title_configured:
                 next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
                 if not next_title and llm_status in ('llm_error', 'llm_invalid'):
-                    next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, use_agent_model=True)
+                    next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, use_agent_model=True, conversation_id=session_id)
             else:
-                next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text)
+                next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, conversation_id=session_id)
                 if not next_title and agent and llm_status in ('llm_error_aux', 'llm_invalid_aux'):
                     next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
         if not next_title:
@@ -4925,7 +5106,7 @@ def generate_session_title_for_session(session, *, prefer_latest: bool = False, 
     with profiles_api.profile_env_for_background_worker(session, "manual title regeneration", logger_override=logger):
         if not _aux_title_generation_enabled():
             return None, 'title_generation_disabled', ''
-        next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent)
+        next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, conversation_id=getattr(session, 'session_id', '') or '')
     if next_title:
         return next_title, llm_status, raw_preview
     fallback_title = _fallback_title_from_exchange(user_text, assistant_text)
@@ -8529,14 +8710,19 @@ def _attempt_credential_self_heal(
 def _agent_cache_api_key_sig(resolved_api_key, credential_pool) -> str:
     """Return the cache-signature component for runtime credentials.
 
-    Credential-pool providers can legitimately hand WebUI a different runtime
-    token on each request (round-robin pools, OAuth refresh, auth self-heal).
-    The AIAgent object is also where cross-turn memory-provider state lives, so
-    using the volatile token itself in the cache signature silently defeats the
-    per-session agent cache and drops warmed Hindsight prefetch results.
+    Credential-pool providers and callable key_cmd sources can legitimately
+    hand WebUI a different runtime token on each request (round-robin pools,
+    OAuth refresh, auth self-heal). The AIAgent object is also where cross-turn
+    memory-provider state lives, so using a volatile token in the cache
+    signature silently defeats the per-session agent cache and drops warmed
+    Hindsight prefetch results.
     """
     if credential_pool is not None:
         return 'credential-pool'
+    if not isinstance(resolved_api_key, str) and callable(resolved_api_key):
+        # key_cmd credentials are resolved by the client at request time; do
+        # not mint or stringify a potentially secret token for cache identity.
+        return 'dynamic-credential'
     import hashlib as _hashlib
     return _hashlib.sha256((resolved_api_key or '').encode()).hexdigest()[:16]
 
@@ -8791,7 +8977,7 @@ def _run_agent_streaming(
     """
     _turn_route_model = model
     _turn_route_provider = model_provider
-    q = STREAMS.get(stream_id)
+    q = peek_stream(stream_id)
     if q is None:
         # The stream was cancelled before the worker started; the route layer
         # already registered the stream owner, so release it here to avoid
@@ -9259,7 +9445,17 @@ def _run_agent_streaming(
         # captures THIS session, not a concurrent turn's process-global env).
         # Co-located with the existing env-restore lifecycle: set here, reset
         # in the outer finally next to _clear_thread_env().
-        _turn_session_identity_tokens = _set_turn_session_identity(session_id)
+        # Resolved the same way as `s.workspace` below so the bound cwd and the
+        # session's own record cannot disagree. Guarded: a turn must not die
+        # here because a workspace path is malformed.
+        try:
+            _turn_workspace_cwd = str(Path(workspace).expanduser().resolve())
+        except Exception:
+            _turn_workspace_cwd = ""
+            logger.debug("per-turn workspace cwd resolve failed", exc_info=True)
+        _turn_session_identity_tokens = _set_turn_session_identity(
+            session_id, workspace=_turn_workspace_cwd
+        )
         s = get_session(session_id)
         _turn_pending_source = getattr(s, 'pending_user_source', None) or 'webui'
         _active_turn_identity = _active_turn_authority(s, stream_id, msg_text)
@@ -11634,17 +11830,7 @@ def _run_agent_streaming(
                 # Only auto-generate title when still default; preserves user renames
                 if s.title == 'Untitled' or s.title == 'New Chat' or not s.title:
                     s.title = title_from(s.messages, s.title)
-                _looks_default = (s.title == 'Untitled' or s.title == 'New Chat' or not s.title)
-                _looks_provisional = _is_provisional_title(s.title, s.messages)
-                _invalid_existing_title = _looks_invalid_generated_title(s.title)
-                _should_bg_title = (
-                    (_looks_default or _looks_provisional or _invalid_existing_title)
-                    and (not getattr(s, 'llm_title_generated', False) or _invalid_existing_title)
-                )
-                _u0 = ''
-                _a0 = ''
-                if _should_bg_title:
-                    _u0, _a0 = _first_exchange_snippets(s.messages)
+                _bg_title_inputs = _background_title_generation_inputs(s)
                 # Read token/cost usage from the agent object (if available).
                 # Per-turn overwrite (#1857): replace cumulative session totals with the
                 # agent's most recent values, which already represent the current turn's
@@ -12406,10 +12592,10 @@ def _run_agent_streaming(
                 # misbehaving log handler here would otherwise skip the
                 # background-title thread spawn below. (#4923 gate hardening)
                 pass
-            if _should_bg_title and _u0 and _a0:
+            if _bg_title_inputs:
                 threading.Thread(
                     target=_run_background_title_update,
-                    args=(s.session_id, _u0, _a0, str(s.title or '').strip(), put, agent),
+                    args=(s.session_id, *_bg_title_inputs, str(s.title or '').strip(), put, agent),
                     daemon=True,
                 ).start()
             else:
