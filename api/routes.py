@@ -2076,10 +2076,12 @@ def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
         return
     row["pinned"] = remote
     try:
-        session = get_session(sid)
-        session = _ensure_full_session_before_mutation(sid, session)
-        if bool(getattr(session, "pinned", False)) != remote:
-            with _get_session_agent_lock(sid):
+        # Load, check and save under the per-session lock so a concurrent
+        # mutation cannot be overwritten by a stale full-session object.
+        with _get_session_agent_lock(sid):
+            session = get_session(sid)
+            session = _ensure_full_session_before_mutation(sid, session)
+            if bool(getattr(session, "pinned", False)) != remote:
                 session.pinned = remote
                 session.save(touch_updated_at=False)
     except Exception:
