@@ -311,3 +311,24 @@ def test_agent_session_pinned_flags_reads_state_db(tmp_path, monkeypatch):
     assert models.agent_session_pinned_flags(["p", "u", "missing"]) == {"p": True, "u": False}
     monkeypatch.setattr(models, "_agent_state_db_path", lambda profile=None: None)
     assert models.agent_session_pinned_flags(["p"]) == {}
+
+
+def test_reconcile_loads_session_under_agent_lock(monkeypatch):
+    import threading
+    from api import routes
+
+    lock = threading.RLock()
+    events = []
+
+    class _Sess:
+        pinned = False
+        def save(self, touch_updated_at=True):
+            events.append(("save", lock._is_owned()))
+
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda sid: lock)
+    monkeypatch.setattr(routes, "get_session", lambda sid: events.append(("load", lock._is_owned())) or _Sess())
+    monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda sid, s: s)
+    row = {"session_id": "s1", "pinned": False}
+    routes._reconcile_sidebar_pin_with_state_db(row, {"pinned": True})
+    assert row["pinned"] is True
+    assert events == [("load", True), ("save", True)]
