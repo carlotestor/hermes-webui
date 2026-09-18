@@ -8156,7 +8156,7 @@ def _get_fresh_memory_models_cache(now: float) -> dict | None:
     return None
 
 
-def invalidate_models_cache():
+def invalidate_models_cache(*, delete_disk: bool = True):
     """Force the TTL cache for get_available_models() to be cleared.
 
     Call this after modifying config.cfg in-memory (e.g. in tests) so
@@ -8169,6 +8169,14 @@ def invalidate_models_cache():
     that call invalidate_models_cache() still get back the previous test's
     result from the disk cache because the disk hit is checked before the memory
     cache rebuild runs.
+
+    ``delete_disk=False`` drops only the in-memory snapshot and leaves the
+    per-profile disk cache in place. Use it when the *sources* have not
+    changed and the caller merely needs the next request to re-resolve which
+    profile's catalog to serve (e.g. a per-client profile switch): the disk
+    cache is already keyed per profile and guarded by
+    _models_cache_source_fingerprint(), so a stale snapshot is rejected on
+    read without paying for a full rebuild (live provider fetches).
     """
     global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts
     global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _cache_build_cv
@@ -8187,7 +8195,8 @@ def invalidate_models_cache():
         _CREDENTIAL_POOL_CACHE.clear()
     # Also delete the disk cache so the next cold build starts fresh.
     # Disk delete is outside the lock — file I/O shouldn't block other readers.
-    _delete_models_cache_on_disk()
+    if delete_disk:
+        _delete_models_cache_on_disk()
     try:
         from api.plugin_providers import invalidate_plugin_model_provider_cache
 
