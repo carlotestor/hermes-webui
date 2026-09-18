@@ -66,6 +66,26 @@ the fingerprint captured at publish time.
   TTL expires. When the runtime version cannot be resolved (early boot), that
   check is skipped rather than wedging the boot.
 
+## Invalidation modes (`invalidate_models_cache`)
+
+`invalidate_models_cache(*, delete_disk=True)` is the only entry point that
+drops the published snapshot. It has two modes:
+
+| Mode | What is dropped | When to use |
+| --- | --- | --- |
+| `delete_disk=True` (default) | in-memory snapshot **and** the per-profile `models_cache.json` on disk | A source may have changed, or test isolation requires a guaranteed cold build. Every pre-existing caller keeps this mode. |
+| `delete_disk=False` | in-memory snapshot only; the disk snapshot is left in place | The sources have **not** changed and the caller only needs the next request to re-resolve *which* profile's catalog to serve. |
+
+`POST /api/profile/switch` uses `delete_disk=False`. The disk cache is already
+keyed per profile (`_get_models_cache_path()`), and a stale or wrong-profile
+snapshot is rejected on read by `_is_loadable_disk_cache()` via the source
+fingerprint above, so deleting it on a switch bought no correctness — it only
+forced a full cold rebuild (live provider `fetch_models` calls, several seconds)
+on every switch. Because this mode leans entirely on the fingerprint check, it
+is safe only while that check stays the single gate for serving a disk snapshot
+(change-protocol items 1 and 4). Both modes must still call
+`_sync_models_cache_provenance()` so the hot-path tuple cannot tear.
+
 ## Change protocol
 
 1. Add or change a source axis in `_models_cache_source_fingerprint()` only —
@@ -89,6 +109,11 @@ the fingerprint captured at publish time.
 timestamp-only churn keeps the fingerprint identical (and a session visit after a
 Codex refresh needs no live rebuild), while genuine changes — a new model, a
 visibility change, any catalog field, any unknown field — still invalidate.
+
+`tests/test_profile_switch_models_disk_cache.py` covers the invalidation modes:
+`delete_disk=False` keeps the disk file and the next `get_available_models()`
+reloads it without a live rebuild, the default still unlinks it, and the
+executed `/api/profile/switch` route passes `delete_disk=False`.
 
 ## References
 

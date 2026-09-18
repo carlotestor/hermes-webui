@@ -14,10 +14,8 @@ The switch route now uses ``invalidate_models_cache(delete_disk=False)``.
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
-REPO = Path(__file__).resolve().parent.parent
+import json
+from urllib.parse import urlparse
 
 
 def _catalog(label: str) -> dict:
@@ -110,17 +108,81 @@ def test_memory_only_invalidate_serves_next_request_from_disk_without_rebuild(tm
     assert result["default_model"] == "disk-model"
 
 
-def test_profile_switch_route_preserves_disk_cache():
-    """The switch handler must opt out of the disk delete."""
-    src = (REPO / "api" / "routes.py").read_text(encoding="utf-8")
-    start = src.index('if parsed.path == "/api/profile/switch":')
-    end = src.index('if parsed.path == "/api/profile/create":', start)
-    block = src[start:end]
+class _FakeHandler:
+    def __init__(self):
+        self.status = None
+        self.sent_headers: list[tuple[str, str]] = []
+        self.body = bytearray()
+        self.wfile = self
+        self.headers = {}
 
-    calls = re.findall(r"invalidate_models_cache\(([^)]*)\)", block)
-    assert calls, "switch route must still invalidate the in-memory models cache (#1200)"
-    for args in calls:
-        assert "delete_disk=False" in args, (
-            "/api/profile/switch must call invalidate_models_cache(delete_disk=False); "
-            "deleting the disk cache forces a multi-second cold rebuild on every switch"
-        )
+    def send_response(self, code):
+        self.status = code
+
+    def send_header(self, key, value):
+        self.sent_headers.append((key, value))
+
+    def end_headers(self):
+        pass
+
+    def write(self, data):
+        self.body.extend(data if isinstance(data, (bytes, bytearray)) else data.encode("utf-8"))
+
+    def get_json(self):
+        return json.loads(self.body.decode("utf-8"))
+
+
+def _drive_profile_switch(monkeypatch, name: str = "demo") -> _FakeHandler:
+    """Execute POST /api/profile/switch through routes.handle_post with the
+    auth / CSRF / profile-fs / watcher collaborators stubbed out, leaving
+    ``config.invalidate_models_cache`` to whatever the caller installed."""
+    from api import gateway_watcher, profiles, routes
+
+    for mod in ("api.auth", "api.helpers", "api.routes"):
+        monkeypatch.setattr(f"{mod}.is_auth_enabled", lambda: False, raising=False)
+    monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(routes, "read_body", lambda handler: {"name": name})
+    monkeypatch.setattr(profiles, "_validate_profile_name", lambda _name: None)
+    monkeypatch.setattr(profiles, "switch_profile", lambda _name, process_wide=False: {"ok": True, "name": _name})
+    monkeypatch.setattr(gateway_watcher, "restart_watcher_for_profile", lambda _name: None)
+
+    handler = _FakeHandler()
+    routes.handle_post(handler, urlparse("/api/profile/switch"))
+    return handler
+
+
+def test_profile_switch_route_calls_invalidate_with_delete_disk_false(monkeypatch):
+    """Executed-route guard: the live switch handler must pass
+    ``delete_disk=False`` (not rely on the default, which unlinks the disk
+    cache and forces a cold rebuild)."""
+    from api import config
+
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda *a, **kw: calls.append((a, kw)))
+
+    handler = _drive_profile_switch(monkeypatch)
+
+    assert handler.status == 200, handler.body.decode("utf-8", "replace")
+    assert handler.get_json() == {"ok": True, "name": "demo"}
+    assert calls == [((), {"delete_disk": False})], (
+        "/api/profile/switch must call invalidate_models_cache(delete_disk=False) exactly once; "
+        f"got {calls!r}"
+    )
+
+
+def test_profile_switch_route_leaves_disk_cache_file_in_place(tmp_path, monkeypatch):
+    """End-to-end through the real ``invalidate_models_cache``: after the
+    executed switch route, the in-memory catalog is dropped but the
+    per-profile disk snapshot still exists."""
+    from api import config as cfg
+
+    cache_path = tmp_path / "models_cache.profile.json"
+    cache_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    _prime_memory_cache(monkeypatch, _catalog("old-profile-model"))
+
+    handler = _drive_profile_switch(monkeypatch)
+
+    assert handler.status == 200, handler.body.decode("utf-8", "replace")
+    assert cfg._available_models_cache is None, "switch must still drop the in-memory catalog (#1200)"
+    assert cache_path.exists(), "switch must not unlink the per-profile disk cache"
