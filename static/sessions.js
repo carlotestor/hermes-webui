@@ -4095,6 +4095,24 @@ function _sessionSnapshotById(sid){
   if(S.session&&S.session.session_id===sid) return S.session;
   return (_allSessions||[]).find(s=>s&&s.session_id===sid)||null;
 }
+// Pin/unpin a sidebar row. Shared by the row action menu and shift-click
+// (the same gesture Hermes Desktop uses), so both surfaces agree.
+async function _toggleSessionPinned(session){
+  if(!session||!session.session_id) return;
+  const newPinned=!session.pinned;
+  try{
+    await api('/api/session/pin',{method:'POST',body:JSON.stringify({session_id:session.session_id,pinned:newPinned})});
+    session.pinned=newPinned;
+    const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
+    if(cached) cached.pinned=newPinned;
+    if(S.session&&S.session.session_id===session.session_id) S.session.pinned=newPinned;
+    renderSessionListFromCache();
+    void renderSessionList();
+  }catch(err){
+    showToast(t('session_pin_failed')+err.message);
+    await renderSessionList();
+  }
+}
 function _pinnedSessionCount(){
   return (_allSessions||[]).filter(s=>s&&s.pinned&&!s.archived).length;
 }
@@ -4938,19 +4956,7 @@ function _openSessionActionMenu(session, anchorEl){
     session.pinned?ICONS.pin:ICONS.unpin,
     async()=>{
       closeSessionActionMenu();
-      const newPinned=!session.pinned;
-      try{
-        await api('/api/session/pin',{method:'POST',body:JSON.stringify({session_id:session.session_id,pinned:newPinned})});
-        session.pinned=newPinned;
-        const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
-        if(cached) cached.pinned=newPinned;
-        if(S.session&&S.session.session_id===session.session_id) S.session.pinned=newPinned;
-        renderSessionListFromCache();
-        void renderSessionList();
-      }catch(err){
-        showToast(t('session_pin_failed')+err.message);
-        await renderSessionList();
-      }
+      await _toggleSessionPinned(session);
     },
     session.pinned?'is-active':''
   ));
@@ -9015,6 +9021,15 @@ function renderSessionListFromCache(){
     el.onpointerup=(e)=>{
       if(e.pointerType==='touch') return;
       if(e.pointerType==='mouse' && e.button!==0) return;  // ignore right/middle click
+      // Shift-click pins/unpins, matching Hermes Desktop's sidebar gesture.
+      if(e.shiftKey&&!_sessionSelectMode&&!_renamingSid&&!_isSessionActionTarget(e.target)){
+        _gestureState='idle';
+        _clearLongPressTimer();
+        e.stopPropagation();
+        e.preventDefault();
+        void _toggleSessionPinned(s);
+        return;
+      }
       if(_finishSessionGesture(e.clientX,e.clientY,e.target,e.pointerType)) e.stopPropagation();
     };
     // Add ondblclick for more reliable double-click detection

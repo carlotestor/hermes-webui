@@ -62,7 +62,7 @@ def test_pin_limit_snapshot_counts_index_dict_entries():
 
 
 def test_pin_action_does_not_short_circuit_on_stale_client_count():
-    body = _function_block(SESSIONS_JS, "_openSessionActionMenu")
+    body = _function_block(SESSIONS_JS, "_toggleSessionPinned")
     assert "const pinLimitReached=" not in body
     assert "if(pinLimitReached)" not in body
     assert "_pinnedSessionCount()>=_getPinnedSessionsLimit()" not in body
@@ -70,7 +70,7 @@ def test_pin_action_does_not_short_circuit_on_stale_client_count():
 
 
 def test_pin_action_refreshes_session_list_after_pin_failure():
-    body = _function_block(SESSIONS_JS, "_openSessionActionMenu")
+    body = _function_block(SESSIONS_JS, "_toggleSessionPinned")
     catch_idx = body.find("}catch(err){")
     assert catch_idx != -1, "Pin/unpin action must have an error path"
     catch_block = body[catch_idx:body.find("}", catch_idx + len("}catch(err){")) + 1]

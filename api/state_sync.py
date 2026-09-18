@@ -249,3 +249,32 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
             db.close()
         except Exception:
             logger.debug("Failed to close state.db")
+
+
+def sync_session_pinned(session_id: str, pinned: bool, profile: Optional[str] = None) -> bool:
+    """Mirror a sidebar pin into ``sessions.pinned`` in state.db (not gated by sync_to_insights).
+
+    That column is the durable pin record shared with Hermes Desktop and
+    ``hermes sessions pin``; writing it here is what makes a WebUI pin show up
+    in Desktop's Pinned section (and vice versa). The write goes through
+    ``SessionDB.set_session_pinned`` so the whole compression lineage is pinned
+    and the auto-archive sweep leaves it alone. Returns True when a row changed.
+    Rows are never created here: a session unknown to state.db keeps a
+    sidecar-only pin.
+    """
+    db = _get_state_db(profile=profile)
+    if not db:
+        return False
+    try:
+        setter = getattr(db, "set_session_pinned", None)
+        if setter is None:
+            return False
+        return bool(setter(session_id, bool(pinned)))
+    except Exception:
+        logger.debug("Failed to sync pin state to state.db for %s", session_id, exc_info=True)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close state.db")

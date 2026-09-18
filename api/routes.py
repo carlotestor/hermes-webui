@@ -2036,6 +2036,48 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# Sidecar pins already pushed into state.db this process (one re-assert per row).
+_REASSERTED_SIDECAR_PINS: set[str] = set()
+
+
+def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
+    """Align a sidecar row's ``pinned`` flag with ``sessions.pinned`` in state.db.
+
+    state.db is the pin record shared with Hermes Desktop and ``hermes sessions
+    pin``, so a pin toggled there is adopted into the sidecar. A sidecar pin the
+    DB does not know about (made before pins were mirrored) is pushed up once
+    instead of being dropped, mirroring Desktop's boot-time re-assert.
+    """
+    remote = meta.get("pinned")
+    if not isinstance(remote, bool):
+        return
+    local = bool(row.get("pinned"))
+    if remote == local:
+        return
+    sid = str(row.get("session_id") or "")
+    if not sid:
+        return
+    profile = row.get("profile") or meta.get("profile") or "default"
+    if local and sid not in _REASSERTED_SIDECAR_PINS:
+        _REASSERTED_SIDECAR_PINS.add(sid)
+        try:
+            from api.state_sync import sync_session_pinned
+            if sync_session_pinned(sid, True, profile=profile):
+                return
+        except Exception:
+            logger.debug("Failed to re-assert sidecar pin for %s", sid, exc_info=True)
+    row["pinned"] = remote
+    try:
+        session = get_session(sid)
+        session = _ensure_full_session_before_mutation(sid, session)
+        if bool(getattr(session, "pinned", False)) != remote:
+            with _get_session_agent_lock(sid):
+                session.pinned = remote
+                session.save(touch_updated_at=False)
+    except Exception:
+        logger.debug("Failed to persist state.db pin into sidecar %s", sid, exc_info=True)
+
+
 def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
     """#4985 second-pass orphan prune for native-WebUI rows whose ``state.db.messages`` is empty.
 
@@ -2452,6 +2494,7 @@ def _build_session_list_cache_payload(
                 for key in ("source_tag", "raw_source", "session_source", "source_label"):
                     if not s.get(key) and meta.get(key):
                         s[key] = meta[key]
+            _reconcile_sidebar_pin_with_state_db(s, meta)
         webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
         # Apply the same CLI visibility semantics to imported local copies so
         # low-value imported artifacts do not leak into the sidebar.
@@ -17188,10 +17231,13 @@ def handle_post(handler, parsed) -> bool:
         if _session_is_subagent_view_only(body["session_id"]):
             return bad(handler, "Subagent sessions are view-only and cannot be modified from WebUI", 400)
         try:
-            s = get_session(body["session_id"])
-            s = _ensure_full_session_before_mutation(body["session_id"], s)
+            # Agent-owned rows (CLI/TUI/Desktop) with no sidecar yet are
+            # materialized so a pin works straight from the sidebar row.
+            s = _get_or_materialize_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
+        except PermissionError:
+            return bad(handler, "Read-only imported sessions cannot be pinned from WebUI", 403)
         pin_requested = bool(body.get("pinned", True))
         # TOCTOU guard (Opus stage-389): the count check and the pin write
         # must happen under the same lock, otherwise two parallel pin
@@ -17244,6 +17290,17 @@ def handle_post(handler, parsed) -> bool:
             with _get_session_agent_lock(body["session_id"]):
                 s.pinned = pin_requested
                 s.save()
+        # `sessions.pinned` in state.db is the pin record Hermes Desktop and
+        # `hermes sessions pin` read, so mirror every toggle there.
+        try:
+            from api.state_sync import sync_session_pinned
+            sync_session_pinned(
+                s.session_id,
+                pin_requested,
+                profile=getattr(s, "profile", None) or "default",
+            )
+        except Exception:
+            logger.debug("Failed to mirror pin to state.db", exc_info=True)
         publish_session_list_changed(
             "session_pin",
             profile=getattr(s, "profile", None),
