@@ -2036,6 +2036,29 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _reconcile_sidebar_pins_with_state_db(rows: list[dict]) -> None:
+    """Reconcile every sidebar row's ``pinned`` flag with state.db.
+
+    Runs on every sidebar build regardless of ``show_cli_sessions``: one
+    batched read per profile, and rows with no state.db row are untouched.
+    """
+    by_profile: dict[object, list[dict]] = defaultdict(list)
+    for row in rows:
+        if str(row.get("session_id") or "").strip():
+            by_profile[row.get("profile")].append(row)
+    for profile_key, profile_rows in by_profile.items():
+        flags = agent_session_pinned_flags(
+            [str(r.get("session_id")).strip() for r in profile_rows],
+            profile=profile_key if isinstance(profile_key, str) and profile_key else None,
+        )
+        if not flags:
+            continue
+        for row in profile_rows:
+            sid = str(row.get("session_id")).strip()
+            if sid in flags:
+                _reconcile_sidebar_pin_with_state_db(row, {"pinned": flags[sid]})
+
+
 def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
     """Adopt ``sessions.pinned`` from state.db into a sidecar row.
 
@@ -2346,6 +2369,8 @@ def _build_session_list_cache_payload(
     show_webhook_sessions = bool(show_webhook_sessions)
     show_kanban_sessions = bool(show_kanban_sessions)
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
+    diag_stage("reconcile_pins")
+    _reconcile_sidebar_pins_with_state_db(webui_sessions)
     if show_cli_sessions:
         diag_stage("get_cli_sessions")
         if _callable_accepts_kwarg(get_cli_sessions, "include_claude_code"):
@@ -2479,7 +2504,6 @@ def _build_session_list_cache_payload(
                 for key in ("source_tag", "raw_source", "session_source", "source_label"):
                     if not s.get(key) and meta.get(key):
                         s[key] = meta[key]
-            _reconcile_sidebar_pin_with_state_db(s, meta)
         webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
         # Apply the same CLI visibility semantics to imported local copies so
         # low-value imported artifacts do not leak into the sidebar.
@@ -10484,6 +10508,7 @@ from api.models import (
     prune_session_from_index,
     agent_session_rows_existing,
     agent_session_zero_message_sids,
+    agent_session_pinned_flags,
     _load_webui_zero_message_orphan_tombstone,
     _record_webui_zero_message_orphan_tombstone,
     _clear_webui_zero_message_orphan_tombstone,

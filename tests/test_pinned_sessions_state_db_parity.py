@@ -266,3 +266,48 @@ def test_state_db_knows_session_reports_lookup_failure(tmp_path, monkeypatch):
 
     fake_mod.SessionDB = _FakeSessionDB
     assert state_sync.state_db_knows_session("missing", profile="default") is False
+
+
+def test_sidebar_build_reconciles_pins_without_show_cli_sessions(monkeypatch):
+    from api import routes
+
+    seen = []
+    monkeypatch.setattr(
+        routes, "agent_session_pinned_flags",
+        lambda ids, profile=None: seen.append((sorted(ids), profile)) or {"a": True, "b": False},
+    )
+    reconciled = []
+    monkeypatch.setattr(
+        routes, "_reconcile_sidebar_pin_with_state_db",
+        lambda row, meta: reconciled.append((row["session_id"], meta["pinned"])),
+    )
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda *a, **kw: pytest.fail("cli listing must not run"))
+    rows = [
+        {"session_id": "a", "profile": "default", "pinned": False, "session_source": "webui"},
+        {"session_id": "b", "profile": "default", "pinned": True, "session_source": "webui"},
+        {"session_id": "c", "profile": "default", "pinned": False, "session_source": "webui"},
+    ]
+    routes._reconcile_sidebar_pins_with_state_db(rows)
+    assert seen == [(["a", "b", "c"], "default")]
+    # Rows unknown to state.db ("c") are left alone.
+    assert reconciled == [("a", True), ("b", False)]
+
+    # And the sidebar payload builder invokes it on the show_cli_sessions=False path.
+    src = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
+    body = src.split("def _build_session_list_cache_payload", 1)[1]
+    assert body.index("_reconcile_sidebar_pins_with_state_db(webui_sessions)") < body.index("if show_cli_sessions:")
+
+
+def test_agent_session_pinned_flags_reads_state_db(tmp_path, monkeypatch):
+    import sqlite3
+    from api import models
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, pinned INTEGER DEFAULT 0)")
+    conn.executemany("INSERT INTO sessions VALUES (?, ?)", [("p", 1), ("u", 0)])
+    conn.commit(); conn.close()
+    monkeypatch.setattr(models, "_agent_state_db_path", lambda profile=None: db)
+    assert models.agent_session_pinned_flags(["p", "u", "missing"]) == {"p": True, "u": False}
+    monkeypatch.setattr(models, "_agent_state_db_path", lambda profile=None: None)
+    assert models.agent_session_pinned_flags(["p"]) == {}
