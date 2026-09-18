@@ -128,6 +128,9 @@ class _FakeSessionDB:
     def __init__(self, db_path):
         self.db_path = db_path
 
+    def get_session(self, _session_id):
+        return None
+
     def set_session_pinned(self, session_id, pinned):
         _FakeSessionDB.calls.append((str(self.db_path), session_id, pinned))
         return True
@@ -222,3 +225,44 @@ def test_reconcile_state_db_wins_over_sidecar(monkeypatch):
     routes._reconcile_sidebar_pin_with_state_db(row, {"pinned": True})
     assert row["pinned"] is True
     assert saved == [(True, {"touch_updated_at": False})]
+
+
+def test_write_pin_fails_closed_when_state_db_lookup_fails(monkeypatch):
+    from api import routes, state_sync
+    from types import SimpleNamespace
+
+    calls = []
+    monkeypatch.setattr(state_sync, "state_db_knows_session", lambda *_a, **_kw: None)
+    monkeypatch.setattr(state_sync, "sync_session_pinned", lambda *a, **kw: calls.append(a) or True)
+    s = SimpleNamespace(session_id="unknown-state", profile="default")
+    assert routes._write_pin_to_state_db(s, True) is False
+    assert calls == []
+
+
+def test_state_db_knows_session_reports_lookup_failure(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from api import state_sync
+
+    class _BrokenDB:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def get_session(self, _sid):
+            raise RuntimeError("database is locked")
+
+        def close(self):
+            pass
+
+    fake_mod = types.ModuleType("hermes_state")
+    fake_mod.SessionDB = _BrokenDB
+    monkeypatch.setitem(sys.modules, "hermes_state", fake_mod)
+    (tmp_path / "state.db").write_bytes(b"")
+    monkeypatch.setattr(
+        "api.profiles._resolve_profile_home_for_name", lambda _name: tmp_path, raising=False
+    )
+    assert state_sync.state_db_knows_session("abc", profile="default") is None
+
+    fake_mod.SessionDB = _FakeSessionDB
+    assert state_sync.state_db_knows_session("missing", profile="default") is False

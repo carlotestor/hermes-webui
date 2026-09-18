@@ -15151,14 +15151,18 @@ def _write_pin_to_state_db(s, pinned: bool) -> bool:
     """Record a pin in ``state.db.sessions.pinned``, the store Hermes Desktop uses.
 
     The pin endpoint commits here before touching the sidecar so a pin that
-    Desktop cannot see is never reported as successful. Rows unknown to
-    state.db (sidecar-only sessions) are accepted: there is nothing to share.
+    Desktop cannot see is never reported as successful. Only a confirmed
+    absence of the row (sidecar-only session) skips the write; a failed
+    lookup fails closed.
     """
     from api.state_sync import sync_session_pinned, state_db_knows_session
     profile = getattr(s, "profile", None) or "default"
     sid = s.session_id
     try:
-        if not state_db_knows_session(sid, profile=profile):
+        known = state_db_knows_session(sid, profile=profile)
+        if known is None:
+            return False
+        if known is False:
             return True
         return sync_session_pinned(sid, pinned, profile=profile)
     except Exception:
