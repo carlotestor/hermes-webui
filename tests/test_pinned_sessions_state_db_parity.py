@@ -173,3 +173,45 @@ def test_sidebar_shift_click_toggles_pin():
     assert "e.shiftKey" in SESSIONS_JS
     # The action menu and shift-click share one code path.
     assert SESSIONS_JS.count("/api/session/pin") == 1
+
+
+def test_reconcile_keeps_sidecar_pin_when_state_db_write_fails(monkeypatch):
+    from api import routes, state_sync
+
+    routes._REASSERTED_SIDECAR_PINS.discard("keep-me")
+    monkeypatch.setattr(state_sync, "sync_session_pinned", lambda *_a, **_kw: False)
+    monkeypatch.setattr(routes, "get_session", lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("sidecar must not be rewritten")))
+    row = {"session_id": "keep-me", "pinned": True, "profile": "default"}
+
+    routes._reconcile_sidebar_pin_with_state_db(row, {"pinned": False})
+
+    assert row["pinned"] is True
+    # A failed push is retried on the next sidebar build, not settled.
+    assert "keep-me" not in routes._REASSERTED_SIDECAR_PINS
+
+
+def test_reconcile_adopts_state_db_pin_into_unpinned_sidecar(monkeypatch):
+    from api import routes
+
+    saved = []
+
+    class _Session:
+        pinned = False
+        _loaded_metadata_only = False
+
+        def save(self, **kw):
+            saved.append((self.pinned, kw))
+
+    monkeypatch.setattr(routes, "get_session", lambda *_a, **_kw: _Session())
+    row = {"session_id": "adopt-me", "pinned": False, "profile": "default"}
+
+    routes._reconcile_sidebar_pin_with_state_db(row, {"pinned": True})
+
+    assert row["pinned"] is True
+    assert saved == [(True, {"touch_updated_at": False})]
+
+
+def test_sidebar_shift_click_respects_read_only_rows():
+    idx = SESSIONS_JS.find("e.shiftKey")
+    assert idx != -1
+    assert "!readOnly" in SESSIONS_JS[idx: idx + 120]

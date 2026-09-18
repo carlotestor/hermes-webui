@@ -2044,9 +2044,8 @@ def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
     """Align a sidecar row's ``pinned`` flag with ``sessions.pinned`` in state.db.
 
     state.db is the pin record shared with Hermes Desktop and ``hermes sessions
-    pin``, so a pin toggled there is adopted into the sidecar. A sidecar pin the
-    DB does not know about (made before pins were mirrored) is pushed up once
-    instead of being dropped, mirroring Desktop's boot-time re-assert.
+    pin``: a pin made there is adopted into the sidecar, and a sidecar-only pin
+    (made before pins were mirrored) is pushed up rather than dropped.
     """
     remote = meta.get("pinned")
     if not isinstance(remote, bool):
@@ -2058,14 +2057,18 @@ def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
     if not sid:
         return
     profile = row.get("profile") or meta.get("profile") or "default"
-    if local and sid not in _REASSERTED_SIDECAR_PINS:
-        _REASSERTED_SIDECAR_PINS.add(sid)
+    if local:
+        # Push the sidecar pin up. Only a confirmed write settles it; while the
+        # DB is unavailable the local pin is kept and the push retries later.
+        if sid in _REASSERTED_SIDECAR_PINS:
+            return
         try:
             from api.state_sync import sync_session_pinned
             if sync_session_pinned(sid, True, profile=profile):
-                return
+                _REASSERTED_SIDECAR_PINS.add(sid)
         except Exception:
             logger.debug("Failed to re-assert sidecar pin for %s", sid, exc_info=True)
+        return
     row["pinned"] = remote
     try:
         session = get_session(sid)

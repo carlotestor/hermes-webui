@@ -9022,7 +9022,7 @@ function renderSessionListFromCache(){
       if(e.pointerType==='touch') return;
       if(e.pointerType==='mouse' && e.button!==0) return;  // ignore right/middle click
       // Shift-click pins/unpins, matching Hermes Desktop's sidebar gesture.
-      if(e.shiftKey&&!_sessionSelectMode&&!_renamingSid&&!_isSessionActionTarget(e.target)){
+      if(e.shiftKey&&!readOnly&&!_sessionSelectMode&&!_renamingSid&&!_isSessionActionTarget(e.target)){
         _gestureState='idle';
         _clearLongPressTimer();
         e.stopPropagation();

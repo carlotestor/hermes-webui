@@ -218,7 +218,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 ### Sessions
 - Create, rename, duplicate, delete, search by title and message content
 - Session actions via `⋯` dropdown per session — pin, move to project, archive, duplicate, delete
-- Pin/star sessions to the top of the sidebar (gold indicator)
+- Pin/star sessions to the top of the sidebar (gold indicator) -- from the row menu or by shift-clicking a row. Pins are stored in the agent's `state.db` (`sessions.pinned`), so they are shared with Hermes Desktop and `hermes sessions pin`; a pin made in either app shows up in the other, and pinned sessions stay in the sidebar regardless of age
 - Archive sessions (hide without deleting, toggle to show)
 - Session projects -- named groups with colors for organizing sessions
 - Session tags -- add #tag to titles for colored chips and click-to-filter
