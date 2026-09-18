@@ -2036,6 +2036,33 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
+    """Adopt ``sessions.pinned`` from state.db into a sidecar row.
+
+    state.db is the only pin record: it is what Hermes Desktop and ``hermes
+    sessions pin`` read and write, and what the WebUI pin endpoint writes.
+    The sidecar copy is a display cache, so state.db always wins.
+    """
+    remote = meta.get("pinned")
+    if not isinstance(remote, bool):
+        return
+    if remote == bool(row.get("pinned")):
+        return
+    sid = str(row.get("session_id") or "")
+    if not sid:
+        return
+    row["pinned"] = remote
+    try:
+        session = get_session(sid)
+        session = _ensure_full_session_before_mutation(sid, session)
+        if bool(getattr(session, "pinned", False)) != remote:
+            with _get_session_agent_lock(sid):
+                session.pinned = remote
+                session.save(touch_updated_at=False)
+    except Exception:
+        logger.debug("Failed to persist state.db pin into sidecar %s", sid, exc_info=True)
+
+
 def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
     """#4985 second-pass orphan prune for native-WebUI rows whose ``state.db.messages`` is empty.
 
@@ -2452,6 +2479,7 @@ def _build_session_list_cache_payload(
                 for key in ("source_tag", "raw_source", "session_source", "source_label"):
                     if not s.get(key) and meta.get(key):
                         s[key] = meta[key]
+            _reconcile_sidebar_pin_with_state_db(s, meta)
         webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
         # Apply the same CLI visibility semantics to imported local copies so
         # low-value imported artifacts do not leak into the sidebar.
@@ -15119,6 +15147,25 @@ def _llm_update_summary(system_prompt: str, user_prompt: str, active_profile: st
         return str(result.get("final_response") or "").strip()
 
 
+def _write_pin_to_state_db(s, pinned: bool) -> bool:
+    """Record a pin in ``state.db.sessions.pinned``, the store Hermes Desktop uses.
+
+    The pin endpoint commits here before touching the sidecar so a pin that
+    Desktop cannot see is never reported as successful. Rows unknown to
+    state.db (sidecar-only sessions) are accepted: there is nothing to share.
+    """
+    from api.state_sync import sync_session_pinned, state_db_knows_session
+    profile = getattr(s, "profile", None) or "default"
+    sid = s.session_id
+    try:
+        if not state_db_knows_session(sid, profile=profile):
+            return True
+        return sync_session_pinned(sid, pinned, profile=profile)
+    except Exception:
+        logger.debug("Failed to write pin to state.db for %s", sid, exc_info=True)
+        return False
+
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
@@ -17188,10 +17235,13 @@ def handle_post(handler, parsed) -> bool:
         if _session_is_subagent_view_only(body["session_id"]):
             return bad(handler, "Subagent sessions are view-only and cannot be modified from WebUI", 400)
         try:
-            s = get_session(body["session_id"])
-            s = _ensure_full_session_before_mutation(body["session_id"], s)
+            # Agent-owned rows (CLI/TUI/Desktop) with no sidecar yet are
+            # materialized so a pin works straight from the sidebar row.
+            s = _get_or_materialize_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
+        except PermissionError:
+            return bad(handler, "Read-only imported sessions cannot be pinned from WebUI", 403)
         pin_requested = bool(body.get("pinned", True))
         # TOCTOU guard (Opus stage-389): the count check and the pin write
         # must happen under the same lock, otherwise two parallel pin
@@ -17238,9 +17288,15 @@ def handle_post(handler, parsed) -> bool:
                 # requests see the increment immediately, even before
                 # save() finishes flushing to disk.
                 s.pinned = True
+            if not _write_pin_to_state_db(s, True):
+                with LOCK:
+                    s.pinned = False
+                return bad(handler, "Could not record the pin in state.db", 503)
             with _get_session_agent_lock(body["session_id"]):
                 s.save()
         else:
+            if not _write_pin_to_state_db(s, pin_requested):
+                return bad(handler, "Could not record the pin in state.db", 503)
             with _get_session_agent_lock(body["session_id"]):
                 s.pinned = pin_requested
                 s.save()

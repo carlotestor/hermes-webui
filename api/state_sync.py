@@ -249,3 +249,49 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
             db.close()
         except Exception:
             logger.debug("Failed to close state.db")
+
+
+def state_db_knows_session(session_id: str, profile: Optional[str] = None) -> bool:
+    """True when ``session_id`` has a row in the profile's state.db."""
+    db = _get_state_db(profile=profile)
+    if not db:
+        return False
+    try:
+        return bool(db.get_session(session_id))
+    except Exception:
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close state.db")
+
+
+def sync_session_pinned(session_id: str, pinned: bool, profile: Optional[str] = None) -> bool:
+    """Write ``sessions.pinned`` in state.db (not gated by sync_to_insights).
+
+    That column is the pin record Hermes Desktop and ``hermes sessions pin``
+    read and write, so it is where WebUI pins live too. The write goes through
+    ``SessionDB.set_session_pinned`` so the whole compression lineage is pinned
+    and the auto-archive sweep leaves it alone. Returns True when the row now
+    holds ``pinned`` (a no-op write on an already-matching row counts).
+    """
+    db = _get_state_db(profile=profile)
+    if not db:
+        return False
+    try:
+        setter = getattr(db, "set_session_pinned", None)
+        if setter is None:
+            return False
+        if setter(session_id, bool(pinned)):
+            return True
+        row = db.get_session(session_id)
+        return bool(row) and bool(row.get("pinned")) == bool(pinned)
+    except Exception:
+        logger.debug("Failed to sync pin state to state.db for %s", session_id, exc_info=True)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close state.db")
