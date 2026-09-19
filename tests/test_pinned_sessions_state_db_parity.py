@@ -446,3 +446,121 @@ def test_pin_endpoint_serializes_state_db_and_sidecar_per_session(monkeypatch, f
     last = order[-1]
     final = bool(responses[last][1]["session"]["pinned"])
     assert state_db["pinned"] == sidecar["pinned"] == final, (state_db, sidecar, responses, log)
+
+
+def test_pin_quota_reservation_survives_sessions_cache_eviction(monkeypatch):
+    """A reserved-but-uncommitted pin must count even after cache eviction.
+
+    Request A (session ``pin_a``) passes the quota check and is parked inside
+    ``_write_pin_to_state_db()``. While parked, ``pin_a`` is evicted from
+    ``SESSIONS`` (``_session_is_evictable()`` ignores ``pinned``, so any cache
+    insertion may do this). Request B (session ``pin_b``, limit=1) then runs:
+    the persisted snapshot does not yet contain A's pin and SESSIONS no longer
+    holds A's mutated object, so only a residency-independent reservation can
+    reject B. After A commits, B must still be rejected; after A unpins, B
+    must succeed.
+    """
+    import threading
+    from types import SimpleNamespace
+    from api import routes
+
+    locks = {}
+    state_db = {}
+    sidecar = {}
+    persisted = []
+    a_in_write = threading.Event()
+    release_a = threading.Event()
+
+    class _Sess:
+        profile = "default"
+        archived = False
+
+        def __init__(self, sid):
+            self.session_id = sid
+            self.pinned = False
+
+        def compact(self):
+            return {"session_id": self.session_id, "pinned": bool(self.pinned), "profile": "default"}
+
+        def save(self, touch_updated_at=True):
+            sidecar[self.session_id] = bool(self.pinned)
+            persisted[:] = [row for row in persisted if row["session_id"] != self.session_id]
+            persisted.append(self.compact())
+
+    sessions = {"pin_a": _Sess("pin_a"), "pin_b": _Sess("pin_b")}
+    cache = {"pin_a": sessions["pin_a"], "pin_b": sessions["pin_b"]}
+
+    def _write(session, pinned):
+        state_db[session.session_id] = bool(pinned)
+        if threading.current_thread().name == "A":
+            a_in_write.set()
+            assert release_a.wait(timeout=5)
+        return True
+
+    bodies = {}
+    responses = {}
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda sid: locks.setdefault(sid, threading.RLock()))
+    monkeypatch.setattr(routes, "_write_pin_to_state_db", _write)
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda sid, **kw: sessions[sid])
+    monkeypatch.setattr(routes, "get_session", lambda sid, **kw: sessions[sid])
+    monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda _sid, sess: sess)
+    monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda _sid: False)
+    monkeypatch.setattr(routes, "all_sessions", lambda *a, **kw: [dict(row) for row in persisted])
+    monkeypatch.setattr(routes, "SESSIONS", cache)
+    monkeypatch.setattr(routes, "_PIN_QUOTA_RESERVATIONS", {})
+    monkeypatch.setattr(routes, "_PIN_QUOTA_COMMIT_SEQ", 0)
+    monkeypatch.setattr(routes, "load_settings", lambda: {"pinned_sessions_limit": 1})
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *a, **kw: None)
+    monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(routes, "read_body", lambda handler: bodies[threading.current_thread().name])
+    monkeypatch.setattr(
+        routes, "j",
+        lambda handler, payload, status=200, extra_headers=None: responses.__setitem__(
+            threading.current_thread().name, (status, payload)) or True,
+    )
+    monkeypatch.setattr(
+        routes, "bad",
+        lambda handler, msg, status=400: responses.__setitem__(
+            threading.current_thread().name, (status, {"error": msg})) or True,
+    )
+
+    def _run(name, sid, pinned):
+        bodies[name] = {"session_id": sid, "pinned": pinned}
+        t = threading.Thread(
+            target=lambda: routes.handle_post(object(), SimpleNamespace(path="/api/session/pin")), name=name,
+        )
+        t.start()
+        return t
+
+    ta = _run("A", "pin_a", True)
+    assert a_in_write.wait(timeout=5), "request A never reached the state.db write"
+    # Deterministic eviction between A's reservation and A's sidecar save.
+    with routes.LOCK:
+        cache.pop("pin_a")
+    assert "pin_a" not in routes.SESSIONS and not persisted
+
+    tb = _run("B", "pin_b", True)
+    tb.join(timeout=5)
+    assert not tb.is_alive()
+    assert responses["B"][0] == 400, responses  # quota still reserved by evicted A
+    assert sessions["pin_b"].pinned is False
+
+    release_a.set()
+    ta.join(timeout=5)
+    assert responses["A"][0] == 200, responses
+    assert state_db["pin_a"] is True and sidecar["pin_a"] is True
+
+    # A is now committed and persisted: a fresh pin of B is still over quota.
+    tb2 = _run("B2", "pin_b", True)
+    tb2.join(timeout=5)
+    assert responses["B2"][0] == 400, responses
+
+    # Unpinning A frees the slot (its committed reservation is retired).
+    tu = _run("U", "pin_a", False)
+    tu.join(timeout=5)
+    assert responses["U"][0] == 200, responses
+    tb3 = _run("B3", "pin_b", True)
+    tb3.join(timeout=5)
+    assert responses["B3"][0] == 200, responses
+    assert sidecar["pin_b"] is True
+    assert routes._PIN_QUOTA_RESERVATIONS.keys() <= {"pin_b"}
