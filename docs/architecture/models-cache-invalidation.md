@@ -66,21 +66,28 @@ the fingerprint captured at publish time.
   TTL expires. When the runtime version cannot be resolved (early boot), that
   check is skipped rather than wedging the boot.
 
-## Invalidation modes (`invalidate_models_cache`)
+## Invalidation paths: memory vs. disk
 
-`invalidate_models_cache(*, delete_disk=True)` is the only entry point that
-offers the `delete_disk` choice. It is **not** the only path that drops the
-published in-memory snapshot: `invalidate_provider_models_cache()`,
-`_get_fresh_memory_models_cache()` (on a fingerprint mismatch or an invalid
-cached shape) and the config-reload branch inside
-`get_available_models()` also reset `_available_models_cache` and call
-`_sync_models_cache_provenance()`. None of those paths take a `delete_disk`
-argument; they only clear memory. `invalidate_models_cache` has two modes:
+Every path that drops the published in-memory snapshot resets
+`_available_models_cache` (plus its timestamps and source fingerprint) and
+calls `_sync_models_cache_provenance()` so the hot-path tuple cannot tear. They
+differ in what they do to the per-profile `models_cache.json` on disk
+(`_delete_models_cache_on_disk()`):
 
-| Mode | What is dropped | When to use |
+| Path | In-memory snapshot | Disk snapshot |
 | --- | --- | --- |
-| `delete_disk=True` (default) | in-memory snapshot **and** the per-profile `models_cache.json` on disk | A source may have changed, or test isolation requires a guaranteed cold build. Every pre-existing caller keeps this mode. |
-| `delete_disk=False` | in-memory snapshot only; the disk snapshot is left in place | The sources have **not** changed and the caller only needs the next request to re-resolve *which* profile's catalog to serve. |
+| `invalidate_models_cache(delete_disk=True)` (default) | dropped | **deleted** unconditionally |
+| `invalidate_models_cache(delete_disk=False)` | dropped | left in place |
+| `invalidate_provider_models_cache(provider_id)` | dropped | **deleted** unconditionally (no `delete_disk` option) |
+| `_get_fresh_memory_models_cache()` on a fingerprint mismatch or invalid cached shape | dropped | untouched |
+| config-reload branch in `get_available_models()` (`_cfg_changed`) | dropped | deleted by `reload_config()` → `_refresh_config_cache()` **only if** a config was already loaded (`_old_cfg_mtime != 0.0`); a first-ever load (server start, profile switch) keeps it |
+
+`invalidate_models_cache` is the only entry point that offers the
+`delete_disk` choice. `delete_disk=True` is for when a source may have changed,
+or test isolation requires a guaranteed cold build; every pre-existing caller
+keeps this mode. `delete_disk=False` is for when the sources have **not**
+changed and the caller only needs the next request to re-resolve *which*
+profile's catalog to serve.
 
 `POST /api/profile/switch` uses `delete_disk=False`. The disk cache is already
 keyed per profile (`_get_models_cache_path()`), and a stale or wrong-profile
@@ -89,8 +96,7 @@ fingerprint above, so deleting it on a switch bought no correctness — it only
 forced a full cold rebuild (live provider `fetch_models` calls, several seconds)
 on every switch. Because this mode leans entirely on the fingerprint check, it
 is safe only while that check stays the single gate for serving a disk snapshot
-(change-protocol items 1 and 4). Both modes must still call
-`_sync_models_cache_provenance()` so the hot-path tuple cannot tear.
+(change-protocol items 1 and 4).
 
 ## Change protocol
 
