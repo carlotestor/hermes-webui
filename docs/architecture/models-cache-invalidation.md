@@ -69,7 +69,13 @@ the fingerprint captured at publish time.
 ## Invalidation modes (`invalidate_models_cache`)
 
 `invalidate_models_cache(*, delete_disk=True)` is the only entry point that
-drops the published snapshot. It has two modes:
+offers the `delete_disk` choice. It is **not** the only path that drops the
+published in-memory snapshot: `invalidate_provider_models_cache()`,
+`_get_fresh_memory_models_cache()` (on a fingerprint mismatch or an invalid
+cached shape) and the config-reload branch inside
+`get_available_models()` also reset `_available_models_cache` and call
+`_sync_models_cache_provenance()`. None of those paths take a `delete_disk`
+argument; they only clear memory. `invalidate_models_cache` has two modes:
 
 | Mode | What is dropped | When to use |
 | --- | --- | --- |
