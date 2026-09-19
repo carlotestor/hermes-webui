@@ -17274,63 +17274,80 @@ def handle_post(handler, parsed) -> bool:
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be pinned from WebUI", 403)
         pin_requested = bool(body.get("pinned", True))
-        # TOCTOU guard (Opus stage-389): the count check and the pin write
-        # must happen under the same lock, otherwise two parallel pin
-        # requests can both pass `len(pinned_ids) >= 3` against the same
-        # snapshot and both succeed, leaving the user with 4 pins. The check
-        # must be careful not to nest `all_sessions()` (which acquires LOCK
-        # internally) inside a `with LOCK:` block — that's a deadlock since
-        # LOCK is a non-reentrant `threading.Lock`. We snapshot the
-        # persisted index outside the lock, then re-check the in-memory
-        # mutation set inside the lock and commit the pin atomically.
-        if pin_requested and not getattr(s, "pinned", False):
-            # Pre-snapshot from persisted index (acquires LOCK internally,
-            # so must run outside our own LOCK acquire below).
-            persisted_rows = [
-                existing for existing in all_sessions()
-                if _session_counts_toward_pin_quota(existing)
-            ]
-            with LOCK:
-                # Final authoritative count: merge persisted pinned rows with the
-                # in-memory SESSIONS snapshot. Count logical sidebar-visible pin
-                # lineages rather than raw session rows so continuation siblings
-                # in the same visible lineage do not consume extra pin quota.
-                candidate_rows = list(persisted_rows)
-                candidate_rows.extend(
-                    existing.compact() for existing in SESSIONS.values()
+        # The whole mutation — refresh the session, write state.db, then
+        # mutate + save the sidecar — is ONE per-session operation under
+        # _get_session_agent_lock(). Two concurrent pin/unpin requests can
+        # otherwise commit state.db in one order and the sidecar in the
+        # opposite order, leaving the authoritative row and the sidecar
+        # disagreeing until the next sidebar reconciliation.
+        #
+        # The global pin-quota LOCK stays separate and is never held across
+        # SQLite I/O: the quota is reserved under LOCK (s.pinned = True so
+        # concurrent pin requests see the increment immediately), released,
+        # and rolled back if the serialized commit fails.
+        with _get_session_agent_lock(body["session_id"]):
+            # Re-resolve under the lock so we commit against the latest
+            # in-memory object, not a snapshot taken before a concurrent
+            # request finished.
+            try:
+                s = _ensure_full_session_before_mutation(
+                    body["session_id"], get_session(body["session_id"])
+                )
+            except KeyError:
+                pass
+            reserved_quota = False
+            if pin_requested and not getattr(s, "pinned", False):
+                # TOCTOU guard (Opus stage-389): the count check and the
+                # quota reservation must happen under the same lock,
+                # otherwise two parallel pin requests can both pass
+                # `len(pinned_ids) >= 3` against the same snapshot and both
+                # succeed, leaving the user with 4 pins. The check must be
+                # careful not to nest `all_sessions()` (which acquires LOCK
+                # internally) inside a `with LOCK:` block — that's a
+                # deadlock since LOCK is a non-reentrant `threading.Lock`.
+                # We snapshot the persisted index outside LOCK, then re-check
+                # the in-memory mutation set inside LOCK and reserve.
+                persisted_rows = [
+                    existing for existing in all_sessions()
                     if _session_counts_toward_pin_quota(existing)
-                )
-                target_row = s.compact()
-                candidate_rows.append(target_row)
-                pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows)
-                target_lineage = _session_row_lineage_root_id(
-                    target_row,
-                    {
-                        str(_session_field(row, "session_id", "") or ""): row
-                        for row in candidate_rows
-                        if _session_field(row, "session_id", None)
-                    },
-                )
-                pinned_lineage_ids.discard(target_lineage)
-                pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
-                if len(pinned_lineage_ids) >= pinned_sessions_limit:
-                    return bad(handler, f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.", 400)
-                # Mark in-memory pin state under LOCK so concurrent pin
-                # requests see the increment immediately, even before
-                # save() finishes flushing to disk.
-                s.pinned = True
-            if not _write_pin_to_state_db(s, True):
+                ]
                 with LOCK:
-                    s.pinned = False
-                return bad(handler, "Could not record the pin in state.db", 503)
-            with _get_session_agent_lock(body["session_id"]):
-                s.save()
-        else:
+                    # Final authoritative count: merge persisted pinned rows
+                    # with the in-memory SESSIONS snapshot. Count logical
+                    # sidebar-visible pin lineages rather than raw session
+                    # rows so continuation siblings in the same visible
+                    # lineage do not consume extra pin quota.
+                    candidate_rows = list(persisted_rows)
+                    candidate_rows.extend(
+                        existing.compact() for existing in SESSIONS.values()
+                        if _session_counts_toward_pin_quota(existing)
+                    )
+                    target_row = s.compact()
+                    candidate_rows.append(target_row)
+                    pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows)
+                    target_lineage = _session_row_lineage_root_id(
+                        target_row,
+                        {
+                            str(_session_field(row, "session_id", "") or ""): row
+                            for row in candidate_rows
+                            if _session_field(row, "session_id", None)
+                        },
+                    )
+                    pinned_lineage_ids.discard(target_lineage)
+                    pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
+                    if len(pinned_lineage_ids) >= pinned_sessions_limit:
+                        return bad(handler, f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.", 400)
+                    s.pinned = True
+                    reserved_quota = True
+            # Authoritative store first (state.db is what Desktop reads);
+            # a pin Desktop cannot see is never reported as successful.
             if not _write_pin_to_state_db(s, pin_requested):
+                if reserved_quota:
+                    with LOCK:
+                        s.pinned = False
                 return bad(handler, "Could not record the pin in state.db", 503)
-            with _get_session_agent_lock(body["session_id"]):
-                s.pinned = pin_requested
-                s.save()
+            s.pinned = pin_requested
+            s.save()
         publish_session_list_changed(
             "session_pin",
             profile=getattr(s, "profile", None),

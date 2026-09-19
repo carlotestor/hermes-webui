@@ -167,9 +167,13 @@ def test_pin_route_writes_state_db_before_sidecar():
     routes_py = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
     pin_block = routes_py.split('if parsed.path == "/api/session/pin":', 1)[1]
     pin_block = pin_block.split('if parsed.path == "/api/session/archive":', 1)[0]
-    assert pin_block.count("_write_pin_to_state_db(") == 2
-    # Both branches refuse before the sidecar save when state.db rejects the pin.
-    assert pin_block.index("_write_pin_to_state_db(s, True)") < pin_block.index("s.save()")
+    assert pin_block.count("_write_pin_to_state_db(") == 1
+    # state.db is committed before the sidecar save, and both happen inside
+    # the per-session lock so pin/unpin mutations serialize as one operation.
+    lock_idx = pin_block.index('with _get_session_agent_lock(body["session_id"]):')
+    write_idx = pin_block.index("_write_pin_to_state_db(s, pin_requested)")
+    save_idx = pin_block.index("s.save()")
+    assert lock_idx < write_idx < save_idx
     assert "503" in pin_block
 
 
@@ -332,3 +336,113 @@ def test_reconcile_loads_session_under_agent_lock(monkeypatch):
     routes._reconcile_sidebar_pin_with_state_db(row, {"pinned": True})
     assert row["pinned"] is True
     assert events == [("load", True), ("save", True)]
+
+
+def _run_pin_endpoint_pair(monkeypatch, *, first_pins: bool):
+    """Drive two concurrent POST /api/session/pin requests against one session.
+
+    Request A (pin when ``first_pins`` else unpin) is parked right after its
+    ``_write_pin_to_state_db()`` call; request B (the opposite toggle) is then
+    started and allowed to run to completion before A is released to ``save()``.
+    Returns the final state.db row, the sidecar flag, both responses and the
+    ordered commit log ``(thread, store, value, session_lock_held)``.
+    """
+    import threading
+    from types import SimpleNamespace
+    from api import routes
+
+    sid = "pin_race"
+    session_lock = threading.RLock()
+    state_db = {"pinned": not first_pins}
+    sidecar = {"pinned": not first_pins}
+    log = []
+    a_wrote = threading.Event()
+    b_done = threading.Event()
+
+    class _Sess:
+        session_id = sid
+        profile = "default"
+        pinned = not first_pins
+        archived = False
+
+        def compact(self):
+            return {"session_id": sid, "pinned": bool(self.pinned), "profile": "default"}
+
+        def save(self, touch_updated_at=True):
+            sidecar["pinned"] = bool(self.pinned)
+            log.append((threading.current_thread().name, "sidecar", bool(self.pinned), session_lock._is_owned()))
+
+    s = _Sess()
+
+    def _write(session, pinned):
+        state_db["pinned"] = bool(pinned)
+        log.append((threading.current_thread().name, "state_db", bool(pinned), session_lock._is_owned()))
+        if threading.current_thread().name == "A":
+            a_wrote.set()
+            # Barrier: hold A between its two-store writes while B runs.
+            b_done.wait(timeout=2.0)
+        return True
+
+    bodies = {
+        "A": {"session_id": sid, "pinned": first_pins},
+        "B": {"session_id": sid, "pinned": not first_pins},
+    }
+    responses = {}
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda _sid: session_lock)
+    monkeypatch.setattr(routes, "_write_pin_to_state_db", _write)
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda _sid, **kw: s)
+    monkeypatch.setattr(routes, "get_session", lambda _sid, **kw: s)
+    monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda _sid, sess: sess)
+    monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda _sid: False)
+    monkeypatch.setattr(routes, "all_sessions", lambda *a, **kw: [])
+    monkeypatch.setattr(routes, "SESSIONS", {})
+    monkeypatch.setattr(routes, "load_settings", lambda: {"pinned_sessions_limit": 3})
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *a, **kw: None)
+    monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(routes, "read_body", lambda handler: bodies[threading.current_thread().name])
+    monkeypatch.setattr(
+        routes, "j",
+        lambda handler, payload, status=200, extra_headers=None: responses.__setitem__(
+            threading.current_thread().name, (status, payload)) or True,
+    )
+    monkeypatch.setattr(
+        routes, "bad",
+        lambda handler, msg, status=400: responses.__setitem__(
+            threading.current_thread().name, (status, {"error": msg})) or True,
+    )
+
+    def _worker():
+        routes.handle_post(object(), SimpleNamespace(path="/api/session/pin"))
+
+    ta = threading.Thread(target=_worker, name="A")
+    tb = threading.Thread(target=_worker, name="B")
+    ta.start()
+    assert a_wrote.wait(timeout=5), "request A never reached the state.db write"
+    tb.start()
+    tb.join(timeout=1.0)  # B either completes (unserialized) or blocks on A's lock (serialized)
+    b_done.set()
+    ta.join(timeout=10)
+    tb.join(timeout=10)
+    assert not ta.is_alive() and not tb.is_alive(), log
+    return state_db, sidecar, responses, log
+
+
+@pytest.mark.parametrize("first_pins", [True, False], ids=["pin-then-unpin", "unpin-then-pin"])
+def test_pin_endpoint_serializes_state_db_and_sidecar_per_session(monkeypatch, first_pins):
+    """Concurrent pin/unpin must commit state.db and the sidecar in ONE order.
+
+    Request A is parked between its state.db write and its sidecar save while
+    request B is started. Both stores and the last response must agree with a
+    single serialized order (A then B, or B then A) — never state.db from one
+    request and the sidecar from the other.
+    """
+    state_db, sidecar, responses, log = _run_pin_endpoint_pair(monkeypatch, first_pins=first_pins)
+    assert responses["A"][0] == 200 and responses["B"][0] == 200, responses
+    order = [name for name, _store, _v, _held in log]
+    # Each request's state.db + sidecar commit is contiguous: one serialized order.
+    assert order in (["A", "A", "B", "B"], ["B", "B", "A", "A"]), log
+    # Both writes of both requests ran under the per-session lock.
+    assert all(held for _n, _s, _v, held in log), log
+    last = order[-1]
+    final = bool(responses[last][1]["session"]["pinned"])
+    assert state_db["pinned"] == sidecar["pinned"] == final, (state_db, sidecar, responses, log)
