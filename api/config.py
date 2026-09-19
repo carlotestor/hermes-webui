@@ -549,9 +549,15 @@ def _refresh_config_cache(config_path: Path | None = None) -> None:
     if config_path is None:
         config_path = _get_config_path()
     _cfg_cache.clear()
-    # Remember the old mtime so we can tell whether config actually changed
-    # vs. first-ever load (mtime == 0.0, e.g. server start or profile switch).
+    # Remember the old mtime AND path so we can tell whether *this* config file
+    # actually changed vs. a first-ever load (mtime == 0.0, server start) or a
+    # load of a different profile's config.yaml. _cfg_mtime is process-global,
+    # so after a per-client profile switch (process_wide=False skips
+    # reload_config()) it still holds the previous profile's nonzero mtime;
+    # without the path check the next /api/models on the new profile would
+    # look like an edit and unlink the new profile's disk snapshot.
     _old_cfg_mtime = _cfg_mtime
+    _old_cfg_path = _cfg_path
     _cfg_path = config_path
     _cfg_mtime = 0.0
     try:
@@ -607,11 +613,15 @@ def _refresh_config_cache(config_path: Path | None = None) -> None:
     _apply_config_defaults(_cfg_cache)
     _cfg_fingerprint = _fingerprint_config(_cfg_cache)
     # Bust the models cache so the next request sees fresh config values.
-    # Only delete the disk cache when config has actually changed -- not on
-    # first-ever load (when _old_cfg_mtime == 0.0, i.e. server start or
-    # profile switch) -- preserving the disk cache so the next restart
-    # still hits the fast path without a cold run.
-    if _old_cfg_mtime != 0.0:
+    # Only delete the disk cache when the SAME config file was already loaded
+    # (a real edit / explicit reload of the active profile's config.yaml) --
+    # not on first-ever load (_old_cfg_mtime == 0.0, server start) and not
+    # when the path changed because the request belongs to another profile
+    # (per-client profile switch). The per-profile disk snapshot is
+    # fingerprint-guarded on read, so a path change needs no unlink; deleting
+    # it here forced a full cold rebuild on the first /api/models after every
+    # switch.
+    if _old_cfg_mtime != 0.0 and _old_cfg_path == config_path:
         _delete_models_cache_on_disk()
 
 

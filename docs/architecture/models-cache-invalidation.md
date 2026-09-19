@@ -80,7 +80,17 @@ differ in what they do to the per-profile `models_cache.json` on disk
 | `invalidate_models_cache(delete_disk=False)` | dropped | left in place |
 | `invalidate_provider_models_cache(provider_id)` | dropped | **deleted** unconditionally (no `delete_disk` option) |
 | `_get_fresh_memory_models_cache()` on a fingerprint mismatch or invalid cached shape | dropped | untouched |
-| config-reload branch in `get_available_models()` (`_cfg_changed`) | dropped | deleted by `reload_config()` → `_refresh_config_cache()` **only if** a config was already loaded (`_old_cfg_mtime != 0.0`); a first-ever load (server start, profile switch) keeps it |
+| config-reload branch in `get_available_models()` (`_cfg_changed`) | dropped | deleted by `reload_config_if_stale()` → `_refresh_config_cache()` **only if** the *same* `config.yaml` path was already loaded and its mtime moved (`_old_cfg_mtime != 0.0 and _old_cfg_path == config_path`, i.e. a real edit of the active profile's config); a first-ever load (server start, `_cfg_mtime == 0.0`) or a path change keeps it |
+
+The path guard matters for per-client profile switches: `switch_profile(name,
+process_wide=False)` deliberately skips `reload_config()`, so the process-global
+`_cfg_mtime` / `_cfg_path` still describe the *previous* profile's config after
+`POST /api/profile/switch`. The first `/api/models` for the new profile then
+takes the config-reload branch (different path, different mtime). Without the
+`_old_cfg_path == config_path` check that reload looked like a config edit and
+unlinked the *target* profile's `models_cache.<name>.json`, defeating the
+`delete_disk=False` switch on the very next request
+(`tests/test_profile_switch_next_models_request_keeps_disk_cache.py`).
 
 `invalidate_models_cache` is the only entry point that offers the
 `delete_disk` choice. `delete_disk=True` is for when a source may have changed,
