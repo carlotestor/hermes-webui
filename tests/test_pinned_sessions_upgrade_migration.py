@@ -8,7 +8,6 @@ them, and mark the profile migrated before state.db is allowed to win.
 
 import sqlite3
 import sys
-import time
 import types
 
 import pytest
