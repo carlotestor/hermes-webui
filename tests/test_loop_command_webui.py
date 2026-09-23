@@ -68,11 +68,11 @@ def test_set_persists_loop_in_agent_store_with_webui_route(loop_env):
 
     assert payload["ok"] and payload["created"]
     assert "Loop set (every 5m): check the deploy" in payload["message"]
-    assert "Stops when the task is done, or after 100 runs (loops.max_ticks)." in payload["message"]
+    assert "Backstop budget: 100 ticks (loops.max_ticks; 0 = unlimited)." in payload["message"]
     state = _load(webui_loops, home, "sid1")
     assert state is not None and state.status == "active"
     assert state.interval_seconds == 300
-    assert state.times == 100 and state.until == ""
+    assert state.times == 0 and state.until == "" and state.max_ticks == 100
     assert state.route == {"platform": "webui", "chat_id": "sid1", "profile": "p1"}
     assert (home / "state.db").exists()
 
@@ -95,15 +95,31 @@ def test_help_documents_default_limit_without_flags(loop_env):
     message = webui_loops.loop_command_payload("sid1", "help", profile_home=home)["message"]
 
     assert "Usage: /loop [interval] <prompt>" in message
-    assert "LOOP_COMPLETE" in message and "default 100" in message
+    assert "LOOP_COMPLETE" in message and "default 100" in message and "/loop resume" in message
     assert "--times" not in message and "--until" not in message
+
+
+def test_set_and_status_text_match_the_cli(loop_env):
+    """The WebUI must print exactly what the CLI's shared dispatch_loop_command prints."""
+    webui_loops, home, _started = loop_env
+    agent = webui_loops._agent_loops
+
+    webui = webui_loops.loop_command_payload("sid1", "5m poll CI", profile_home=home)
+    webui_status = webui_loops.loop_command_payload("sid1", "status", profile_home=home)["message"]
+    with webui_loops._profile_scope(home):
+        cli = agent.dispatch_loop_command(agent.LoopManager(session_id="cli-sid"), "5m poll CI")
+        cli_status = agent.LoopManager(session_id="cli-sid").status_line()
+
+    assert webui["message"] == cli["output"]
+    assert webui_status == cli_status
+    assert "0/100 budget" in webui_status
 
 
 def test_controls_round_trip_through_loop_manager(loop_env):
     webui_loops, home, _started = loop_env
     webui_loops.loop_command_payload("sid1", "5m poll CI", profile_home=home)
 
-    assert "Loop (active, every 5m, 0/100 runs" in webui_loops.loop_command_payload("sid1", "status", profile_home=home)["message"]
+    assert "Loop (active, every 5m, 0/100 budget" in webui_loops.loop_command_payload("sid1", "status", profile_home=home)["message"]
     assert webui_loops.loop_command_payload("sid1", "pause", profile_home=home)["loop"]["status"] == "paused"
     assert webui_loops.loop_command_payload("sid1", "resume", profile_home=home)["loop"]["status"] == "active"
     stopped = webui_loops.loop_command_payload("sid1", "stop", profile_home=home)
@@ -159,8 +175,8 @@ def test_loop_complete_marker_finishes_loop(loop_env):
     assert webui_loops.fire_due_loops() == {}
 
 
-def test_default_run_limit_finishes_loop(loop_env, monkeypatch):
-    """With no LOOP_COMPLETE, the loop ends for good (done, not paused) after the default limit."""
+def test_run_limit_pauses_loop_and_resume_continues(loop_env, monkeypatch):
+    """CLI parity: hitting loops.max_ticks pauses (recoverable), it does not end the loop."""
     webui_loops, home, started = loop_env
     monkeypatch.setattr(webui_loops._agent_loops, "max_ticks_default", lambda: 2)
     webui_loops.loop_command_payload("sid1", "30s ping", profile_home=home)
@@ -171,12 +187,45 @@ def test_default_run_limit_finishes_loop(loop_env, monkeypatch):
     assert webui_loops.fire_due_loops() == {"sid1": "fired"}
     decision = webui_loops.evaluate_loop_after_turn("sid1", "pong", profile_home=home)
 
-    assert decision["status"] == "done" and decision["stopped"] is True
-    assert "ran 2/2 times" in decision["message"]
-    assert _load(webui_loops, home, "sid1").status == "done"
+    assert decision["status"] == "paused" and decision["stopped"] is True
+    assert decision["message"] == ("⏸ Loop paused — 2/2 ticks used (loops.max_ticks). "
+                                   "/loop resume to keep going, /loop stop to end it.")
+    assert _load(webui_loops, home, "sid1").status == "paused"
     _make_due(webui_loops, home, "sid1")
     assert webui_loops.fire_due_loops() == {}
     assert len(started) == 2
+
+    assert webui_loops.loop_command_payload("sid1", "resume", profile_home=home)["loop"]["status"] == "active"
+    _make_due(webui_loops, home, "sid1")
+    assert webui_loops.fire_due_loops() == {"sid1": "fired"}
+    assert started[-1][1].startswith("[/loop wakeup #3, every 30s]")
+
+
+def test_interrupted_wakeup_pauses_loop(loop_env):
+    """CLI parity: stopping a loop wakeup turn pauses the loop (Ctrl+C in the CLI)."""
+    webui_loops, home, started = loop_env
+    webui_loops.loop_command_payload("sid1", "5m check", profile_home=home)
+    webui_loops.fire_due_loops()
+
+    decision = webui_loops.pause_loop_after_interrupt("sid1", profile_home=home)
+
+    assert decision["status"] == "paused"
+    assert decision["message"] == ("⏸ Loop paused — wakeup turn was interrupted. "
+                                   "Use /loop resume to continue, or /loop stop to end it.")
+    state = _load(webui_loops, home, "sid1")
+    assert state.status == "paused" and state.awaiting_response is False
+    assert state.paused_reason == "user-interrupted (Stop)"
+    later = time.time() + webui_loops.STALE_TICK_GRACE_SECONDS + 1
+    assert webui_loops.fire_due_loops(now=later) == {}
+    assert len(started) == 1
+
+
+def test_interrupt_without_tick_in_flight_is_noop(loop_env):
+    webui_loops, home, _started = loop_env
+    webui_loops.loop_command_payload("sid1", "5m check", profile_home=home)
+
+    assert webui_loops.pause_loop_after_interrupt("sid1", profile_home=home) == {}
+    assert _load(webui_loops, home, "sid1").status == "active"
 
 
 def test_unlimited_config_has_no_run_limit(loop_env, monkeypatch):
@@ -185,7 +234,7 @@ def test_unlimited_config_has_no_run_limit(loop_env, monkeypatch):
 
     payload = webui_loops.loop_command_payload("sid1", "5m ping", profile_home=home)
 
-    assert "Stops when the task is done (no run limit)." in payload["message"]
+    assert "Backstop budget" not in payload["message"]
     state = _load(webui_loops, home, "sid1")
     assert state.times == 0 and state.max_ticks == 0
 

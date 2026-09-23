@@ -122,3 +122,49 @@ def test_ordinary_turn_never_touches_loop_state(tmp_path, monkeypatch):
 
     assert calls == []
     assert not any(name == "loop" for name, _ in events)
+
+
+def _cancel_pending_turn(monkeypatch, source):
+    stream_id = f"cancel-{source}"
+    session = Session(session_id=f"sid-cancel-{source}", messages=[],
+                      pending_user_message="[/loop wakeup #1, every 5m]\nRecurring task: x",
+                      pending_user_source=source, active_stream_id=stream_id)
+    session.save()
+    models.SESSIONS[session.session_id] = session
+    q = queue.Queue()
+    config.STREAMS[stream_id] = q
+    config.CANCEL_FLAGS[stream_id] = __import__("threading").Event()
+    agent = mock.Mock()
+    agent.session_id = session.session_id
+    config.AGENT_INSTANCES[stream_id] = agent
+    calls = []
+
+    def fake_pause(session_id, *, profile_home=None):
+        calls.append(session_id)
+        return {"status": "paused", "stopped": True,
+                "message": webui_loops.LOOP_INTERRUPTED_MESSAGE, "loop": {"status": "paused"}}
+
+    monkeypatch.setattr(webui_loops, "pause_loop_after_interrupt", fake_pause)
+    assert streaming.cancel_stream(stream_id) is True
+    events = []
+    while not q.empty():
+        item = q.get_nowait()
+        events.append((item[0], item[1]))
+    return session.session_id, calls, events
+
+
+def test_stopping_loop_wakeup_pauses_loop_and_emits_loop_event(monkeypatch):
+    sid, calls, events = _cancel_pending_turn(monkeypatch, "loop_wakeup")
+
+    assert calls == [sid]
+    names = [name for name, _ in events]
+    assert names == ["loop", "cancel"]
+    assert events[0][1]["message"] == webui_loops.LOOP_INTERRUPTED_MESSAGE
+    assert events[0][1]["status"] == "paused"
+
+
+def test_stopping_ordinary_turn_leaves_loop_alone(monkeypatch):
+    _sid, calls, events = _cancel_pending_turn(monkeypatch, "webui")
+
+    assert calls == []
+    assert [name for name, _ in events] == ["cancel"]

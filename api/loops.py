@@ -38,8 +38,8 @@ LOOP_HELP = (
     "  /loop 5m check the deploy status      — first run now, then every 5m\n"
     "  /loop keep fixing tests until green   — self-paced (backs off while output is unchanged)\n"
     "Controls: /loop status · /loop pause · /loop resume · /loop stop\n"
-    "The loop stops itself when the agent reports the task is done (LOOP_COMPLETE), "
-    "or after loops.max_ticks runs (default 100)."
+    "The loop stops itself when the agent reports the task is done (LOOP_COMPLETE). "
+    "After loops.max_ticks runs (default 100) it pauses; /loop resume keeps going."
 )
 
 _SCHEDULER_LOCK = threading.Lock()
@@ -159,40 +159,25 @@ def loop_command_payload(
         route["profile"] = str(profile)
     with _profile_scope(profile_home):
         mgr = _agent_loops.LoopManager(session_id=sid)
-        replacing = mgr.has_loop()
-        # The run limit is a hard stop (``times``), not the agent's resumable max_ticks pause.
-        limit = _agent_loops.max_ticks_default()
-        try:
-            state = mgr.set(prompt, interval_seconds=parsed.get("interval_seconds"),
-                            times=limit, route=route)
-        except ValueError as exc:
-            return {"ok": False, "error": "invalid_args", "message": f"/loop: {exc}"}
+        # Same set path, status text and loops.max_ticks pause as the CLI.
+        result = _agent_loops.dispatch_loop_command(mgr, arg, route=route)
+        state = mgr.state
         goal_active = False
-        with contextlib.suppress(Exception):
-            goal_active = bool(_agent_loops.goal_blocks_loop_tick(sid))
-        floor = _agent_loops.format_interval(state.interval_seconds)
-        ceiling = _agent_loops.format_interval(_agent_loops.self_paced_ceiling_seconds())
-
-    lines = [f"↻ Loop set ({state.cadence_label()}): {state.prompt}"]
-    if replacing:
-        lines.append("(replaced the previous loop for this session)")
-    requested = parsed.get("interval_seconds")
-    if requested is not None and requested < state.interval_seconds:
-        lines.append(f"(interval raised to the {floor} minimum — loops.min_interval_seconds)")
-    if state.mode == "self_paced":
-        lines.append(f"Self-paced: backs off up to {ceiling} while nothing changes.")
-    stop = "Stops when the task is done"
-    lines.append(f"{stop}, or after {limit} runs (loops.max_ticks)." if limit else f"{stop} (no run limit).")
-    lines.append("First wakeup fires now. Controls: /loop status · pause · resume · stop.")
+        if result.get("created"):
+            with contextlib.suppress(Exception):
+                goal_active = bool(_agent_loops.goal_blocks_loop_tick(sid))
+    message = str(result.get("output") or "")
+    if not result.get("created"):
+        return {"ok": False, "error": "invalid_args", "message": message}
     if goal_active:
-        lines.append("Note: an active /goal is driving this session — loop wakeups "
-                     "defer until the goal finishes, pauses, or parks.")
+        message += ("\nNote: an active /goal is driving this session — loop wakeups "
+                    "defer until the goal finishes, pauses, or parks.")
     wake_scheduler()
     return {
         "ok": True,
         "action": "set",
         "created": True,
-        "message": "\n".join(lines),
+        "message": message,
         "loop": _state_payload(state),
     }
 
@@ -232,6 +217,30 @@ def evaluate_loop_after_turn(
         decision = mgr.complete_tick(str(last_response or ""))
         payload = _state_payload(mgr.state)
     return {**(decision or {}), "loop": payload}
+
+
+LOOP_INTERRUPTED_REASON = "user-interrupted (Stop)"
+LOOP_INTERRUPTED_MESSAGE = ("⏸ Loop paused — wakeup turn was interrupted. "
+                            "Use /loop resume to continue, or /loop stop to end it.")
+
+
+def pause_loop_after_interrupt(
+    session_id: str,
+    *,
+    profile_home: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Pause the loop whose in-flight wakeup the user stopped (CLI Ctrl+C parity); ``{}`` if none."""
+    if not loops_available() or not session_id:
+        return {}
+    with _profile_scope(profile_home):
+        mgr = _agent_loops.LoopManager(session_id=str(session_id))
+        state = mgr.state
+        if state is None or not state.awaiting_response or not _is_webui_route(state):
+            return {}
+        mgr.pause(reason=LOOP_INTERRUPTED_REASON)
+        payload = _state_payload(mgr.state)
+    return {"status": "paused", "stopped": True, "reason": LOOP_INTERRUPTED_REASON,
+            "message": LOOP_INTERRUPTED_MESSAGE, "loop": payload}
 
 
 # ── Scheduler ────────────────────────────────────────────────────────────────

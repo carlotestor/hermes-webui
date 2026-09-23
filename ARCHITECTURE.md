@@ -462,10 +462,11 @@ closed. A busy session or an active `/goal` defers the tick; a start refused wit
 After a `loop_wakeup` turn, the streaming and gateway-chat post-turn hooks call
 `complete_tick()` and emit a `loop` SSE status event. The WebUI takes no `--times` or
 `--until`: a loop ends when the agent replies with the `LOOP_COMPLETE` marker (the
-wakeup prompt tells it to once the task is done), or after `loops.max_ticks` runs
-(default 100). The bridge stores that limit as the loop's `times` so reaching it ends
-the loop (`done`) rather than leaving it paused. A tick whose turn never
-reached that hook (provider error, cancel, restart) is completed by the scheduler once
+wakeup prompt tells it to once the task is done). As in the CLI, it pauses after
+`loops.max_ticks` runs (default 100; `/loop resume` continues), and stopping a wakeup
+turn pauses the loop (`cancel_stream()` calls `pause_loop_after_interrupt()`, like the
+CLI's Ctrl+C). A tick whose turn never
+reached that hook (provider error, restart) is completed by the scheduler once
 the session has been idle for 60s, so the loop cannot wedge. Looping a slash command
 is rejected in the WebUI for now.
 

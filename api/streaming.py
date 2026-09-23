@@ -14099,6 +14099,8 @@ def cancel_stream(stream_id: str) -> bool:
     _snap_agent = None
     _snap_owner_session_id = None
     _cancel_session_payload = None
+    _cancel_was_loop_wakeup = False
+    _cancel_profile = None
 
     with streams_lock:
         stream_present = stream_id in streams
@@ -14353,6 +14355,8 @@ def cancel_stream(stream_id: str) -> bool:
                         _cancel_session_id,
                     )
                 _cs.active_stream_id = None
+                _cancel_was_loop_wakeup = getattr(_cs, 'pending_user_source', None) == 'loop_wakeup'
+                _cancel_profile = getattr(_cs, 'profile', None)
                 _cs.pending_user_message = None
                 _cs.pending_attachments = []
                 _cs.pending_started_at = None
@@ -14422,7 +14426,31 @@ def cancel_stream(stream_id: str) -> bool:
             except Exception:
                 logger.debug("Failed to clear session state on cancel for %s", _cancel_session_id)
 
+    # /loop parity with the CLI's Ctrl+C: stopping a loop wakeup pauses the loop.
+    _loop_pause_payload = None
+    if _cancel_was_loop_wakeup and _cancel_session_id:
+        try:
+            from api.loops import pause_loop_after_interrupt
+            from api.profiles import get_hermes_home_for_profile
+
+            _decision = pause_loop_after_interrupt(
+                _cancel_session_id, profile_home=get_hermes_home_for_profile(_cancel_profile))
+            if _decision.get('message'):
+                _loop_pause_payload = {
+                    'session_id': _cancel_session_id,
+                    'message': _decision['message'],
+                    'status': _decision.get('status'),
+                    'loop': _decision.get('loop'),
+                }
+        except Exception:
+            logger.debug("Failed to pause /loop after cancel for %s", _cancel_session_id, exc_info=True)
+
     if _emit_cancel_event and q:
+        if _loop_pause_payload:
+            try:
+                q.put_nowait(('loop', _loop_pause_payload))
+            except Exception:
+                logger.debug("Failed to put loop pause event to queue")
         _cancel_event_id = STREAM_LAST_EVENT_ID.get(stream_id)
         if _cancel_event_id and hasattr(q, "note_last_event_id"):
             try:
