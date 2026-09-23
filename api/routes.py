@@ -2182,20 +2182,6 @@ def _save_pin_migration_state(state: dict) -> bool:
         return False
 
 
-def _record_pending_state_db_pins(profile, session_ids) -> bool:
-    """Queue sidecar pins state.db has not confirmed; the next sidebar build writes them."""
-    from api.state_sync import _resolve_state_db_path
-
-    db_path = _resolve_state_db_path(profile)
-    if db_path is None:
-        return False
-    with _PIN_MIGRATION_LOCK:
-        state = _load_pin_migration_state()
-        pending = state.setdefault("pending_pins", {})
-        pending[str(db_path)] = sorted(set(pending.get(str(db_path)) or []) | set(session_ids))
-        return _save_pin_migration_state(state)
-
-
 def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] | None:
     """Copy sidecar pins into ``sessions.pinned``: all of them once per state.db, then pending ones.
 
@@ -2229,12 +2215,22 @@ def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] 
             if flags is None:
                 return None
             still_pending |= {sid for sid in todo if flags.get(sid) is not True}
+        # A compression child left unpinned under a pinned ancestor missed its carry.
+        uncarried = agent_session_uncarried_pins(row_pins, profile=profile)
+        if uncarried is None:
+            return None
+        for sid in uncarried:
+            sync_session_pinned(sid, True, profile=profile)
+        if uncarried:
+            uncarried = agent_session_uncarried_pins(uncarried, profile=profile)
+            if uncarried is None:
+                return None
         if key not in migrated or still_pending != pending:
             state["migrated_state_dbs"] = sorted(migrated | {key})
             state.setdefault("pending_pins", {})[key] = sorted(still_pending)
             if not _save_pin_migration_state(state):
                 return None
-        return still_pending
+        return still_pending | uncarried
 
 def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
     """Adopt state.db's pin (the record Desktop and the CLI share) into a sidecar cache row."""
@@ -10791,6 +10787,7 @@ from api.models import (
     agent_session_rows_existing,
     agent_session_zero_message_sids,
     agent_session_pinned_flags,
+    agent_session_uncarried_pins,
     agent_session_pinned_ids,
     agent_session_pin_store_present,
     agent_session_pin_lineage_rows,

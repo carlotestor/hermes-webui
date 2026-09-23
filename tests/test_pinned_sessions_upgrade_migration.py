@@ -186,3 +186,52 @@ def test_absent_row_pin_is_written_once_the_row_appears(upgrade_env):
     conn.commit()
     conn.close()
     assert _sidebar_build(env) == {"late": False, "other": False}
+
+
+def _compressed_lineage(env):
+    _make_db(env.db, ["root", "child"], pinned={"root"})
+    conn = sqlite3.connect(str(env.db))
+    conn.execute("UPDATE sessions SET end_reason = 'compression' WHERE id = 'root'")
+    conn.execute("UPDATE sessions SET parent_session_id = 'root' WHERE id = 'child'")
+    conn.commit()
+    conn.close()
+    env.sidecars.update({"root": True})
+    _sidebar_build(env)
+
+
+def _failed_carry(env):
+    from api.streaming import _carry_pin_to_compression_child
+
+    SqliteSessionDB.fail_writes = True
+    assert _carry_pin_to_compression_child("root", "child", "default", True) is False
+    SqliteSessionDB.fail_writes = False
+    env.sidecars["child"] = True  # the rotation keeps the sidecar pin
+
+
+def test_failed_carry_retries_without_a_saved_marker(upgrade_env, monkeypatch):
+    env = upgrade_env
+    _compressed_lineage(env)
+    # The marker file cannot be written either: the retry comes from state.db's lineage.
+    monkeypatch.setattr(env.routes, "_save_pin_migration_state", lambda _s: False)
+    _failed_carry(env)
+    assert db_pins(env.db) == {"root": True, "child": False}
+
+    assert _sidebar_build(env) == {"root": True, "child": True}
+    assert db_pins(env.db) == {"root": True, "child": True}
+    assert env.sidecars == {"root": True, "child": True}
+
+
+def test_failed_carry_retry_keeps_a_newer_desktop_unpin(upgrade_env):
+    env = upgrade_env
+    _compressed_lineage(env)
+    _failed_carry(env)
+
+    # Desktop unpins the lineage before the next sidebar build.
+    conn = sqlite3.connect(str(env.db))
+    conn.execute("UPDATE sessions SET pinned = 0")
+    conn.commit()
+    conn.close()
+
+    assert _sidebar_build(env) == {"root": False, "child": False}
+    assert db_pins(env.db) == {"root": False, "child": False}
+    assert env.sidecars == {"root": False, "child": False}

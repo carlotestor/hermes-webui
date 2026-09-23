@@ -6004,6 +6004,26 @@ def agent_session_pinned_flags(session_ids, *, profile=None) -> dict[str, bool] 
     return _read_pin_db(profile, query, missing={}) if session_ids else {}
 
 
+def agent_session_uncarried_pins(session_ids, *, profile=None) -> set[str] | None:
+    """Unpinned ids with a pinned compression ancestor (a lineage pin that missed the child).
+
+    Empty without lineage columns; ``None`` when unreadable.
+    """
+    def query(cur, cols):
+        if not {"id", "pinned", "parent_session_id", "end_reason"} <= cols:
+            return set()
+        sql = (
+            "WITH RECURSIVE anc(start, id) AS ("
+            " SELECT c.id, p.id FROM sessions c JOIN sessions p ON p.id = c.parent_session_id"
+            " WHERE c.id IN ({ids}) AND NOT c.pinned AND p.end_reason = 'compression'"
+            " UNION SELECT a.start, p.id FROM anc a JOIN sessions c ON c.id = a.id"
+            " JOIN sessions p ON p.id = c.parent_session_id WHERE p.end_reason = 'compression')"
+            " SELECT DISTINCT a.start FROM anc a JOIN sessions s ON s.id = a.id WHERE s.pinned"
+        )
+        return {str(row[0]).strip() for row in _pin_db_chunks(cur, sql, session_ids)}
+    return _read_pin_db(profile, query, missing=set()) if session_ids else set()
+
+
 def agent_session_pin_store_present(*, profile=None) -> bool | None:
     """Whether *profile* has a state.db with ``sessions.pinned``; ``None`` when unreadable."""
     return _read_pin_db(profile, lambda cur, cols: "pinned" in cols, missing=False)

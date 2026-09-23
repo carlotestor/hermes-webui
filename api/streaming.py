@@ -9255,7 +9255,8 @@ def _cached_agent_session_identity(agent) -> str | None:
 def _carry_pin_to_compression_child(old_sid: str, new_sid: str, profile, sidecar_pinned: bool) -> bool | None:
     """Pin the compression child in state.db when the parent is pinned there (sidecar flag as fallback).
 
-    None when the parent is unpinned, else whether state.db confirms it; a failed carry is queued.
+    None when the parent is unpinned, else whether state.db confirms it; a missed carry is
+    re-derived from state.db's lineage on the next sidebar build.
     """
     from api.state_sync import sync_session_pinned
     from api.models import agent_session_pinned_flags
@@ -9273,9 +9274,7 @@ def _carry_pin_to_compression_child(old_sid: str, new_sid: str, profile, sidecar
         logger.debug("Pin carry to compression child %s failed", new_sid, exc_info=True)
         ok = False
     if not ok:
-        from api.routes import _record_pending_state_db_pins
         logger.warning("Could not carry pin to compression child %s; will retry", new_sid)
-        _record_pending_state_db_pins(profile, [new_sid])
     return ok
 
 
