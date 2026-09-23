@@ -85,3 +85,30 @@ def test_pin_refused_when_a_profile_pin_db_is_unreadable(monkeypatch):
     assert responses["r"] == 503
     assert writes == [] and sess.pinned is False
     assert routes._PIN_QUOTA_RESERVATIONS == {}
+
+
+def test_quota_counts_pins_of_a_registered_profile_without_webui_rows(tmp_path, monkeypatch):
+    from api import models, routes
+
+    work_db = tmp_path / "work.db"
+    _state_db(work_db, [("d1", None, None, None, 1), ("d2", None, None, None, 1)])
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: work_db if profile == "work" else None)
+    monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}, {"name": "work"}])
+    # WebUI holds rows for "default" only; "work" was pinned from Desktop/CLI.
+    rows = routes._pin_quota_rows_from_state_db([{"session_id": "a", "pinned": True, "profile": "default"}])
+    assert routes._visible_pinned_lineage_ids(rows) == {"a", "d1", "d2"}
+
+
+def test_missing_pin_store_counts_as_no_agent_pins(tmp_path, monkeypatch):
+    from api import models, routes
+
+    legacy = tmp_path / "legacy.db"
+    conn = sqlite3.connect(legacy)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT)")
+    conn.execute("INSERT INTO sessions VALUES ('a', 'webui')")
+    conn.commit(); conn.close()
+    monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}, {"name": "nodb"}])
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: legacy if profile == "default" else None)
+    # A state.db without sessions.pinned, and a profile without state.db, hold no agent pins.
+    rows = routes._pin_quota_rows_from_state_db([{"session_id": "a", "pinned": True, "profile": "default"}])
+    assert routes._visible_pinned_lineage_ids(rows) == {"a"}

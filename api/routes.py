@@ -461,24 +461,41 @@ def _pin_quota_reservation_rows(exclude_sid: str, snapshot_seq: int) -> list[dic
     return rows
 
 
+def _pin_quota_profile_keys(rows) -> list:
+    """Profiles whose pins count toward the global limit: every registered one plus row owners."""
+    keys = {_session_field(row, "profile", None) for row in rows}
+    try:
+        keys.update(p.get("name") for p in list_profiles_api() if p.get("name"))
+    except Exception:
+        logger.warning("Could not list profiles for the pin quota", exc_info=True)
+    return sorted(keys, key=lambda k: (k is None, str(k)))
+
+
 def _pin_quota_rows_from_state_db(rows) -> list[dict] | None:
     """Return quota rows whose ``pinned`` flag comes from each profile's state.db.
 
-    State.db-only pins join their compression lineage. ``None`` when any
-    profile's pins cannot be read, so the caller fails closed.
+    State.db-only pins join their compression lineage. A profile with no pin
+    store keeps its cached flags; ``None`` when an existing store cannot be read.
+    Every registered profile is read, so pins made outside the WebUI count too.
     """
     by_profile: dict[object, list[dict]] = defaultdict(list)
     for row in rows:
         by_profile[_session_field(row, "profile", None)].append(dict(row))
     out: list[dict] = []
-    for profile_key, profile_rows in by_profile.items():
+    for profile_key in _pin_quota_profile_keys(rows):
+        profile_rows = by_profile.get(profile_key, [])
         profile = profile_key if isinstance(profile_key, str) and profile_key else None
         pinned_ids = agent_session_pinned_ids(profile=profile)
+        if pinned_ids is None:
+            return None
         known = agent_session_pinned_flags(
             [r.get("session_id") for r in profile_rows], profile=profile
         )
-        if pinned_ids is None or known is None:
-            return None
+        if known is None:
+            # No pin store (no state.db or no pinned column): cached flags stand.
+            if agent_session_pin_store_present(profile=profile) is not False:
+                return None
+            known = {}
         seen = set()
         for row in profile_rows:
             sid = str(row.get("session_id") or "").strip()
@@ -10767,6 +10784,7 @@ from api.models import (
     agent_session_zero_message_sids,
     agent_session_pinned_flags,
     agent_session_pinned_ids,
+    agent_session_pin_store_present,
     agent_session_pin_lineage_rows,
     _load_webui_zero_message_orphan_tombstone,
     _record_webui_zero_message_orphan_tombstone,

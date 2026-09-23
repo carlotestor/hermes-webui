@@ -6013,8 +6013,29 @@ def agent_session_pinned_flags(
         return None
 
 
+def agent_session_pin_store_present(*, profile=None) -> bool | None:
+    """Whether *profile* has an agent pin store (state.db with ``sessions.pinned``).
+
+    False means no agent pins can exist; ``None`` means the store could not be read.
+    """
+    db_path = _pin_state_db_path(profile)
+    if db_path is None:
+        return False
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            return 'pinned' in {str(row[1]) for row in cur.fetchall()}
+    except Exception:
+        logger.debug("agent_session_pin_store_present probe failed", exc_info=True)
+        return None
+
+
 def agent_session_pinned_ids(*, profile=None) -> set[str] | None:
-    """Return ids pinned in *profile*'s state.db; ``None`` when unreadable."""
+    """Return ids pinned in *profile*'s state.db; ``None`` when unreadable.
+
+    No state.db or no ``pinned`` column means no agent pin store: empty set.
+    """
     db_path = _pin_state_db_path(profile)
     if db_path is None:
         return set()
@@ -6023,7 +6044,7 @@ def agent_session_pinned_ids(*, profile=None) -> set[str] | None:
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
             if 'pinned' not in {str(row[1]) for row in cur.fetchall()}:
-                return None
+                return set()
             cur.execute("SELECT id FROM sessions WHERE pinned")
             return {str(row[0]).strip() for row in cur.fetchall() if row[0]}
     except Exception:
@@ -6052,16 +6073,22 @@ def agent_session_pin_lineage_rows(
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
             cols = {str(row[1]) for row in cur.fetchall()}
-            if not {'id', 'parent_session_id', 'end_reason'} <= cols:
+            if 'id' not in cols:
                 return None
             source_sql = "child.session_source" if 'session_source' in cols else "NULL"
+            # Without lineage columns no compression link exists: one slot per id.
+            if {'parent_session_id', 'end_reason'} <= cols:
+                parent_sql = "parent.id"
+                join_sql = (" LEFT JOIN sessions parent ON parent.id = child.parent_session_id"
+                            " AND parent.end_reason = 'compression'")
+            else:
+                parent_sql, join_sql = "NULL", ""
             rows: list[dict] = []
             for i in range(0, len(wanted), 500):
                 chunk = wanted[i:i + 500]
                 cur.execute(
-                    f"SELECT child.id, parent.id, {source_sql} FROM sessions child"
-                    " LEFT JOIN sessions parent ON parent.id = child.parent_session_id"
-                    " AND parent.end_reason = 'compression'"
+                    f"SELECT child.id, {parent_sql}, {source_sql} FROM sessions child"
+                    f"{join_sql}"
                     f" WHERE child.id IN ({','.join('?' * len(chunk))})",
                     chunk,
                 )
