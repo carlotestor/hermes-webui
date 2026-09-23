@@ -3980,6 +3980,47 @@ def _split_thinking_from_content(raw_content, existing_reasoning=''):
     )
 
 
+def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments):
+    """Persist per-step reasoning on this turn's assistant messages in ``s.messages``.
+
+    Contract (docs/sse-streams.md, "Reasoning settlement"): a message's own
+    ``reasoning`` key, even None (the agent found no thinking for that step),
+    is authoritative. ``_reasoning_segments`` (live stream index -> text) fill
+    only messages without the key, because segments drift when a step has no
+    thinking. Inline ``<think>`` blocks are split out of content either way.
+    """
+    # #3587: use per-message segments so each of this turn's assistant messages
+    # gets its own trace; skip prior-turn messages (multi-turn off-by-N).
+    if not s.messages:
+        return
+    _prev_asst = sum(
+        1 for m in (_previous_messages or [])
+        if isinstance(m, dict) and m.get('role') == 'assistant'
+    )
+    _asst_count = 0
+    for _rm in s.messages:
+        if not (isinstance(_rm, dict) and _rm.get('role') == 'assistant'):
+            continue
+        _turn_idx = _asst_count
+        _asst_count += 1
+        if _turn_idx < _prev_asst:
+            continue  # prior-turn message: never touch its reasoning
+        if 'reasoning' in _rm:
+            _existing_reasoning = _rm.get('reasoning') or ''
+        else:
+            _existing_reasoning = _reasoning_segments.get(_turn_idx - _prev_asst, '')
+        _content = _rm.get('content')
+        if isinstance(_content, str) and _content:
+            _new_content, _merged_reasoning = _split_thinking_from_content(
+                _content, _existing_reasoning
+            )
+            _rm['content'] = _new_content
+            if _merged_reasoning:
+                _rm['reasoning'] = _merged_reasoning
+        elif _existing_reasoning:
+            _rm['reasoning'] = _existing_reasoning
+
+
 def _strip_thinking_markup(text: str) -> str:
     """Remove common reasoning/thinking wrappers from model text."""
     if not text:
@@ -12461,42 +12502,8 @@ def _run_agent_streaming(
                 # assistant content into m['reasoning'] (server-side twin of the JS
                 # _splitThinkFromContent). Inline-thinking providers (e.g. MiniMax-M3)
                 # otherwise leave the thinking trace in m['content'], bloating the
-                # persisted session file 30-50% and bypassing the thinking card. The
-                # #3587: use per-message segments so intermediate assistant turns
-                # (before tool calls) each receive their own reasoning trace rather
-                # than all reasoning being written only to the last assistant message.
-                # Scope the walk to this turn's newly-appended assistant messages
-                # to prevent cross-turn reasoning clobber (multi-turn off-by-N).
-                if s.messages:
-                    _prev_asst = sum(
-                        1 for m in (_previous_messages or [])
-                        if isinstance(m, dict) and m.get('role') == 'assistant'
-                    )
-                    _asst_count = 0
-                    for _rm in s.messages:
-                        if not (isinstance(_rm, dict) and _rm.get('role') == 'assistant'):
-                            continue
-                        _turn_idx = _asst_count
-                        _asst_count += 1
-                        if _turn_idx < _prev_asst:
-                            continue  # prior-turn message — never touch its reasoning
-                        _seg_reasoning = _reasoning_segments.get(_turn_idx - _prev_asst, '')
-                        # The agent's own `reasoning` key (even None) is authoritative;
-                        # stream segments drift off by one when a step has no thinking.
-                        if 'reasoning' in _rm:
-                            _existing_reasoning = _rm.get('reasoning') or ''
-                        else:
-                            _existing_reasoning = _seg_reasoning
-                        _content = _rm.get('content')
-                        if isinstance(_content, str) and _content:
-                            _new_content, _merged_reasoning = _split_thinking_from_content(
-                                _content, _existing_reasoning
-                            )
-                            _rm['content'] = _new_content
-                            if _merged_reasoning:
-                                _rm['reasoning'] = _merged_reasoning
-                        elif _existing_reasoning:
-                            _rm['reasoning'] = _existing_reasoning
+                # persisted session file 30-50% and bypassing the thinking card.
+                _settle_turn_reasoning(s, _previous_messages, _reasoning_segments)
                 try:
                     _turn_duration_seconds = max(0.0, time.time() - float(_turn_started_at))
                 except Exception:

@@ -71,6 +71,28 @@ cache or publish its result to a later subscriber cohort. The subscriber lock
 protects removal, epoch checks and cache commits, but is not held during DB
 reads, so disconnect is not blocked by a slow projection.
 
+## Reasoning settlement
+
+When a `/api/chat/stream` turn settles, `_settle_turn_reasoning()` in
+`api/streaming.py` persists a reasoning trace on each of the turn's new
+assistant messages before the session is saved. Assistant messages from
+earlier turns are never modified.
+
+- **The agent's `reasoning` key wins.** If the message carries a `reasoning`
+  key, its value is used, including `None`. The agent writes this key on every
+  assistant message it builds, and `None` means the model produced no thinking
+  for that step. It is not backfilled from the stream.
+- **Stream segments are only a fallback.** The live `_reasoning_segments`
+  (stream step index -> text) fill a message only when it has no `reasoning`
+  key at all. They are not authoritative because the index advances only at a
+  tool boundary that already holds reasoning text. With adaptive-thinking
+  models that skip thinking on some tool-call steps, segment `k` can therefore
+  hold step `k+1`'s trace.
+- **Inline `<think>` blocks** in the content are always split into `reasoning`
+  and merged with the value chosen above.
+
+Regression coverage: `tests/test_settlement_agent_reasoning_authoritative.py`.
+
 ## Heartbeats and proxy behavior
 
 - All long-lived streams emit SSE keepalive comment lines on the
