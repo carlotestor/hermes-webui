@@ -5920,6 +5920,12 @@ def agent_session_rows_existing(
         return frozenset(wanted)
 
 
+def _pin_state_db_path(profile=None) -> Path | None:
+    """state.db holding *profile*'s pins; never another profile's database."""
+    from api.state_sync import _resolve_state_db_path
+    return _resolve_state_db_path(profile if isinstance(profile, str) and profile else None)
+
+
 def agent_session_pinned_flags(
     session_ids: list[str] | set[str] | frozenset[str],
     *,
@@ -5936,7 +5942,8 @@ def agent_session_pinned_flags(
     wanted = {str(sid).strip() for sid in (session_ids or []) if str(sid or "").strip()}
     if not wanted:
         return {}
-    db_path = _agent_state_db_path(profile=profile)
+    # An explicit profile reads only its own state.db; missing means empty.
+    db_path = _pin_state_db_path(profile)
     if db_path is None:
         return {}
     try:

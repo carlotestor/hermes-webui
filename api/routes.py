@@ -2083,9 +2083,12 @@ def _reconcile_sidebar_pins_with_state_db(rows: list[dict]) -> None:
         if str(row.get("session_id") or "").strip():
             by_profile[row.get("profile")].append(row)
     for profile_key, profile_rows in by_profile.items():
+        profile = profile_key if isinstance(profile_key, str) and profile_key else None
+        if not _migrate_legacy_sidecar_pins(profile_rows, profile):
+            continue
         flags = agent_session_pinned_flags(
             [str(r.get("session_id")).strip() for r in profile_rows],
-            profile=profile_key if isinstance(profile_key, str) and profile_key else None,
+            profile=profile,
         )
         if not flags:
             continue
@@ -2094,6 +2097,63 @@ def _reconcile_sidebar_pins_with_state_db(rows: list[dict]) -> None:
             if sid in flags:
                 _reconcile_sidebar_pin_with_state_db(row, {"pinned": flags[sid]})
 
+
+_PIN_MIGRATION_MARKER_NAME = "_pin_state_db_migration.json"
+_PIN_MIGRATION_LOCK = threading.Lock()
+
+
+def _pin_migration_marker_path() -> Path:
+    return Path(SESSION_DIR) / _PIN_MIGRATION_MARKER_NAME
+
+
+def _migrated_pin_state_dbs() -> set[str]:
+    try:
+        data = json.loads(_pin_migration_marker_path().read_text(encoding="utf-8"))
+        return {str(p) for p in (data.get("migrated_state_dbs") or [])}
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> bool:
+    """Copy pre-state.db sidecar pins into ``sessions.pinned`` once per state.db.
+
+    Returns True once this profile's state.db is migrated (writes verified and
+    the marker saved); until then state.db must not overwrite sidecar pins.
+    """
+    from api.paths import _atomic_write_text
+    from api.state_sync import _resolve_state_db_path, sync_session_pinned
+
+    db_path = _resolve_state_db_path(profile)
+    if db_path is None:
+        return True
+    key = str(db_path)
+    with _PIN_MIGRATION_LOCK:
+        migrated = _migrated_pin_state_dbs()
+        if key in migrated:
+            return True
+        legacy = [
+            str(r.get("session_id")).strip() for r in profile_rows if r.get("pinned") is True
+        ]
+        if legacy:
+            flags = agent_session_pinned_flags(legacy, profile=profile)
+            for sid in legacy:
+                if flags.get(sid) is False:
+                    sync_session_pinned(sid, True, profile=profile)
+            flags = agent_session_pinned_flags(legacy, profile=profile)
+            if any(flags.get(sid) is False for sid in legacy):
+                logger.warning("Legacy pin migration into %s incomplete; will retry", key)
+                return False
+        migrated.add(key)
+        try:
+            _atomic_write_text(
+                _pin_migration_marker_path(),
+                json.dumps({"migrated_state_dbs": sorted(migrated)}, indent=2),
+            )
+        except OSError:
+            logger.warning("Could not record legacy pin migration for %s", key, exc_info=True)
+            return False
+        logger.info("Migrated %d legacy WebUI pin(s) into %s", len(legacy), key)
+        return True
 
 def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
     """Adopt ``sessions.pinned`` from state.db into a sidecar row.

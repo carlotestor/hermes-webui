@@ -202,7 +202,8 @@ def test_write_pin_accepts_sidecar_only_session(monkeypatch):
     assert calls == []
 
 
-def test_reconcile_state_db_wins_over_sidecar(monkeypatch):
+def test_reconcile_state_db_wins_over_sidecar_after_migration(monkeypatch):
+    """Per-row reconcile; the sweep only calls it once legacy pins are migrated."""
     from api import routes
 
     saved = []
@@ -276,6 +277,7 @@ def test_sidebar_build_reconciles_pins_without_show_cli_sessions(monkeypatch):
     from api import routes
 
     seen = []
+    monkeypatch.setattr(routes, "_migrate_legacy_sidecar_pins", lambda rows, profile: True)
     monkeypatch.setattr(
         routes, "agent_session_pinned_flags",
         lambda ids, profile=None: seen.append((sorted(ids), profile)) or {"a": True, "b": False},
@@ -311,9 +313,9 @@ def test_agent_session_pinned_flags_reads_state_db(tmp_path, monkeypatch):
     conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, pinned INTEGER DEFAULT 0)")
     conn.executemany("INSERT INTO sessions VALUES (?, ?)", [("p", 1), ("u", 0)])
     conn.commit(); conn.close()
-    monkeypatch.setattr(models, "_agent_state_db_path", lambda profile=None: db)
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: db)
     assert models.agent_session_pinned_flags(["p", "u", "missing"]) == {"p": True, "u": False}
-    monkeypatch.setattr(models, "_agent_state_db_path", lambda profile=None: None)
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: None)
     assert models.agent_session_pinned_flags(["p"]) == {}
 
 
