@@ -461,10 +461,11 @@ def _pin_quota_reservation_rows(exclude_sid: str, snapshot_seq: int) -> list[dic
     return rows
 
 
-def _pin_quota_rows_from_state_db(rows) -> list[dict]:
+def _pin_quota_rows_from_state_db(rows) -> list[dict] | None:
     """Return quota rows whose ``pinned`` flag comes from each profile's state.db.
 
-    Pins state.db holds without a WebUI row are added as their own lineage.
+    State.db-only pins join their compression lineage. ``None`` when any
+    profile's pins cannot be read, so the caller fails closed.
     """
     by_profile: dict[object, list[dict]] = defaultdict(list)
     for row in rows:
@@ -473,12 +474,11 @@ def _pin_quota_rows_from_state_db(rows) -> list[dict]:
     for profile_key, profile_rows in by_profile.items():
         profile = profile_key if isinstance(profile_key, str) and profile_key else None
         pinned_ids = agent_session_pinned_ids(profile=profile)
-        if pinned_ids is None:
-            out.extend(profile_rows)
-            continue
         known = agent_session_pinned_flags(
             [r.get("session_id") for r in profile_rows], profile=profile
-        ) or {}
+        )
+        if pinned_ids is None or known is None:
+            return None
         seen = set()
         for row in profile_rows:
             sid = str(row.get("session_id") or "").strip()
@@ -486,8 +486,12 @@ def _pin_quota_rows_from_state_db(rows) -> list[dict]:
             if sid in known:
                 row["pinned"] = sid in pinned_ids
             out.append(row)
+        lineage_rows = agent_session_pin_lineage_rows(pinned_ids - seen, profile=profile)
+        if lineage_rows is None:
+            return None
+        links = {lr["session_id"]: lr for lr in lineage_rows}
         out.extend(
-            {"session_id": sid, "pinned": True, "profile": profile_key}
+            dict(links.get(sid) or {"session_id": sid, "pinned": True}, profile=profile_key)
             for sid in sorted(pinned_ids - seen)
         )
     return out
@@ -10763,6 +10767,7 @@ from api.models import (
     agent_session_zero_message_sids,
     agent_session_pinned_flags,
     agent_session_pinned_ids,
+    agent_session_pin_lineage_rows,
     _load_webui_zero_message_orphan_tombstone,
     _record_webui_zero_message_orphan_tombstone,
     _clear_webui_zero_message_orphan_tombstone,
@@ -17619,10 +17624,13 @@ def handle_post(handler, parsed) -> bool:
                     cached_rows = [existing.compact() for existing in SESSIONS.values()]
                 # state.db is the pin record: its flag overrides every cached copy.
                 target_profile_row = {"session_id": "", "profile": getattr(s, "profile", None)}
+                quota_rows = _pin_quota_rows_from_state_db(
+                    list(all_sessions()) + cached_rows + [target_profile_row]
+                )
+                if quota_rows is None:
+                    return bad(handler, "Could not read pins from state.db to check the pin limit", 503)
                 persisted_rows = [
-                    existing for existing in _pin_quota_rows_from_state_db(
-                        list(all_sessions()) + cached_rows + [target_profile_row]
-                    )
+                    existing for existing in quota_rows
                     if existing.get("session_id") and _session_counts_toward_pin_quota(existing)
                 ]
                 with LOCK:

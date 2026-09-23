@@ -6031,6 +6031,53 @@ def agent_session_pinned_ids(*, profile=None) -> set[str] | None:
         return None
 
 
+def agent_session_pin_lineage_rows(
+    session_ids: list[str] | set[str] | frozenset[str],
+    *,
+    profile=None,
+) -> list[dict] | None:
+    """Return quota rows for pinned state.db sessions; ``None`` when unreadable.
+
+    ``parent_session_id`` is set only for a compression parent, the link
+    ``SessionDB.set_session_pinned`` pins across, so a lineage shares one slot.
+    """
+    wanted = sorted({str(sid).strip() for sid in (session_ids or []) if str(sid or "").strip()})
+    if not wanted:
+        return []
+    db_path = _pin_state_db_path(profile)
+    if db_path is None:
+        return []
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            cols = {str(row[1]) for row in cur.fetchall()}
+            if not {'id', 'parent_session_id', 'end_reason'} <= cols:
+                return None
+            source_sql = "child.session_source" if 'session_source' in cols else "NULL"
+            rows: list[dict] = []
+            for i in range(0, len(wanted), 500):
+                chunk = wanted[i:i + 500]
+                cur.execute(
+                    f"SELECT child.id, parent.id, {source_sql} FROM sessions child"
+                    " LEFT JOIN sessions parent ON parent.id = child.parent_session_id"
+                    " AND parent.end_reason = 'compression'"
+                    f" WHERE child.id IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                )
+                for sid, parent, source in cur.fetchall():
+                    row = {"session_id": str(sid).strip(), "pinned": True}
+                    if parent:
+                        row["parent_session_id"] = str(parent).strip()
+                    if source:
+                        row["session_source"] = str(source)
+                    rows.append(row)
+            return rows
+    except Exception:
+        logger.debug("agent_session_pin_lineage_rows probe failed", exc_info=True)
+        return None
+
+
 def agent_session_zero_message_sids(
     session_ids: list[str] | set[str] | frozenset[str],
     *,
