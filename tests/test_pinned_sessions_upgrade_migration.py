@@ -194,3 +194,28 @@ def test_failed_pin_read_does_not_finalize_migration(upgrade_env, monkeypatch):
     assert _sidebar_build(env) == {"legacy_a": True}
     assert _db_pins(env.db) == {"legacy_a": True}
     assert env.sidecars == {"legacy_a": True}
+
+
+def test_absent_row_pin_is_written_once_the_row_appears(upgrade_env):
+    env = upgrade_env
+    # The sidecar pin predates its state.db row (the Agent has not inserted it yet).
+    _make_db(env.db, ["other"])
+    env.sidecars.update({"late": True, "other": False})
+    assert _sidebar_build(env) == {"late": True, "other": False}
+
+    # The Agent inserts the row with its default pinned=0.
+    conn = sqlite3.connect(str(env.db))
+    conn.execute("INSERT INTO sessions (id, pinned) VALUES ('late', 0)")
+    conn.commit()
+    conn.close()
+
+    assert _sidebar_build(env) == {"late": True, "other": False}
+    assert _db_pins(env.db) == {"late": True, "other": False}
+    assert env.sidecars == {"late": True, "other": False}
+
+    # Nothing pending any more: a later Desktop unpin now reaches the sidecar.
+    conn = sqlite3.connect(str(env.db))
+    conn.execute("UPDATE sessions SET pinned = 0 WHERE id = 'late'")
+    conn.commit()
+    conn.close()
+    assert _sidebar_build(env) == {"late": False, "other": False}

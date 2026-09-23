@@ -9257,7 +9257,7 @@ def _carry_pin_to_compression_child(old_sid: str, new_sid: str, profile, sidecar
 
     state.db decides; the sidecar flag is used only when state.db cannot answer
     for the parent. Returns None when the parent is unpinned, else whether
-    state.db confirms the child is pinned (the Agent inserts it unpinned).
+    state.db confirms the child is pinned; an unconfirmed carry is queued for retry.
     """
     from api.state_sync import sync_session_pinned
     from api.models import agent_session_pinned_flags
@@ -9275,7 +9275,9 @@ def _carry_pin_to_compression_child(old_sid: str, new_sid: str, profile, sidecar
         logger.debug("Pin carry to compression child %s failed", new_sid, exc_info=True)
         ok = False
     if not ok:
-        logger.warning("Could not carry pin to compression child %s", new_sid)
+        from api.routes import _record_pending_state_db_pins
+        logger.warning("Could not carry pin to compression child %s; will retry", new_sid)
+        _record_pending_state_db_pins(profile, [new_sid])
     return ok
 
 
@@ -11870,11 +11872,11 @@ def _run_agent_streaming(
                             _close_cached_agent_entry_at_session_boundary(old_sid, _skipped_agent_migration_entry)
                         except Exception:
                             logger.debug("Failed to close skipped compression-migration cached agent for session %s", old_sid, exc_info=True)
-                    # The child's pin mirrors what state.db confirms after the carry.
+                    # A pinned parent keeps the child pinned; a failed carry is retried.
                     s.pinned = _carry_pin_to_compression_child(
                         old_sid, new_sid, getattr(s, 'profile', None) or _resolved_profile_name,
                         getattr(s, 'pinned', False),
-                    ) is True
+                    ) is not None
                     _compressed = True
 
                 # ── Detect silent agent failure (no assistant reply produced) ──

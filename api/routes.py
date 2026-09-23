@@ -437,14 +437,14 @@ def _session_row_lineage_root_id(session, sessions_by_id) -> str:
     return current or sid
 
 
-# Pin-quota reservations, keyed by session_id → ``{"row", "committed_seq"}``.
+# Pin-quota reservations, keyed by (profile, session_id) → ``{"row", "committed_seq"}``.
 # An in-flight pin counts here until state.db holds its outcome; a pin state.db
 # accepted is stamped and pruned by the next check whose state.db read follows it.
-_PIN_QUOTA_RESERVATIONS: dict[str, dict] = {}
+_PIN_QUOTA_RESERVATIONS: dict[tuple, dict] = {}
 _PIN_QUOTA_COMMIT_SEQ = 0
 
 
-def _pin_quota_reservation_rows(exclude_sid: str, snapshot_seq: int) -> list[dict]:
+def _pin_quota_reservation_rows(exclude_key: tuple, snapshot_seq: int) -> list[dict]:
     """Return reservation rows still owed quota; prune ones the snapshot covers.
 
     Caller must hold ``LOCK``. ``snapshot_seq`` is ``_PIN_QUOTA_COMMIT_SEQ`` as
@@ -456,18 +456,19 @@ def _pin_quota_reservation_rows(exclude_sid: str, snapshot_seq: int) -> list[dic
         if committed_seq is not None and committed_seq <= snapshot_seq:
             _PIN_QUOTA_RESERVATIONS.pop(rid, None)
             continue
-        if rid != exclude_sid:
+        if rid != exclude_key:
             rows.append(dict(entry["row"]))
     return rows
 
 
-def _pin_quota_profile_keys(rows) -> list:
-    """Profiles whose pins count toward the global limit: every registered one plus row owners."""
+def _pin_quota_profile_keys(rows) -> list | None:
+    """Profiles whose pins count toward the global limit; ``None`` when they cannot be listed."""
     keys = {_session_field(row, "profile", None) for row in rows}
     try:
         keys.update(p.get("name") for p in list_profiles_api() if p.get("name"))
     except Exception:
         logger.warning("Could not list profiles for the pin quota", exc_info=True)
+        return None
     return sorted(keys, key=lambda k: (k is None, str(k)))
 
 
@@ -481,8 +482,11 @@ def _pin_quota_rows_from_state_db(rows) -> list[dict] | None:
     by_profile: dict[object, list[dict]] = defaultdict(list)
     for row in rows:
         by_profile[_session_field(row, "profile", None)].append(dict(row))
+    profile_keys = _pin_quota_profile_keys(rows)
+    if profile_keys is None:
+        return None
     out: list[dict] = []
-    for profile_key in _pin_quota_profile_keys(rows):
+    for profile_key in profile_keys:
         profile_rows = by_profile.get(profile_key, [])
         profile = profile_key if isinstance(profile_key, str) and profile_key else None
         pinned_ids = agent_session_pinned_ids(profile=profile)
@@ -2148,7 +2152,8 @@ def _reconcile_sidebar_pins_with_state_db(rows: list[dict]) -> None:
             by_profile[row.get("profile")].append(row)
     for profile_key, profile_rows in by_profile.items():
         profile = profile_key if isinstance(profile_key, str) and profile_key else None
-        if not _migrate_legacy_sidecar_pins(profile_rows, profile):
+        pending = _migrate_legacy_sidecar_pins(profile_rows, profile)
+        if pending is None:
             continue
         flags = agent_session_pinned_flags(
             [str(r.get("session_id")).strip() for r in profile_rows],
@@ -2158,7 +2163,7 @@ def _reconcile_sidebar_pins_with_state_db(rows: list[dict]) -> None:
             continue
         for row in profile_rows:
             sid = str(row.get("session_id")).strip()
-            if sid in flags:
+            if sid in flags and sid not in pending:
                 _reconcile_sidebar_pin_with_state_db(row, {"pinned": flags[sid]})
 
 
@@ -2170,57 +2175,79 @@ def _pin_migration_marker_path() -> Path:
     return Path(SESSION_DIR) / _PIN_MIGRATION_MARKER_NAME
 
 
-def _migrated_pin_state_dbs() -> set[str]:
+def _load_pin_migration_state() -> dict:
     try:
         data = json.loads(_pin_migration_marker_path().read_text(encoding="utf-8"))
-        return {str(p) for p in (data.get("migrated_state_dbs") or [])}
-    except (OSError, ValueError, AttributeError):
-        return set()
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> bool:
-    """Copy pre-state.db sidecar pins into ``sessions.pinned`` once per state.db.
-
-    Returns True once this profile's state.db is migrated (writes verified and
-    the marker saved); until then state.db must not overwrite sidecar pins.
-    """
+def _save_pin_migration_state(state: dict) -> bool:
     from api.paths import _atomic_write_text
+    try:
+        _atomic_write_text(_pin_migration_marker_path(), json.dumps(state, indent=2, sort_keys=True))
+        return True
+    except OSError:
+        logger.warning("Could not record the pin migration state", exc_info=True)
+        return False
+
+
+def _record_pending_state_db_pins(profile, session_ids) -> bool:
+    """Queue sidecar pins state.db has not confirmed; the next sidebar build writes them."""
+    from api.state_sync import _resolve_state_db_path
+
+    db_path = _resolve_state_db_path(profile)
+    if db_path is None:
+        return False
+    with _PIN_MIGRATION_LOCK:
+        state = _load_pin_migration_state()
+        pending = state.setdefault("pending_pins", {})
+        pending[str(db_path)] = sorted(set(pending.get(str(db_path)) or []) | set(session_ids))
+        return _save_pin_migration_state(state)
+
+
+def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] | None:
+    """Write sidecar pins state.db lacks into ``sessions.pinned``.
+
+    The first run per state.db copies every sidecar pin; a pin whose row is absent
+    or whose write fails stays pending and is retried on each build. Returns the
+    pending ids reconciliation must not overwrite, or None when nothing may be applied.
+    """
     from api.state_sync import _resolve_state_db_path, sync_session_pinned
 
     db_path = _resolve_state_db_path(profile)
     if db_path is None:
-        return True
+        return set()
     key = str(db_path)
     with _PIN_MIGRATION_LOCK:
-        migrated = _migrated_pin_state_dbs()
-        if key in migrated:
-            return True
-        legacy = [
-            str(r.get("session_id")).strip() for r in profile_rows if r.get("pinned") is True
-        ]
-        if legacy:
-            flags = agent_session_pinned_flags(legacy, profile=profile)
+        state = _load_pin_migration_state()
+        migrated = set(state.get("migrated_state_dbs") or [])
+        pending = set((state.get("pending_pins") or {}).get(key) or [])
+        row_pins = {str(r.get("session_id")).strip(): r.get("pinned") is True for r in profile_rows}
+        # A pending pin the sidecar no longer holds was unpinned in the WebUI.
+        todo = {sid for sid in pending if row_pins.get(sid)}
+        if key not in migrated:
+            todo |= {sid for sid, pinned in row_pins.items() if pinned}
+        still_pending = {sid for sid in pending if sid not in row_pins}
+        if todo:
+            flags = agent_session_pinned_flags(todo, profile=profile)
             if flags is None:
-                logger.warning("Could not read pins from %s; legacy pin migration will retry", key)
-                return False
-            for sid in legacy:
+                logger.warning("Could not read pins from %s; pin migration will retry", key)
+                return None
+            for sid in todo:
                 if flags.get(sid) is False:
                     sync_session_pinned(sid, True, profile=profile)
-            flags = agent_session_pinned_flags(legacy, profile=profile)
-            if flags is None or any(flags.get(sid) is False for sid in legacy):
-                logger.warning("Legacy pin migration into %s incomplete; will retry", key)
-                return False
-        migrated.add(key)
-        try:
-            _atomic_write_text(
-                _pin_migration_marker_path(),
-                json.dumps({"migrated_state_dbs": sorted(migrated)}, indent=2),
-            )
-        except OSError:
-            logger.warning("Could not record legacy pin migration for %s", key, exc_info=True)
-            return False
-        logger.info("Migrated %d legacy WebUI pin(s) into %s", len(legacy), key)
-        return True
+            flags = agent_session_pinned_flags(todo, profile=profile)
+            if flags is None:
+                return None
+            still_pending |= {sid for sid in todo if flags.get(sid) is not True}
+        if key not in migrated or still_pending != pending:
+            state["migrated_state_dbs"] = sorted(migrated | {key})
+            state.setdefault("pending_pins", {})[key] = sorted(still_pending)
+            if not _save_pin_migration_state(state):
+                return None
+        return still_pending
 
 def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
     """Adopt ``sessions.pinned`` from state.db into a sidecar row.
@@ -17626,6 +17653,7 @@ def handle_post(handler, parsed) -> bool:
             except KeyError:
                 pass
             reserved_quota = False
+            reservation_key = (getattr(s, "profile", None), s.session_id)
             if pin_requested and not getattr(s, "pinned", False):
                 # TOCTOU guard (Opus stage-389): the count check and the
                 # quota reservation must happen under the same lock,
@@ -17661,7 +17689,7 @@ def handle_post(handler, parsed) -> bool:
                     # from SESSIONS while its pin is still being committed
                     # must keep consuming quota until it commits or rolls back.
                     candidate_rows.extend(
-                        _pin_quota_reservation_rows(s.session_id, snapshot_seq)
+                        _pin_quota_reservation_rows(reservation_key, snapshot_seq)
                     )
                     target_row = s.compact()
                     candidate_rows.append(target_row)
@@ -17680,7 +17708,7 @@ def handle_post(handler, parsed) -> bool:
                         return bad(handler, f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.", 400)
                     s.pinned = True
                     reserved_quota = True
-                    _PIN_QUOTA_RESERVATIONS[s.session_id] = {
+                    _PIN_QUOTA_RESERVATIONS[reservation_key] = {
                         "row": dict(target_row, pinned=True),
                         "committed_seq": None,
                     }
@@ -17702,9 +17730,9 @@ def handle_post(handler, parsed) -> bool:
                     with LOCK:
                         if committed:
                             _PIN_QUOTA_COMMIT_SEQ += 1
-                            _PIN_QUOTA_RESERVATIONS[s.session_id]["committed_seq"] = _PIN_QUOTA_COMMIT_SEQ
+                            _PIN_QUOTA_RESERVATIONS[reservation_key]["committed_seq"] = _PIN_QUOTA_COMMIT_SEQ
                         else:
-                            _PIN_QUOTA_RESERVATIONS.pop(s.session_id, None)
+                            _PIN_QUOTA_RESERVATIONS.pop(reservation_key, None)
         publish_session_list_changed(
             "session_pin",
             profile=getattr(s, "profile", None),

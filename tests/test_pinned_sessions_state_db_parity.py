@@ -277,7 +277,7 @@ def test_sidebar_build_reconciles_pins_without_show_cli_sessions(monkeypatch):
     from api import routes
 
     seen = []
-    monkeypatch.setattr(routes, "_migrate_legacy_sidecar_pins", lambda rows, profile: True)
+    monkeypatch.setattr(routes, "_migrate_legacy_sidecar_pins", lambda rows, profile: set())
     monkeypatch.setattr(
         routes, "agent_session_pinned_flags",
         lambda ids, profile=None: seen.append((sorted(ids), profile)) or {"a": True, "b": False},
@@ -568,7 +568,7 @@ def test_pin_quota_reservation_survives_sessions_cache_eviction(monkeypatch):
     tb3.join(timeout=5)
     assert responses["B3"][0] == 200, responses
     assert sidecar["pin_b"] is True
-    assert routes._PIN_QUOTA_RESERVATIONS.keys() <= {"pin_b"}
+    assert routes._PIN_QUOTA_RESERVATIONS.keys() <= {("default", "pin_b")}
 
 
 def test_failed_sidecar_save_quota_follows_state_db(monkeypatch):
@@ -650,4 +650,4 @@ def test_failed_sidecar_save_quota_follows_state_db(monkeypatch):
     _post("pin_c")
     assert responses["pin_c"] == 200, responses
     assert state_db["pin_c"] is True
-    assert set(routes._PIN_QUOTA_RESERVATIONS) <= {"pin_c"}
+    assert set(routes._PIN_QUOTA_RESERVATIONS) <= {("default", "pin_c")}
