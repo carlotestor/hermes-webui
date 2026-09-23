@@ -11870,11 +11870,11 @@ def _run_agent_streaming(
                             _close_cached_agent_entry_at_session_boundary(old_sid, _skipped_agent_migration_entry)
                         except Exception:
                             logger.debug("Failed to close skipped compression-migration cached agent for session %s", old_sid, exc_info=True)
-                    if _carry_pin_to_compression_child(
+                    # The child's pin mirrors what state.db confirms after the carry.
+                    s.pinned = _carry_pin_to_compression_child(
                         old_sid, new_sid, getattr(s, 'profile', None) or _resolved_profile_name,
                         getattr(s, 'pinned', False),
-                    ) is not None:
-                        s.pinned = True
+                    ) is True
                     _compressed = True
 
                 # ── Detect silent agent failure (no assistant reply produced) ──

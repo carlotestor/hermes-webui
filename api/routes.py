@@ -17647,18 +17647,20 @@ def handle_post(handler, parsed) -> bool:
                         with LOCK:
                             s.pinned = False
                     return bad(handler, "Could not record the pin in state.db", 503)
+                committed = True
                 s.pinned = pin_requested
                 s.save()
-                committed = True
-            finally:
-                with LOCK:
-                    if reserved_quota and committed:
+                if reserved_quota:
+                    with LOCK:
                         # Keep the reservation until a later quota check
                         # snapshots the persisted store after this commit.
                         _PIN_QUOTA_COMMIT_SEQ += 1
                         _PIN_QUOTA_RESERVATIONS[s.session_id]["committed_seq"] = _PIN_QUOTA_COMMIT_SEQ
-                    else:
-                        # Rolled back, or an unpin: the reservation is void.
+            finally:
+                # The reservation follows state.db: void on rollback or unpin, kept
+                # unstamped when state.db holds the pin but the sidecar save raised.
+                if not (reserved_quota and committed):
+                    with LOCK:
                         _PIN_QUOTA_RESERVATIONS.pop(s.session_id, None)
         publish_session_list_changed(
             "session_pin",

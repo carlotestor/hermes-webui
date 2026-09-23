@@ -141,3 +141,22 @@ def test_carry_skips_when_state_db_parent_unpinned(tmp_path, monkeypatch):
     pins = _sqlite_pins(tmp_path, monkeypatch, [("root", 0), ("child", 0)])
     assert _carry_pin_to_compression_child("root", "child", "default", True) is None
     assert pins()["child"] is False
+
+
+def test_failed_carry_leaves_child_unpinned(tmp_path, monkeypatch):
+    import api.state_sync as state_sync
+    from api.streaming import _carry_pin_to_compression_child
+
+    # Parent pinned in state.db, but the child write does not land.
+    pins = _sqlite_pins(tmp_path, monkeypatch, [("root", 1), ("child", 0)])
+    monkeypatch.setattr(state_sync, "sync_session_pinned", lambda *a, **kw: False)
+    assert _carry_pin_to_compression_child("root", "child", "default", False) is False
+    assert pins()["child"] is False
+
+    # The rotation assigns the carry's confirmed result, not "parent was pinned".
+    src = (ROOT / "api" / "streaming.py").read_text(encoding="utf-8")
+    block = src.split("if _agent_sid and _agent_sid != session_id:", 1)[1]
+    block = block.split("_compressed = True", 1)[0]
+    assert "s.pinned = _carry_pin_to_compression_child(" in block
+    assert ") is True\n" in block
+    assert "is not None" not in block.split("_carry_pin_to_compression_child(", 1)[1]

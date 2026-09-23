@@ -569,3 +569,73 @@ def test_pin_quota_reservation_survives_sessions_cache_eviction(monkeypatch):
     assert responses["B3"][0] == 200, responses
     assert sidecar["pin_b"] is True
     assert routes._PIN_QUOTA_RESERVATIONS.keys() <= {"pin_b"}
+
+
+def test_failed_sidecar_save_keeps_state_db_pin_reservation(monkeypatch):
+    """state.db accepted the pin but ``s.save()`` raised: quota stays reserved."""
+    import threading
+    from types import SimpleNamespace
+    from api import routes
+
+    state_db = {}
+    persisted = []
+    responses = {}
+    bodies = {}
+    fail_save = {"pin_a"}
+
+    class _Sess:
+        profile = "default"
+        archived = False
+
+        def __init__(self, sid):
+            self.session_id = sid
+            self.pinned = False
+
+        def compact(self):
+            return {"session_id": self.session_id, "pinned": bool(self.pinned), "profile": "default"}
+
+        def save(self, touch_updated_at=True):
+            if self.session_id in fail_save:
+                raise OSError("disk full")
+            persisted[:] = [r for r in persisted if r["session_id"] != self.session_id]
+            persisted.append(self.compact())
+
+    sessions = {"pin_a": _Sess("pin_a"), "pin_b": _Sess("pin_b")}
+    cache = dict(sessions)
+    locks = {}
+
+    def _write(session, pinned):
+        state_db[session.session_id] = bool(pinned)
+        return True
+
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda sid: locks.setdefault(sid, threading.RLock()))
+    monkeypatch.setattr(routes, "_write_pin_to_state_db", _write)
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda sid, **kw: sessions[sid])
+    monkeypatch.setattr(routes, "get_session", lambda sid, **kw: sessions[sid])
+    monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda _sid, sess: sess)
+    monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda _sid: False)
+    monkeypatch.setattr(routes, "all_sessions", lambda *a, **kw: [dict(r) for r in persisted])
+    monkeypatch.setattr(routes, "SESSIONS", cache)
+    monkeypatch.setattr(routes, "_PIN_QUOTA_RESERVATIONS", {})
+    monkeypatch.setattr(routes, "_PIN_QUOTA_COMMIT_SEQ", 0)
+    monkeypatch.setattr(routes, "load_settings", lambda: {"pinned_sessions_limit": 1})
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *a, **kw: None)
+    monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(routes, "read_body", lambda handler: bodies["cur"])
+    monkeypatch.setattr(routes, "j", lambda h, p, status=200, extra_headers=None: responses.__setitem__(bodies["cur"]["session_id"], status) or True)
+    monkeypatch.setattr(routes, "bad", lambda h, m, status=400: responses.__setitem__(bodies["cur"]["session_id"], status) or True)
+
+    def _post(sid):
+        bodies["cur"] = {"session_id": sid, "pinned": True}
+        return routes.handle_post(object(), SimpleNamespace(path="/api/session/pin"))
+
+    with pytest.raises(OSError):
+        _post("pin_a")
+    assert state_db["pin_a"] is True and not persisted
+    assert "pin_a" in routes._PIN_QUOTA_RESERVATIONS
+
+    # pin_a is evicted; its pin lives only in state.db and the reservation.
+    cache.pop("pin_a")
+    _post("pin_b")
+    assert responses["pin_b"] == 400
+    assert sessions["pin_b"].pinned is False
