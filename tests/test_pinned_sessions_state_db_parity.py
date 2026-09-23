@@ -571,8 +571,12 @@ def test_pin_quota_reservation_survives_sessions_cache_eviction(monkeypatch):
     assert routes._PIN_QUOTA_RESERVATIONS.keys() <= {"pin_b"}
 
 
-def test_failed_sidecar_save_keeps_state_db_pin_reservation(monkeypatch):
-    """state.db accepted the pin but ``s.save()`` raised: quota stays reserved."""
+def test_failed_sidecar_save_quota_follows_state_db(monkeypatch):
+    """state.db accepted the pin but ``s.save()`` raised: quota follows state.db.
+
+    The pin still counts while state.db holds it (even with the session evicted),
+    and stops counting once Desktop/CLI clears it in state.db.
+    """
     import threading
     from types import SimpleNamespace
     from api import routes
@@ -600,7 +604,7 @@ def test_failed_sidecar_save_keeps_state_db_pin_reservation(monkeypatch):
             persisted[:] = [r for r in persisted if r["session_id"] != self.session_id]
             persisted.append(self.compact())
 
-    sessions = {"pin_a": _Sess("pin_a"), "pin_b": _Sess("pin_b")}
+    sessions = {"pin_a": _Sess("pin_a"), "pin_b": _Sess("pin_b"), "pin_c": _Sess("pin_c")}
     cache = dict(sessions)
     locks = {}
 
@@ -610,6 +614,8 @@ def test_failed_sidecar_save_keeps_state_db_pin_reservation(monkeypatch):
 
     monkeypatch.setattr(routes, "_get_session_agent_lock", lambda sid: locks.setdefault(sid, threading.RLock()))
     monkeypatch.setattr(routes, "_write_pin_to_state_db", _write)
+    monkeypatch.setattr(routes, "agent_session_pinned_ids", lambda profile=None: {k for k, v in state_db.items() if v}, raising=False)
+    monkeypatch.setattr(routes, "agent_session_pinned_flags", lambda ids, profile=None: {i: state_db[i] for i in ids if i in state_db})
     monkeypatch.setattr(routes, "_get_or_materialize_session", lambda sid, **kw: sessions[sid])
     monkeypatch.setattr(routes, "get_session", lambda sid, **kw: sessions[sid])
     monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda _sid, sess: sess)
@@ -632,10 +638,16 @@ def test_failed_sidecar_save_keeps_state_db_pin_reservation(monkeypatch):
     with pytest.raises(OSError):
         _post("pin_a")
     assert state_db["pin_a"] is True and not persisted
-    assert "pin_a" in routes._PIN_QUOTA_RESERVATIONS
 
-    # pin_a is evicted; its pin lives only in state.db and the reservation.
+    # pin_a is evicted; its pin lives only in state.db and still counts.
     cache.pop("pin_a")
     _post("pin_b")
     assert responses["pin_b"] == 400
     assert sessions["pin_b"].pinned is False
+
+    # Desktop/CLI unpins pin_a in state.db: the slot frees with no WebUI request.
+    state_db["pin_a"] = False
+    _post("pin_c")
+    assert responses["pin_c"] == 200, responses
+    assert state_db["pin_c"] is True
+    assert set(routes._PIN_QUOTA_RESERVATIONS) <= {"pin_c"}

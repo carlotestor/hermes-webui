@@ -437,21 +437,9 @@ def _session_row_lineage_root_id(session, sessions_by_id) -> str:
     return current or sid
 
 
-# In-flight and recently committed pin-quota reservations, keyed by session_id
-# → ``{"row": compact_row, "committed_seq": int | None}``.
-#
-# POST /api/session/pin reserves quota under LOCK before it commits state.db
-# and the sidecar. Marking the in-memory object (``s.pinned = True``) alone is
-# not enough: ``_session_is_evictable()`` ignores ``pinned``, so any cache
-# insertion running ``_evict_sessions_over_cap()`` during the SQLite write can
-# drop the reserved session from ``SESSIONS`` before ``s.save()`` lands, and a
-# concurrent pin would then see neither the unsaved sidecar nor the evicted
-# in-memory reservation and exceed ``pinned_sessions_limit``. Reservations
-# therefore live here, independent of cache residency. A rolled-back
-# reservation is removed immediately; a committed one is stamped with
-# ``_PIN_QUOTA_COMMIT_SEQ`` and only dropped by a later quota check whose
-# persisted ``all_sessions()`` snapshot was taken AFTER that commit (so the
-# snapshot itself already counts the pin). Read and written only under LOCK.
+# Pin-quota reservations, keyed by session_id → ``{"row", "committed_seq"}``.
+# An in-flight pin counts here until state.db holds its outcome; a pin state.db
+# accepted is stamped and pruned by the next check whose state.db read follows it.
 _PIN_QUOTA_RESERVATIONS: dict[str, dict] = {}
 _PIN_QUOTA_COMMIT_SEQ = 0
 
@@ -460,7 +448,7 @@ def _pin_quota_reservation_rows(exclude_sid: str, snapshot_seq: int) -> list[dic
     """Return reservation rows still owed quota; prune ones the snapshot covers.
 
     Caller must hold ``LOCK``. ``snapshot_seq`` is ``_PIN_QUOTA_COMMIT_SEQ`` as
-    read before the caller's ``all_sessions()`` snapshot.
+    read before the caller's state.db pin snapshot.
     """
     rows = []
     for rid, entry in list(_PIN_QUOTA_RESERVATIONS.items()):
@@ -471,6 +459,38 @@ def _pin_quota_reservation_rows(exclude_sid: str, snapshot_seq: int) -> list[dic
         if rid != exclude_sid:
             rows.append(dict(entry["row"]))
     return rows
+
+
+def _pin_quota_rows_from_state_db(rows) -> list[dict]:
+    """Return quota rows whose ``pinned`` flag comes from each profile's state.db.
+
+    Pins state.db holds without a WebUI row are added as their own lineage.
+    """
+    by_profile: dict[object, list[dict]] = defaultdict(list)
+    for row in rows:
+        by_profile[_session_field(row, "profile", None)].append(dict(row))
+    out: list[dict] = []
+    for profile_key, profile_rows in by_profile.items():
+        profile = profile_key if isinstance(profile_key, str) and profile_key else None
+        pinned_ids = agent_session_pinned_ids(profile=profile)
+        if pinned_ids is None:
+            out.extend(profile_rows)
+            continue
+        known = agent_session_pinned_flags(
+            [r.get("session_id") for r in profile_rows], profile=profile
+        ) or {}
+        seen = set()
+        for row in profile_rows:
+            sid = str(row.get("session_id") or "").strip()
+            seen.add(sid)
+            if sid in known:
+                row["pinned"] = sid in pinned_ids
+            out.append(row)
+        out.extend(
+            {"session_id": sid, "pinned": True, "profile": profile_key}
+            for sid in sorted(pinned_ids - seen)
+        )
+    return out
 
 
 def _visible_pinned_lineage_ids(session_rows) -> set[str]:
@@ -10742,6 +10762,7 @@ from api.models import (
     agent_session_rows_existing,
     agent_session_zero_message_sids,
     agent_session_pinned_flags,
+    agent_session_pinned_ids,
     _load_webui_zero_message_orphan_tombstone,
     _record_webui_zero_message_orphan_tombstone,
     _clear_webui_zero_message_orphan_tombstone,
@@ -17595,22 +17616,21 @@ def handle_post(handler, parsed) -> bool:
                 # the in-memory mutation set inside LOCK and reserve.
                 with LOCK:
                     snapshot_seq = _PIN_QUOTA_COMMIT_SEQ
+                    cached_rows = [existing.compact() for existing in SESSIONS.values()]
+                # state.db is the pin record: its flag overrides every cached copy.
+                target_profile_row = {"session_id": "", "profile": getattr(s, "profile", None)}
                 persisted_rows = [
-                    existing for existing in all_sessions()
-                    if _session_counts_toward_pin_quota(existing)
+                    existing for existing in _pin_quota_rows_from_state_db(
+                        list(all_sessions()) + cached_rows + [target_profile_row]
+                    )
+                    if existing.get("session_id") and _session_counts_toward_pin_quota(existing)
                 ]
                 with LOCK:
-                    # Final authoritative count: merge persisted pinned rows
-                    # with the in-memory SESSIONS snapshot AND the in-flight
-                    # reservations of other pin requests. Count logical
-                    # sidebar-visible pin lineages rather than raw session
-                    # rows so continuation siblings in the same visible
-                    # lineage do not consume extra pin quota.
-                    candidate_rows = list(persisted_rows)
-                    candidate_rows.extend(
-                        existing.compact() for existing in SESSIONS.values()
-                        if _session_counts_toward_pin_quota(existing)
-                    )
+                    # Final authoritative count: state.db-backed pinned rows
+                    # plus other requests' reservations, counted as visible
+                    # lineages so continuation siblings share one slot.
+                    candidate_rows = []
+                    candidate_rows.extend(persisted_rows)
                     # Reservations survive cache eviction: a session evicted
                     # from SESSIONS while its pin is still being committed
                     # must keep consuming quota until it commits or rolls back.
@@ -17650,18 +17670,15 @@ def handle_post(handler, parsed) -> bool:
                 committed = True
                 s.pinned = pin_requested
                 s.save()
+            finally:
+                # state.db now holds the outcome, so the reservation ends here either way.
                 if reserved_quota:
                     with LOCK:
-                        # Keep the reservation until a later quota check
-                        # snapshots the persisted store after this commit.
-                        _PIN_QUOTA_COMMIT_SEQ += 1
-                        _PIN_QUOTA_RESERVATIONS[s.session_id]["committed_seq"] = _PIN_QUOTA_COMMIT_SEQ
-            finally:
-                # The reservation follows state.db: void on rollback or unpin, kept
-                # unstamped when state.db holds the pin but the sidecar save raised.
-                if not (reserved_quota and committed):
-                    with LOCK:
-                        _PIN_QUOTA_RESERVATIONS.pop(s.session_id, None)
+                        if committed:
+                            _PIN_QUOTA_COMMIT_SEQ += 1
+                            _PIN_QUOTA_RESERVATIONS[s.session_id]["committed_seq"] = _PIN_QUOTA_COMMIT_SEQ
+                        else:
+                            _PIN_QUOTA_RESERVATIONS.pop(s.session_id, None)
         publish_session_list_changed(
             "session_pin",
             profile=getattr(s, "profile", None),

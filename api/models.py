@@ -6013,6 +6013,24 @@ def agent_session_pinned_flags(
         return None
 
 
+def agent_session_pinned_ids(*, profile=None) -> set[str] | None:
+    """Return ids pinned in *profile*'s state.db; ``None`` when unreadable."""
+    db_path = _pin_state_db_path(profile)
+    if db_path is None:
+        return set()
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            if 'pinned' not in {str(row[1]) for row in cur.fetchall()}:
+                return None
+            cur.execute("SELECT id FROM sessions WHERE pinned")
+            return {str(row[0]).strip() for row in cur.fetchall() if row[0]}
+    except Exception:
+        logger.debug("agent_session_pinned_ids probe failed", exc_info=True)
+        return None
+
+
 def agent_session_zero_message_sids(
     session_ids: list[str] | set[str] | frozenset[str],
     *,
