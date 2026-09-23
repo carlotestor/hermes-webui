@@ -3,7 +3,6 @@
 import sqlite3
 import sys
 import threading
-import types
 from types import SimpleNamespace
 
 
@@ -39,9 +38,7 @@ class SqliteSessionDB:
 
 
 def install_sqlite_session_db(monkeypatch):
-    fake = types.ModuleType("hermes_state")
-    setattr(fake, "SessionDB", SqliteSessionDB)
-    monkeypatch.setitem(sys.modules, "hermes_state", fake)
+    monkeypatch.setitem(sys.modules, "hermes_state", SimpleNamespace(SessionDB=SqliteSessionDB))
     SqliteSessionDB.fail_writes = False
 
 
