@@ -284,3 +284,54 @@ console.log(JSON.stringify(rows.map(r=>({sid:r.session_id, orphan:!!r._orphan_ch
         {"sid": "telegram_parent", "orphan": False},
         {"sid": "webui_tip", "orphan": True},
     ]
+
+
+def test_5305_flagless_subagent_child_of_filtered_parent_is_suppressed():
+    """A delegated subagent row can arrive without ``_cross_surface_child_session``:
+    the all-profiles payload only enriches the active profile's lineage, and a
+    subagent->subagent edge is same-source. Such a child must still follow its
+    out-of-view parent instead of leaking as a top-level "Subagent Session"."""
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + """
+global.S = { session: null, busy: false, activeStreamId: null };
+global._activeProject = global.NO_PROJECT_FILTER;
+global._showArchived = false;
+global._sessionSourceFilter = 'webui';
+const allMatched = [
+  { session_id:'proj_parent', title:'Parent WebUI', session_source:'webui', raw_source:'webui', source_tag:'webui', message_count:5, project_id:'projX', profile:'other', updated_at:100, last_message_at:100 },
+  { session_id:'orchestrator', title:'Subagent Session', parent_session_id:'proj_parent', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', profile:'other', message_count:3, updated_at:101, last_message_at:101 },
+  { session_id:'leaf', title:'Subagent Session', parent_session_id:'orchestrator', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', profile:'other', message_count:2, updated_at:102, last_message_at:102 },
+];
+const part = _partitionSidebarSessionRows(allMatched, null);
+const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw);
+console.log(JSON.stringify({
+  sessionsRaw: part.sessionsRaw.map(s=>s.session_id),
+  topLevel: rows.map(r=>r.session_id),
+}));
+"""
+    out = json.loads(_run_node(source))
+    assert out["sessionsRaw"] == ["orchestrator", "leaf"]
+    assert out["topLevel"] == []
+
+
+def test_5305_flagless_subagent_child_still_stacks_under_visible_parent():
+    """Suppression only applies when the parent is out of view: the same
+    flag-less subagent child nests under its parent once that parent is rendered."""
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + """
+global._showArchived = false;
+const collapsed = [{ session_id:'webui_parent', title:'Parent WebUI', raw_source:'webui', source_tag:'webui', session_source:'webui', message_count:3 }];
+const raw = [
+  collapsed[0],
+  { session_id:'subagent_child', title:'Subagent Session', parent_session_id:'webui_parent', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', message_count:2 },
+];
+const rows = _attachChildSessionsToSidebarRows(collapsed, raw);
+const parent = rows.find(r=>r.session_id==='webui_parent') || {};
+console.log(JSON.stringify({
+  topLevel: rows.map(r=>r.session_id),
+  childSids: (parent._child_sessions||[]).map(c=>c.session_id),
+}));
+"""
+    out = json.loads(_run_node(source))
+    assert out["topLevel"] == ["webui_parent"]
+    assert out["childSids"] == ["subagent_child"]

@@ -7240,7 +7240,8 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // trigger from archived to filtered-out. A cross-surface WebUI child of a
       // genuinely external (messaging/CLI) parent is handled by the parentIsExternal
       // branch above and still orphans as before.
-      if(child&&child._cross_surface_child_session&&_isChildSession(child)) continue;
+      // Delegated subagents never orphan, flagged or not (all-profiles rows and subagent->subagent edges lack the flag).
+      if(childIsDelegatedSubagent||(child&&child._cross_surface_child_session&&_isChildSession(child))) continue;
       orphans.push({...child,_orphan_child_session:true});
     }
   }
