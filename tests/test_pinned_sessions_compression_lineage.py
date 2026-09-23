@@ -60,7 +60,7 @@ def test_pin_survives_later_compression_then_unpin_archives(real_db):
     db.close()
     assert not _row(hermes_state, path, "child")["pinned"]
 
-    assert _carry_pin_to_compression_child("child", "default") is True
+    assert _carry_pin_to_compression_child("root", "child", "default", False) is True
     assert _row(hermes_state, path, "child")["pinned"]
 
     time.sleep(0.01)
@@ -77,5 +77,67 @@ def test_compression_rotation_carries_the_pin():
     src = (ROOT / "api" / "streaming.py").read_text(encoding="utf-8")
     block = src.split("if _agent_sid and _agent_sid != session_id:", 1)[1]
     block = block.split("_compressed = True", 1)[0]
-    assert "if getattr(s, 'pinned', False):" in block
-    assert "_carry_pin_to_compression_child(new_sid," in block
+    assert "_carry_pin_to_compression_child(\n                        old_sid, new_sid," in block
+    assert "if getattr(s, 'pinned', False):" not in block
+
+
+def _sqlite_pins(tmp_path, monkeypatch, rows):
+    import sqlite3
+    import sys
+    import types
+    from api import models
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, pinned INTEGER NOT NULL DEFAULT 0)")
+    conn.executemany("INSERT INTO sessions VALUES (?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+    class _DB:
+        def __init__(self, _path):
+            self._conn = sqlite3.connect(db)
+
+        def set_session_pinned(self, sid, pinned):
+            cur = self._conn.execute("UPDATE sessions SET pinned = ? WHERE id = ?", (int(pinned), sid))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+        def get_session(self, sid):
+            row = self._conn.execute("SELECT id, pinned FROM sessions WHERE id = ?", (sid,)).fetchone()
+            return {"id": row[0], "pinned": row[1]} if row else None
+
+        def close(self):
+            self._conn.close()
+
+    fake = types.ModuleType("hermes_state")
+    fake.SessionDB = _DB
+    monkeypatch.setitem(sys.modules, "hermes_state", fake)
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: db)
+    monkeypatch.setattr("api.state_sync._resolve_state_db_path", lambda profile=None: db)
+
+    def pins():
+        c = sqlite3.connect(db)
+        try:
+            return {r[0]: bool(r[1]) for r in c.execute("SELECT id, pinned FROM sessions")}
+        finally:
+            c.close()
+    return pins
+
+
+def test_carry_uses_state_db_pin_not_stale_sidecar(tmp_path, monkeypatch):
+    from api.streaming import _carry_pin_to_compression_child
+
+    # Desktop pinned the parent in state.db; the WebUI sidecar still says unpinned.
+    pins = _sqlite_pins(tmp_path, monkeypatch, [("root", 1), ("child", 0)])
+    assert _carry_pin_to_compression_child("root", "child", "default", False) is True
+    assert pins()["child"] is True
+
+
+def test_carry_skips_when_state_db_parent_unpinned(tmp_path, monkeypatch):
+    from api.streaming import _carry_pin_to_compression_child
+
+    # Desktop unpinned the parent; a stale sidecar pin must not re-pin the child.
+    pins = _sqlite_pins(tmp_path, monkeypatch, [("root", 0), ("child", 0)])
+    assert _carry_pin_to_compression_child("root", "child", "default", True) is None
+    assert pins()["child"] is False

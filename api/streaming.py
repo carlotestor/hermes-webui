@@ -9096,16 +9096,25 @@ def _cached_agent_session_identity(agent) -> str | None:
     return None
 
 
-def _carry_pin_to_compression_child(new_sid: str, profile) -> bool:
-    """Pin the compression child in state.db and verify it (the Agent inserts it unpinned).
+def _carry_pin_to_compression_child(old_sid: str, new_sid: str, profile, sidecar_pinned: bool) -> bool | None:
+    """Pin the compression child in state.db when the parent is pinned there.
 
-    Returns True when state.db confirms the child is pinned.
+    state.db decides; the sidecar flag is used only when state.db cannot answer
+    for the parent. Returns None when the parent is unpinned, else whether
+    state.db confirms the child is pinned (the Agent inserts it unpinned).
     """
     from api.state_sync import sync_session_pinned
     from api.models import agent_session_pinned_flags
+    profile = profile or 'default'
+    flags = agent_session_pinned_flags([old_sid], profile=profile)
+    parent_pinned = flags.get(old_sid) if flags else None
+    if parent_pinned is None:
+        parent_pinned = bool(sidecar_pinned)
+    if not parent_pinned:
+        return None
     try:
-        sync_session_pinned(new_sid, True, profile=profile or 'default')
-        ok = agent_session_pinned_flags([new_sid], profile=profile or 'default').get(new_sid) is True
+        sync_session_pinned(new_sid, True, profile=profile)
+        ok = (agent_session_pinned_flags([new_sid], profile=profile) or {}).get(new_sid) is True
     except Exception:
         logger.debug("Pin carry to compression child %s failed", new_sid, exc_info=True)
         ok = False
@@ -11562,8 +11571,11 @@ def _run_agent_streaming(
                             _close_cached_agent_entry_at_session_boundary(old_sid, _skipped_agent_migration_entry)
                         except Exception:
                             logger.debug("Failed to close skipped compression-migration cached agent for session %s", old_sid, exc_info=True)
-                    if getattr(s, 'pinned', False):
-                        _carry_pin_to_compression_child(new_sid, getattr(s, 'profile', None) or _resolved_profile_name)
+                    if _carry_pin_to_compression_child(
+                        old_sid, new_sid, getattr(s, 'profile', None) or _resolved_profile_name,
+                        getattr(s, 'pinned', False),
+                    ) is not None:
+                        s.pinned = True
                     _compressed = True
 
                 # ── Detect silent agent failure (no assistant reply produced) ──
