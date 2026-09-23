@@ -17,13 +17,27 @@ def _home(profile):
         reset_hermes_home_override(token)
 
 
+def _wakeup_reply(messages):
+    """Assistant text after the newest user message; "" if the wakeup turn produced none (never a stale reply)."""
+    for m in reversed(messages or []):
+        if m.get("role") == "user":
+            return ""
+        if m.get("role") == "assistant":
+            return str(m.get("content") or "")
+    return ""
+
+
 def run_loop_command(session_id, args):
     from api.models import get_session
     from hermes_cli.loops import LoopManager, dispatch_loop_command, parse_loop_args
     p = parse_loop_args(args)
     if not p["error"] and p["prompt"].startswith("/"):  # WebUI slash commands run in the browser, not the agent
         return "/loop: looping slash commands isn't supported in the WebUI."
-    with _home(get_session(session_id, metadata_only=True).profile):
+    try:
+        profile = get_session(session_id, metadata_only=True).profile
+    except KeyError:  # fail closed: never fall back to another profile's state.db
+        return "/loop: open a saved chat first."
+    with _home(profile):
         out = dispatch_loop_command(LoopManager(session_id=session_id), args,
                                     route={"platform": "webui", "chat_id": session_id})
     _WAKE.set()
@@ -50,14 +64,19 @@ def run_due_loops():
                         if _session_has_cancel_marker(s):
                             mgr.pause(reason="user-interrupted (Stop)")
                         else:
-                            mgr.complete_tick(str(next((m.get("content") for m in reversed(s.messages)
-                                                        if m.get("role") == "assistant"), "") or ""))
+                            mgr.complete_tick(_wakeup_reply(s.messages))
                     elif not goal_blocks_loop_tick(sid) and (msg := mgr.fire_tick()):
-                        status = start_session_turn(sid, msg, source="loop_wakeup").get("_status", 200)
+                        try:
+                            status = start_session_turn(sid, msg, source="loop_wakeup").get("_status", 200)
+                        except Exception:  # nothing ran: roll the tick back so it is never judged
+                            mgr.abandon_tick()
+                            raise
                         if status >= 400:
                             mgr.clear() if status == 404 else mgr.abandon_tick()
                 except KeyError:  # session deleted
                     mgr.clear()
+                except Exception:
+                    logging.getLogger(__name__).warning("/loop tick failed for %s", sid, exc_info=True)
 
 
 def start_loop_scheduler():

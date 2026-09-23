@@ -47,3 +47,56 @@ def test_webui_loop_matches_cli(tmp_path, monkeypatch):
         loops.run_loop_command("s1", "5m poll CI --times 2")
         assert "0/2 runs" in loops.run_loop_command("s1", "status")
         assert tick("a").status == "active" and tick("b").last_stop_reason == "completed the requested 2 runs"
+
+
+@requires_agent_modules
+def test_webui_loop_greptile_regressions(tmp_path, monkeypatch):
+    from hermes_cli import goals, loops as agent
+    from api import background_process, loops, models, profiles, routes
+    msgs, started = [{"role": "assistant", "content": "old\nLOOP_COMPLETE"}], []
+    monkeypatch.setattr(goals, "_DB_CACHE", {})
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda p: tmp_path)
+    monkeypatch.setattr(profiles, "_profiles_root", lambda: tmp_path / "none")
+    monkeypatch.setattr(background_process, "_session_has_active_turn", lambda sid: False)
+
+    def get_session(sid, **kw):
+        if sid != "s1":
+            raise KeyError(sid)
+        return NS(profile=None, messages=msgs)
+
+    monkeypatch.setattr(models, "get_session", get_session)
+    # Unknown session: fail closed instead of writing the default profile's state.db.
+    assert loops.run_loop_command("gone", "5m x") == "/loop: open a saved chat first."
+    with loops._home(None):
+        assert agent.load_loop("gone") is None
+
+    def due():
+        s = agent.load_loop("s1")
+        s.next_due_at = 0
+        agent.save_loop("s1", s)
+
+    loops.run_loop_command("s1", "5m check")
+
+    def boom(*a, **kw):
+        raise RuntimeError("start failed")
+
+    monkeypatch.setattr(routes, "start_session_turn", boom)
+    with loops._home(None):
+        due()
+        loops.run_due_loops()
+        s = agent.load_loop("s1")  # a start that raised is rolled back, never judged later
+        assert s.ticks_fired == 0 and not s.awaiting_response and s.status == "active"
+        monkeypatch.setattr(routes, "start_session_turn", lambda sid, m, source: started.append(m) or {})
+        due()
+        loops.run_due_loops()
+        msgs.append({"role": "user", "content": started[-1]})  # wakeup turn ended with no reply
+        loops.run_due_loops()
+        s = agent.load_loop("s1")  # the older LOOP_COMPLETE reply is not this tick's reply
+        assert s.status == "active" and s.ticks_fired == 1 and not s.awaiting_response
+
+
+def test_loop_controls_bypass_busy_routing():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text(encoding="utf-8")
+    busy = src[src.index("Busy-control slash commands must be intercepted"):src.index("const defaultMessageMode=")]
+    assert "_pc.name==='loop'" in busy and "executeAgentCommand(text,{name:'loop'})" in busy
