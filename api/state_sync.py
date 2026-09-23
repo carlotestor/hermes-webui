@@ -259,14 +259,7 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
 
 
 def state_db_knows_session(session_id: str, profile: Optional[str] = None) -> Optional[bool]:
-    """Whether ``session_id`` has a row in the profile's state.db.
-
-    Returns True/False for a confirmed answer. No state.db file (or no
-    hermes_state module) is a confirmed False: nothing there to share with.
-    Returns None when a DB exists but cannot be opened or read (locked,
-    unreadable, incompatible), so callers fail closed instead of mistaking an
-    outage for a missing row.
-    """
+    """Whether ``session_id`` has a state.db row; no state.db is False, an unreadable one None."""
     try:
         from hermes_state import SessionDB
     except ImportError:
@@ -290,13 +283,9 @@ def state_db_knows_session(session_id: str, profile: Optional[str] = None) -> Op
 
 
 def sync_session_pinned(session_id: str, pinned: bool, profile: Optional[str] = None) -> bool:
-    """Write ``sessions.pinned`` in state.db (not gated by sync_to_insights).
+    """Pin the session's compression lineage in state.db, the record Desktop and the CLI share.
 
-    That column is the pin record Hermes Desktop and ``hermes sessions pin``
-    read and write, so it is where WebUI pins live too. The write goes through
-    ``SessionDB.set_session_pinned`` so the whole compression lineage is pinned
-    and the auto-archive sweep leaves it alone. Returns True when the row now
-    holds ``pinned`` (a no-op write on an already-matching row counts).
+    Not gated by sync_to_insights. True when the row now holds *pinned*.
     """
     db = _get_state_db(profile=profile)
     if not db:

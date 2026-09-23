@@ -5964,145 +5964,86 @@ def _pin_state_db_path(profile=None) -> Path | None:
     return _resolve_state_db_path(profile if isinstance(profile, str) and profile else None)
 
 
-def agent_session_pinned_flags(
-    session_ids: list[str] | set[str] | frozenset[str],
-    *,
-    profile=None,
-) -> dict[str, bool] | None:
-    """Return ``{session_id: pinned}`` for ids that have a row in the agent ``sessions`` table.
+def _read_pin_db(profile, query, *, missing):
+    """Return ``query(cursor, session_columns)`` on *profile*'s state.db.
 
-    ``sessions.pinned`` is the pin record shared with Hermes Desktop and
-    ``hermes sessions pin``; the sidebar reconciles its cached flag from it.
-    Batched like ``agent_session_rows_existing``. Returns ``{}`` when the
-    profile has no state.db, and ``None`` when the pins could not be read (read
-    error or no ``pinned`` column), so callers never mistake a failure for "no pins".
+    *missing* when the profile has no state.db; ``None`` when it cannot be read.
     """
-    wanted = {str(sid).strip() for sid in (session_ids or []) if str(sid or "").strip()}
-    if not wanted:
-        return {}
-    # An explicit profile reads only its own state.db; missing means empty.
     db_path = _pin_state_db_path(profile)
     if db_path is None:
-        return {}
+        return missing
     try:
         with closing(open_state_db_readonly(db_path)) as conn:
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
-            cols = {str(row[1]) for row in cur.fetchall()}
-            if 'id' not in cols or 'pinned' not in cols:
-                return None
-            flags: dict[str, bool] = {}
-            ids = list(wanted)
-            chunk_size = 500
-            for i in range(0, len(ids), chunk_size):
-                chunk = ids[i:i + chunk_size]
-                placeholders = ','.join('?' * len(chunk))
-                cur.execute(
-                    f"SELECT id, pinned FROM sessions WHERE id IN ({placeholders})",
-                    chunk,
-                )
-                for row in cur.fetchall():
-                    flags[str(row[0]).strip()] = bool(row[1])
-            return flags
+            return query(cur, {str(row[1]) for row in cur.fetchall()})
     except Exception:
-        logger.debug(
-            "agent_session_pinned_flags probe failed for %d ids",
-            len(wanted),
-            exc_info=True,
-        )
+        logger.debug("state.db pin read failed for %s", db_path, exc_info=True)
         return None
+
+
+def _pin_db_chunks(cur, sql, ids):
+    """Yield rows of ``sql`` (with an ``{ids}`` placeholder list) over *ids* in batches of 500."""
+    ids = sorted({str(sid).strip() for sid in ids if str(sid or "").strip()})
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        cur.execute(sql.format(ids=",".join("?" * len(chunk))), chunk)
+        yield from cur.fetchall()
+
+
+def agent_session_pinned_flags(session_ids, *, profile=None) -> dict[str, bool] | None:
+    """Return ``{session_id: pinned}`` from ``sessions.pinned``, the pin record Hermes Desktop shares.
+
+    ``{}`` when the profile has no state.db; ``None`` on a read error or no ``pinned`` column.
+    """
+    def query(cur, cols):
+        if not {"id", "pinned"} <= cols:
+            return None
+        rows = _pin_db_chunks(cur, "SELECT id, pinned FROM sessions WHERE id IN ({ids})", session_ids or [])
+        return {str(sid).strip(): bool(pinned) for sid, pinned in rows}
+    return _read_pin_db(profile, query, missing={}) if session_ids else {}
 
 
 def agent_session_pin_store_present(*, profile=None) -> bool | None:
-    """Whether *profile* has an agent pin store (state.db with ``sessions.pinned``).
-
-    False means no agent pins can exist; ``None`` means the store could not be read.
-    """
-    db_path = _pin_state_db_path(profile)
-    if db_path is None:
-        return False
-    try:
-        with closing(open_state_db_readonly(db_path)) as conn:
-            cur = conn.cursor()
-            cur.execute("PRAGMA table_info(sessions)")
-            return 'pinned' in {str(row[1]) for row in cur.fetchall()}
-    except Exception:
-        logger.debug("agent_session_pin_store_present probe failed", exc_info=True)
-        return None
+    """Whether *profile* has a state.db with ``sessions.pinned``; ``None`` when unreadable."""
+    return _read_pin_db(profile, lambda cur, cols: "pinned" in cols, missing=False)
 
 
 def agent_session_pinned_ids(*, profile=None) -> set[str] | None:
-    """Return ids pinned in *profile*'s state.db; ``None`` when unreadable.
+    """Ids pinned in *profile*'s state.db (empty without a pin store); ``None`` when unreadable."""
+    def query(cur, cols):
+        if "pinned" not in cols:
+            return set()
+        cur.execute("SELECT id FROM sessions WHERE pinned")
+        return {str(row[0]).strip() for row in cur.fetchall() if row[0]}
+    return _read_pin_db(profile, query, missing=set())
 
-    No state.db or no ``pinned`` column means no agent pin store: empty set.
+
+def agent_session_pin_lineage_rows(session_ids, *, profile=None) -> list[dict] | None:
+    """Quota rows for pinned state.db sessions; ``None`` when unreadable.
+
+    ``parent_session_id`` is set only for a compression parent, so a lineage shares one slot.
     """
-    db_path = _pin_state_db_path(profile)
-    if db_path is None:
-        return set()
-    try:
-        with closing(open_state_db_readonly(db_path)) as conn:
-            cur = conn.cursor()
-            cur.execute("PRAGMA table_info(sessions)")
-            if 'pinned' not in {str(row[1]) for row in cur.fetchall()}:
-                return set()
-            cur.execute("SELECT id FROM sessions WHERE pinned")
-            return {str(row[0]).strip() for row in cur.fetchall() if row[0]}
-    except Exception:
-        logger.debug("agent_session_pinned_ids probe failed", exc_info=True)
-        return None
-
-
-def agent_session_pin_lineage_rows(
-    session_ids: list[str] | set[str] | frozenset[str],
-    *,
-    profile=None,
-) -> list[dict] | None:
-    """Return quota rows for pinned state.db sessions; ``None`` when unreadable.
-
-    ``parent_session_id`` is set only for a compression parent, the link
-    ``SessionDB.set_session_pinned`` pins across, so a lineage shares one slot.
-    """
-    wanted = sorted({str(sid).strip() for sid in (session_ids or []) if str(sid or "").strip()})
-    if not wanted:
-        return []
-    db_path = _pin_state_db_path(profile)
-    if db_path is None:
-        return []
-    try:
-        with closing(open_state_db_readonly(db_path)) as conn:
-            cur = conn.cursor()
-            cur.execute("PRAGMA table_info(sessions)")
-            cols = {str(row[1]) for row in cur.fetchall()}
-            if 'id' not in cols:
-                return None
-            source_sql = "child.session_source" if 'session_source' in cols else "NULL"
-            # Without lineage columns no compression link exists: one slot per id.
-            if {'parent_session_id', 'end_reason'} <= cols:
-                parent_sql = "parent.id"
-                join_sql = (" LEFT JOIN sessions parent ON parent.id = child.parent_session_id"
-                            " AND parent.end_reason = 'compression'")
-            else:
-                parent_sql, join_sql = "NULL", ""
-            rows: list[dict] = []
-            for i in range(0, len(wanted), 500):
-                chunk = wanted[i:i + 500]
-                cur.execute(
-                    f"SELECT child.id, {parent_sql}, {source_sql} FROM sessions child"
-                    f"{join_sql}"
-                    f" WHERE child.id IN ({','.join('?' * len(chunk))})",
-                    chunk,
-                )
-                for sid, parent, source in cur.fetchall():
-                    row = {"session_id": str(sid).strip(), "pinned": True}
-                    if parent:
-                        row["parent_session_id"] = str(parent).strip()
-                    if source:
-                        row["session_source"] = str(source)
-                    rows.append(row)
-            return rows
-    except Exception:
-        logger.debug("agent_session_pin_lineage_rows probe failed", exc_info=True)
-        return None
+    def query(cur, cols):
+        if "id" not in cols:
+            return None
+        source = "child.session_source" if "session_source" in cols else "NULL"
+        parent, join = "NULL", ""
+        if {"parent_session_id", "end_reason"} <= cols:
+            parent = "parent.id"
+            join = (" LEFT JOIN sessions parent ON parent.id = child.parent_session_id"
+                    " AND parent.end_reason = 'compression'")
+        sql = f"SELECT child.id, {parent}, {source} FROM sessions child{join} WHERE child.id IN ({{ids}})"
+        out = []
+        for sid, parent_id, src in _pin_db_chunks(cur, sql, session_ids):
+            row = {"session_id": str(sid).strip(), "pinned": True}
+            if parent_id:
+                row["parent_session_id"] = str(parent_id).strip()
+            if src:
+                row["session_source"] = str(src)
+            out.append(row)
+        return out
+    return _read_pin_db(profile, query, missing=[]) if session_ids else []
 
 
 def agent_session_zero_message_sids(

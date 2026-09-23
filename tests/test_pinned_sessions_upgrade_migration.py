@@ -7,10 +7,11 @@ them, and mark the profile migrated before state.db is allowed to win.
 """
 
 import sqlite3
-import sys
 import types
 
 import pytest
+
+from tests._pin_helpers import SqliteSessionDB, db_pins, install_sqlite_session_db
 
 
 def _make_db(path, ids, pinned=()):
@@ -27,37 +28,6 @@ def _make_db(path, ids, pinned=()):
     conn.close()
 
 
-def _db_pins(path):
-    conn = sqlite3.connect(str(path))
-    try:
-        return {row[0]: bool(row[1]) for row in conn.execute("SELECT id, pinned FROM sessions")}
-    finally:
-        conn.close()
-
-
-class _SqliteSessionDB:
-    """Minimal ``hermes_state.SessionDB`` over the real sqlite file."""
-
-    fail_writes = False
-
-    def __init__(self, db_path):
-        self._conn = sqlite3.connect(str(db_path))
-
-    def get_session(self, sid):
-        row = self._conn.execute("SELECT id, pinned FROM sessions WHERE id = ?", (sid,)).fetchone()
-        return {"id": row[0], "pinned": row[1]} if row else None
-
-    def set_session_pinned(self, sid, pinned):
-        if _SqliteSessionDB.fail_writes:
-            return False
-        cur = self._conn.execute("UPDATE sessions SET pinned = ? WHERE id = ?", (int(pinned), sid))
-        self._conn.commit()
-        return cur.rowcount > 0
-
-    def close(self):
-        self._conn.close()
-
-
 @pytest.fixture
 def upgrade_env(tmp_path, monkeypatch):
     """One profile home with a state.db and a WebUI sidecar store."""
@@ -69,10 +39,7 @@ def upgrade_env(tmp_path, monkeypatch):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
 
-    fake_mod = types.ModuleType("hermes_state")
-    fake_mod.SessionDB = _SqliteSessionDB
-    monkeypatch.setitem(sys.modules, "hermes_state", fake_mod)
-    _SqliteSessionDB.fail_writes = False
+    install_sqlite_session_db(monkeypatch)
     monkeypatch.setattr("api.profiles._resolve_profile_home_for_name", lambda _n: home, raising=False)
     monkeypatch.setattr("api.profiles._is_root_profile", lambda n: n == "default", raising=False)
     monkeypatch.setattr(models, "_get_profile_home", lambda _p: home)
@@ -112,7 +79,7 @@ def test_legacy_sidecar_pins_survive_first_sidebar_build(upgrade_env):
 
     assert shown == {"legacy_a": True, "legacy_b": True, "plain": False, "webui_only": True}
     assert env.sidecars == {"legacy_a": True, "legacy_b": True, "plain": False, "webui_only": True}
-    assert _db_pins(env.db) == {"legacy_a": True, "legacy_b": True, "plain": False}
+    assert db_pins(env.db) == {"legacy_a": True, "legacy_b": True, "plain": False}
 
 
 def test_after_migration_state_db_wins(upgrade_env):
@@ -120,7 +87,7 @@ def test_after_migration_state_db_wins(upgrade_env):
     _make_db(env.db, ["legacy_a", "desktop_pin"], pinned={"desktop_pin"})
     env.sidecars.update({"legacy_a": True, "desktop_pin": False})
     _sidebar_build(env)
-    assert _db_pins(env.db) == {"legacy_a": True, "desktop_pin": True}
+    assert db_pins(env.db) == {"legacy_a": True, "desktop_pin": True}
 
     # Desktop unpins after the migration: that now propagates to the sidecar.
     conn = sqlite3.connect(str(env.db))
@@ -137,16 +104,16 @@ def test_failed_migration_write_leaves_sidecar_pins_and_retries(upgrade_env):
     env = upgrade_env
     _make_db(env.db, ["legacy_a"])
     env.sidecars.update({"legacy_a": True})
-    _SqliteSessionDB.fail_writes = True
+    SqliteSessionDB.fail_writes = True
 
     shown = _sidebar_build(env)
     assert shown == {"legacy_a": True}
     assert env.sidecars == {"legacy_a": True}
-    assert _db_pins(env.db) == {"legacy_a": False}
+    assert db_pins(env.db) == {"legacy_a": False}
 
-    _SqliteSessionDB.fail_writes = False
+    SqliteSessionDB.fail_writes = False
     _sidebar_build(env)
-    assert _db_pins(env.db) == {"legacy_a": True}
+    assert db_pins(env.db) == {"legacy_a": True}
     assert env.sidecars == {"legacy_a": True}
 
 
@@ -159,18 +126,18 @@ def test_migration_is_recorded_once_per_state_db(upgrade_env):
     assert len(markers) == 1, markers
 
     writes = []
-    orig = _SqliteSessionDB.set_session_pinned
+    orig = SqliteSessionDB.set_session_pinned
 
     def _count(self, sid, pinned):
         writes.append((sid, pinned))
         return orig(self, sid, pinned)
 
-    _SqliteSessionDB.set_session_pinned = _count
+    SqliteSessionDB.set_session_pinned = _count
     try:
         _sidebar_build(env)
         _sidebar_build(env)
     finally:
-        _SqliteSessionDB.set_session_pinned = orig
+        SqliteSessionDB.set_session_pinned = orig
     assert writes == []
 
 
@@ -192,7 +159,7 @@ def test_failed_pin_read_does_not_finalize_migration(upgrade_env, monkeypatch):
     # The read recovers: the migration retries and the sidecar pin reaches state.db.
     monkeypatch.setattr(models, "open_state_db_readonly", real_open)
     assert _sidebar_build(env) == {"legacy_a": True}
-    assert _db_pins(env.db) == {"legacy_a": True}
+    assert db_pins(env.db) == {"legacy_a": True}
     assert env.sidecars == {"legacy_a": True}
 
 
@@ -210,7 +177,7 @@ def test_absent_row_pin_is_written_once_the_row_appears(upgrade_env):
     conn.close()
 
     assert _sidebar_build(env) == {"late": True, "other": False}
-    assert _db_pins(env.db) == {"late": True, "other": False}
+    assert db_pins(env.db) == {"late": True, "other": False}
     assert env.sidecars == {"late": True, "other": False}
 
     # Nothing pending any more: a later Desktop unpin now reaches the sidecar.

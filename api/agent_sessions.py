@@ -844,9 +844,7 @@ def read_importable_agent_session_rows(
                     candidate_order_clause=candidate_order_clause,
                 )
 
-            # Pinned rows are back-filled past the recency window (same contract
-            # as the agent's list endpoints) so a pin made in Desktop/CLI on an
-            # old conversation still reaches the sidebar's Pinned section.
+            # Back-fill pinned rows past the recency window, like the agent's list endpoints.
             if has_pinned_col:
                 row_filter = (
                     "WHERE c.id IS NOT NULL OR (s.pinned = 1 AND "

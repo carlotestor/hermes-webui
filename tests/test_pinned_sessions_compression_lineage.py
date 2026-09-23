@@ -9,6 +9,8 @@ import time
 
 import pytest
 
+from tests._pin_helpers import db_pins, install_sqlite_session_db
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
@@ -83,8 +85,6 @@ def test_compression_rotation_carries_the_pin():
 
 def _sqlite_pins(tmp_path, monkeypatch, rows):
     import sqlite3
-    import sys
-    import types
     from api import models
 
     db = tmp_path / "state.db"
@@ -93,36 +93,10 @@ def _sqlite_pins(tmp_path, monkeypatch, rows):
     conn.executemany("INSERT INTO sessions VALUES (?, ?)", rows)
     conn.commit()
     conn.close()
-
-    class _DB:
-        def __init__(self, _path):
-            self._conn = sqlite3.connect(db)
-
-        def set_session_pinned(self, sid, pinned):
-            cur = self._conn.execute("UPDATE sessions SET pinned = ? WHERE id = ?", (int(pinned), sid))
-            self._conn.commit()
-            return cur.rowcount > 0
-
-        def get_session(self, sid):
-            row = self._conn.execute("SELECT id, pinned FROM sessions WHERE id = ?", (sid,)).fetchone()
-            return {"id": row[0], "pinned": row[1]} if row else None
-
-        def close(self):
-            self._conn.close()
-
-    fake = types.ModuleType("hermes_state")
-    fake.SessionDB = _DB
-    monkeypatch.setitem(sys.modules, "hermes_state", fake)
+    install_sqlite_session_db(monkeypatch)
     monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: db)
     monkeypatch.setattr("api.state_sync._resolve_state_db_path", lambda profile=None: db)
-
-    def pins():
-        c = sqlite3.connect(db)
-        try:
-            return {r[0]: bool(r[1]) for r in c.execute("SELECT id, pinned FROM sessions")}
-        finally:
-            c.close()
-    return pins
+    return lambda: db_pins(db)
 
 
 def test_carry_uses_state_db_pin_not_stale_sidecar(tmp_path, monkeypatch):
