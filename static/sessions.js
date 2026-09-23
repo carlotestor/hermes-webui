@@ -7247,9 +7247,11 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // branch above and still orphans as before.
       // A flag-less subagent is suppressed only when parent_source proves the importer saw its parent;
       // a parent outside the importer's recency window leaves this orphan row as the only way in.
-      // While searching, a matching subagent stays openable even when its parent is not in the results.
-      const subagentParentKnown=childIsDelegatedSubagent&&!!child.parent_source&&!searchActive;
-      if(subagentParentKnown||(child&&child._cross_surface_child_session&&_isChildSession(child))) continue;
+      // While searching, a matching child stays openable even when its parent is not in the results,
+      // whatever its lineage flags: search hits must not depend on enrichment metadata.
+      const subagentParentKnown=childIsDelegatedSubagent&&!!child.parent_source;
+      const crossSurfaceChild=!!(child&&child._cross_surface_child_session&&_isChildSession(child));
+      if(!searchActive&&(subagentParentKnown||crossSurfaceChild)) continue;
       orphans.push({...child,_orphan_child_session:true});
     }
   }

@@ -416,6 +416,7 @@ global._sessionSourceFilter = 'webui';
 const all = [
   { session_id:'parent', title:'Plan the release', session_source:'webui', raw_source:'webui', source_tag:'webui', message_count:5, updated_at:100, last_message_at:100 },
   { session_id:'sub', title:'Zebra benchmark notes', parent_session_id:'parent', relationship_type:'child_session', parent_source:'webui', raw_source:'subagent', source_tag:'subagent', session_source:'other', message_count:3, updated_at:101, last_message_at:101 },
+  { session_id:'subx', title:'Zebra flagged notes', parent_session_id:'parent', relationship_type:'child_session', parent_source:'webui', raw_source:'subagent', source_tag:'subagent', session_source:'other', _cross_surface_child_session:true, message_count:3, updated_at:102, last_message_at:102 },
 ];
 function render(query){
   global.$ = (id)=>id==='sessionSearch' ? { value: query } : null;
@@ -427,5 +428,9 @@ function render(query){
 console.log(JSON.stringify({ search: render('zebra'), idle: render('') }));
 """
     out = json.loads(_run_node(source))
-    assert out["search"] == [{"sid": "sub", "orphan": True, "kids": []}]
-    assert out["idle"] == [{"sid": "parent", "orphan": False, "kids": ["sub"]}]
+    assert sorted(out["search"], key=lambda r: r["sid"]) == [
+        {"sid": "sub", "orphan": True, "kids": []},
+        {"sid": "subx", "orphan": True, "kids": []},
+    ]
+    assert len(out["idle"]) == 1 and out["idle"][0]["sid"] == "parent"
+    assert sorted(out["idle"][0]["kids"]) == ["sub", "subx"]
