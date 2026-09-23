@@ -297,7 +297,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Plain skills match case-insensitive keywords in their name or description; built-in, agent/plugin, and bundle commands keep prefix matching and take precedence over a same-slug skill
 - Built-in: `/help`, `/clear`, `/compress [focus topic]`, `/compact` (alias), `/model <name>`, `/workspace <name>`, `/new`, `/usage`, `/theme`
 - Arrow keys navigate, Tab/Enter select, Escape closes
-- `/loop [interval] <prompt> [--times N] [--until <condition>]` re-runs a prompt in the current session on a schedule (`status` / `pause` / `resume` / `stop` to control it). Ticks start server-side, so a loop keeps running with the tab closed; state is shared with the CLI/TUI through Hermes Agent's loop store
+- `/loop [interval] <prompt>` re-runs a prompt in the current session on a schedule (`status` / `pause` / `resume` / `stop` to control it). It stops by itself when the agent reports the task is done, or after `loops.max_ticks` runs (default 100). Ticks start server-side, so a loop keeps running with the tab closed; state is shared with the CLI/TUI through Hermes Agent's loop store
 - Unrecognized commands pass through to the agent
 
 ### Panels

@@ -31,7 +31,16 @@ SCAN_INTERVAL_SECONDS = 15.0
 # server restart) would stay ``awaiting_response`` forever; complete it once the session has
 # been idle this long after the fire.
 STALE_TICK_GRACE_SECONDS = 60.0
-_CONTROL_WORDS = {"", "status", "pause", "resume", "stop", "clear", "cancel", "help", "--help", "-h"}
+_CONTROL_WORDS = {"", "status", "pause", "resume", "stop", "clear", "cancel"}
+_HELP_WORDS = {"help", "--help", "-h"}
+LOOP_HELP = (
+    "Usage: /loop [interval] <prompt>\n"
+    "  /loop 5m check the deploy status      — first run now, then every 5m\n"
+    "  /loop keep fixing tests until green   — self-paced (backs off while output is unchanged)\n"
+    "Controls: /loop status · /loop pause · /loop resume · /loop stop\n"
+    "The loop stops itself when the agent reports the task is done (LOOP_COMPLETE), "
+    "or after loops.max_ticks runs (default 100)."
+)
 
 _SCHEDULER_LOCK = threading.Lock()
 _SCHEDULER_THREAD: Optional[threading.Thread] = None
@@ -109,35 +118,81 @@ def loop_command_payload(
             "message": "/loop needs a hermes-agent version that ships hermes_cli.loops.",
         }
     arg = str(args or "").strip()
-    if arg.lower() not in _CONTROL_WORDS:
-        parsed = _agent_loops.parse_loop_args(arg)
-        if not parsed.get("error") and str(parsed.get("prompt") or "").lstrip().startswith("/"):
-            return {
-                "ok": False,
-                "error": "slash_prompt_unsupported",
-                "message": "/loop: looping a slash command is not supported in the WebUI yet — "
-                "loop a plain prompt instead.",
-            }
+    if arg.lower() in _HELP_WORDS:
+        return {"ok": True, "action": "help", "created": False, "message": LOOP_HELP, "loop": None}
+    if arg.lower() in _CONTROL_WORDS:
+        with _profile_scope(profile_home):
+            mgr = _agent_loops.LoopManager(session_id=sid)
+            result = _agent_loops.dispatch_loop_command(mgr, arg)
+            state = mgr.state
+        return {
+            "ok": True,
+            "action": arg.lower() or "status",
+            "created": False,
+            "message": str(result.get("output") or ""),
+            "loop": _state_payload(state),
+        }
+
+    parsed = _agent_loops.parse_loop_args(arg)
+    if parsed.get("error"):
+        usage = "Usage: /loop [interval] <prompt> — see /loop help."
+        text = usage if parsed["error"] == "empty" else f"/loop: {parsed['error']}"
+        return {"ok": False, "error": "invalid_args", "message": text}
+    if parsed.get("times") or parsed.get("until"):
+        return {
+            "ok": False,
+            "error": "unsupported_flag",
+            "message": "/loop: --times and --until are not supported in the WebUI. The loop stops "
+            "itself when the task is done, or after the default run limit.",
+        }
+    prompt = str(parsed.get("prompt") or "")
+    if prompt.lstrip().startswith("/"):
+        return {
+            "ok": False,
+            "error": "slash_prompt_unsupported",
+            "message": "/loop: looping a slash command is not supported in the WebUI yet — "
+            "loop a plain prompt instead.",
+        }
+
     route = {"platform": WEBUI_LOOP_PLATFORM, "chat_id": sid}
     if profile:
         route["profile"] = str(profile)
     with _profile_scope(profile_home):
         mgr = _agent_loops.LoopManager(session_id=sid)
-        result = _agent_loops.dispatch_loop_command(mgr, arg, route=route)
-        state = mgr.state
-        goal_note = ""
-        if result.get("created"):
-            with contextlib.suppress(Exception):
-                if _agent_loops.goal_blocks_loop_tick(sid):
-                    goal_note = ("\nNote: an active /goal is driving this session — loop wakeups "
-                                 "defer until the goal finishes, pauses, or parks.")
-    if result.get("created"):
-        wake_scheduler()
+        replacing = mgr.has_loop()
+        # The run limit is a hard stop (``times``), not the agent's resumable max_ticks pause.
+        limit = _agent_loops.max_ticks_default()
+        try:
+            state = mgr.set(prompt, interval_seconds=parsed.get("interval_seconds"),
+                            times=limit, route=route)
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_args", "message": f"/loop: {exc}"}
+        goal_active = False
+        with contextlib.suppress(Exception):
+            goal_active = bool(_agent_loops.goal_blocks_loop_tick(sid))
+        floor = _agent_loops.format_interval(state.interval_seconds)
+        ceiling = _agent_loops.format_interval(_agent_loops.self_paced_ceiling_seconds())
+
+    lines = [f"↻ Loop set ({state.cadence_label()}): {state.prompt}"]
+    if replacing:
+        lines.append("(replaced the previous loop for this session)")
+    requested = parsed.get("interval_seconds")
+    if requested is not None and requested < state.interval_seconds:
+        lines.append(f"(interval raised to the {floor} minimum — loops.min_interval_seconds)")
+    if state.mode == "self_paced":
+        lines.append(f"Self-paced: backs off up to {ceiling} while nothing changes.")
+    stop = "Stops when the task is done"
+    lines.append(f"{stop}, or after {limit} runs (loops.max_ticks)." if limit else f"{stop} (no run limit).")
+    lines.append("First wakeup fires now. Controls: /loop status · pause · resume · stop.")
+    if goal_active:
+        lines.append("Note: an active /goal is driving this session — loop wakeups "
+                     "defer until the goal finishes, pauses, or parks.")
+    wake_scheduler()
     return {
         "ok": True,
-        "action": "set" if result.get("created") else (arg.lower() or "status"),
-        "created": bool(result.get("created")),
-        "message": str(result.get("output") or "") + goal_note,
+        "action": "set",
+        "created": True,
+        "message": "\n".join(lines),
         "loop": _state_payload(state),
     }
 

@@ -24,7 +24,7 @@ const COMMANDS=[
   {name:'use',       desc:t('cmd_use'),      fn:cmdUse,      arg:'skill-name', subArgs:'skills', noEcho:true},
   {name:'stop',      desc:t('cmd_stop'),     fn:cmdStop,      noEcho:true},
   {name:'goal',      desc:t('cmd_goal'),     fn:cmdGoal,      arg:'[status|pause|resume|clear|text]', subArgs:['status','pause','resume','clear']},
-  {name:'loop',      desc:t('cmd_loop'),     fn:cmdLoop,      arg:'[interval] prompt [--times N] [--until cond] | status|pause|resume|stop', subArgs:['status','pause','resume','stop','help']},
+  {name:'loop',      desc:t('cmd_loop'),     fn:cmdLoop,      arg:'[interval] prompt | status|pause|resume|stop', subArgs:['status','pause','resume','stop','help']},
   {name:'queue',     desc:t('cmd_queue'),    fn:cmdQueue,     arg:'message', noEcho:true},
   {name:'interrupt', desc:t('cmd_interrupt'), fn:cmdInterrupt, arg:'message', noEcho:true},
   {name:'steer',     desc:t('cmd_steer'),    fn:cmdSteer,     arg:'message', noEcho:true},
