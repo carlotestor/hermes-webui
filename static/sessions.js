@@ -7061,6 +7061,11 @@ function _sessionStateTooltip({isStreaming=false,hasUnread=false}={}){
 
 function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawReferenceSessions){
   const referenceSessions=Array.isArray(rawReferenceSessions)?rawReferenceSessions:(rawSessions||[]);
+  let searchActive=false;
+  try{
+    const searchEl=typeof $==='function' ? $('sessionSearch') : null;
+    searchActive=Boolean(searchEl&&String(searchEl.value||'').trim());
+  }catch(_e){ searchActive=false; }
   const sessionIdsInList=new Set(referenceSessions.map(s=>s&&s.session_id).filter(Boolean));
   const rawSessionsById=new Map(referenceSessions.filter(s=>s&&s.session_id).map(s=>[s.session_id,s]));
   const cleanSidebarRow=(s)=>{
@@ -7242,7 +7247,8 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // branch above and still orphans as before.
       // A flag-less subagent is suppressed only when parent_source proves the importer saw its parent;
       // a parent outside the importer's recency window leaves this orphan row as the only way in.
-      const subagentParentKnown=childIsDelegatedSubagent&&!!child.parent_source;
+      // While searching, a matching subagent stays openable even when its parent is not in the results.
+      const subagentParentKnown=childIsDelegatedSubagent&&!!child.parent_source&&!searchActive;
       if(subagentParentKnown||(child&&child._cross_surface_child_session&&_isChildSession(child))) continue;
       orphans.push({...child,_orphan_child_session:true});
     }

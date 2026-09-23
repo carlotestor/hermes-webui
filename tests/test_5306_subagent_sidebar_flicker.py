@@ -394,3 +394,38 @@ console.log(JSON.stringify(rows.map(r=>({{sid:r.session_id, orphan:!!r._orphan_c
         assert out == [{"sid": "leaf", "orphan": True, "kids": []}]
     else:
         assert out == [{"sid": "orch", "orphan": False, "kids": ["leaf"]}]
+
+
+def test_5305_search_keeps_matching_subagent_when_parent_does_not_match():
+    """While sidebar search is active, a delegated subagent that matches the query
+    stays openable even though its known parent does not match and is not rendered."""
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + """
+eval(extractFunc('_stripAttachedFilesMarker'));
+eval(extractFunc('_sessionDisplayTitle'));
+eval(extractFunc('_sessionSearchAddIdCandidate'));
+eval(extractFunc('_sessionSearchCleanUrlToken'));
+eval(extractFunc('_sessionSearchSessionIdCandidates'));
+eval(extractFunc('_sessionSearchDirectSessionMatches'));
+eval(extractFunc('_sessionSearchDirectAndTitleMatches'));
+eval(extractFunc('_sessionSearchMergeMatches'));
+global.S = { session: null, busy: false, activeStreamId: null };
+global._activeProject = null;
+global._showArchived = false;
+global._sessionSourceFilter = 'webui';
+const all = [
+  { session_id:'parent', title:'Plan the release', session_source:'webui', raw_source:'webui', source_tag:'webui', message_count:5, updated_at:100, last_message_at:100 },
+  { session_id:'sub', title:'Zebra benchmark notes', parent_session_id:'parent', relationship_type:'child_session', parent_source:'webui', raw_source:'subagent', source_tag:'subagent', session_source:'other', message_count:3, updated_at:101, last_message_at:101 },
+];
+function render(query){
+  global.$ = (id)=>id==='sessionSearch' ? { value: query } : null;
+  const matched = _sessionSearchMergeMatches(all, query, []);
+  const part = _partitionSidebarSessionRows(matched, null);
+  return _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw)
+    .map(r=>({sid:r.session_id, orphan:!!r._orphan_child_session, kids:(r._child_sessions||[]).map(c=>c.session_id)}));
+}
+console.log(JSON.stringify({ search: render('zebra'), idle: render('') }));
+"""
+    out = json.loads(_run_node(source))
+    assert out["search"] == [{"sid": "sub", "orphan": True, "kids": []}]
+    assert out["idle"] == [{"sid": "parent", "orphan": False, "kids": ["sub"]}]
