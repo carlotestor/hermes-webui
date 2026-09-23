@@ -9096,6 +9096,24 @@ def _cached_agent_session_identity(agent) -> str | None:
     return None
 
 
+def _carry_pin_to_compression_child(new_sid: str, profile) -> bool:
+    """Pin the compression child in state.db and verify it (the Agent inserts it unpinned).
+
+    Returns True when state.db confirms the child is pinned.
+    """
+    from api.state_sync import sync_session_pinned
+    from api.models import agent_session_pinned_flags
+    try:
+        sync_session_pinned(new_sid, True, profile=profile or 'default')
+        ok = agent_session_pinned_flags([new_sid], profile=profile or 'default').get(new_sid) is True
+    except Exception:
+        logger.debug("Pin carry to compression child %s failed", new_sid, exc_info=True)
+        ok = False
+    if not ok:
+        logger.warning("Could not carry pin to compression child %s", new_sid)
+    return ok
+
+
 def _cached_agent_matches_session(agent, session_id: str) -> bool:
     identity = _cached_agent_session_identity(agent)
     return identity is None or identity == str(session_id)
@@ -11544,6 +11562,8 @@ def _run_agent_streaming(
                             _close_cached_agent_entry_at_session_boundary(old_sid, _skipped_agent_migration_entry)
                         except Exception:
                             logger.debug("Failed to close skipped compression-migration cached agent for session %s", old_sid, exc_info=True)
+                    if getattr(s, 'pinned', False):
+                        _carry_pin_to_compression_child(new_sid, getattr(s, 'profile', None) or _resolved_profile_name)
                     _compressed = True
 
                 # ── Detect silent agent failure (no assistant reply produced) ──
