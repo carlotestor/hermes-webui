@@ -203,6 +203,8 @@ class GatewayWatcher:
     ):
         self._subscribers: list[queue.Queue] = []
         self._sub_lock = threading.Lock()
+        # Final removal invalidates any projection admitted by an earlier cohort.
+        self._subscriber_epoch = 0
         self._stop_event = threading.Event()
         # Wakes a poll loop parked because nobody is subscribed (subscribe/stop).
         self._idle_wake = threading.Event()
@@ -286,21 +288,32 @@ class GatewayWatcher:
         self._idle_wake.set()
         return q
 
-    def unsubscribe(self, q: queue.Queue):
-        """Remove a subscriber queue."""
-        with self._sub_lock:
-            try:
-                self._subscribers.remove(q)
-            except ValueError:
-                pass
+    def _remove_subscriber_locked(self, q: queue.Queue) -> bool:
+        """Remove a known queue under _sub_lock; fence polls on the last removal."""
+        try:
+            self._subscribers.remove(q)
+        except ValueError:
+            return False
+        if not self._subscribers:
+            self._subscriber_epoch += 1
+            self._last_cheap_fp = ''
+            self._last_full_projection_at = None
+        return True
 
-    def _notify_subscribers(self, sessions: list):
+    def unsubscribe(self, q: queue.Queue):
+        """Remove a subscriber queue, invalidating projection on the last removal."""
+        with self._sub_lock:
+            self._remove_subscriber_locked(q)
+
+    def _notify_subscribers(self, sessions: list, *, epoch: int | None = None):
         """Push change event to all subscribers."""
         event = {
             'type': 'sessions_changed',
             'sessions': sessions,
         }
         with self._sub_lock:
+            if epoch is not None and epoch != self._subscriber_epoch:
+                return  # An old poll must not notify a new subscriber cohort.
             dead = []
             for q in self._subscribers:
                 try:
@@ -310,10 +323,7 @@ class GatewayWatcher:
                 except Exception:
                     dead.append(q)
             for q in dead:
-                try:
-                    self._subscribers.remove(q)
-                except ValueError:
-                    pass
+                self._remove_subscriber_locked(q)
                 # Send a None sentinel so the SSE handler unblocks, closes,
                 # and lets the browser's EventSource auto-reconnect.
                 try:
@@ -330,9 +340,9 @@ class GatewayWatcher:
         """
         with self._sub_lock:
             has_subscribers = bool(self._subscribers)
+            admission_epoch = self._subscriber_epoch
         if not has_subscribers:
-            # Force fresh projection on the next subscription, without touching DB.
-            self._last_full_projection_at = None
+            # Final removal already invalidated the cache under the same lock.
             return False
         db_path = self._state_db_path
         # A watcher may start before the agent has created state.db. Publishing an
@@ -361,14 +371,20 @@ class GatewayWatcher:
         if sessions is None:
             return False
         current_hash = _snapshot_hash(sessions)
-        if cheap_fp is not None:
-            self._last_cheap_fp = cheap_fp
-        self._last_full_projection_at = current_time
-
-        if current_hash != self._last_hash:
-            self._last_hash = current_hash
-            self._last_sessions = sessions
-            self._notify_subscribers(sessions)
+        with self._sub_lock:
+            if admission_epoch != self._subscriber_epoch or not self._subscribers:
+                return False  # Never restore a cache invalidated during the DB read.
+            if cheap_fp is not None:
+                self._last_cheap_fp = cheap_fp
+            self._last_full_projection_at = current_time
+            if current_hash != self._last_hash:
+                changed = True
+                self._last_hash = current_hash
+                self._last_sessions = sessions
+            else:
+                changed = False
+        if changed:
+            self._notify_subscribers(sessions, epoch=admission_epoch)
         return True
 
     def _poll_loop(self):

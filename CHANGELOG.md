@@ -28,6 +28,28 @@
 
 ### Fixed
 
+- **A session deleted during a restart no longer produces a spurious recovery warning.** When
+  WebUI startup recovery re-attached background processes, a session that had vanished between
+  enumeration and rebind raised a `KeyError` that was logged as a warning. It now follows the
+  existing skip path, confined to the session lookup, so the vanished owner is skipped, live owners
+  still rebind, and registry errors still warn. (#7753, #7774 by @happy5318)
+
+- **Waiting on the Agent's session lease is shown as a warning instead of looking stuck.** When
+  another Hermes process (gateway, CLI or cron) holds the session's turn lease, the Agent's
+  "another Hermes process is using this session" notices now reach the chat as a warning status
+  instead of being dropped, and the status clears when the run ends. Classification keys on the Agent
+  status kind (`lifecycle` / `warn`), so user-authored text can never be promoted to a warning.
+  (#7760 by @ruizanthony)
+- **A stale in-flight projection can no longer reach a gateway watcher after its last subscriber
+  leaves.** Final unsubscribe and queue eviction now invalidate the cache and fence projections that
+  were already in flight, without holding the lock across database reads or SSE writes, so a client
+  that re-subscribes gets a fresh snapshot instead of a stale one. (#7761 by @ruizanthony)
+- **A burst of "session busy" refusals no longer drops a background-task completion.** When
+  `start_session_turn()` refused a completion wake-up with a transient 409 (Agent runtime stale,
+  process wake-ups paused, or the session busy with another turn), the bridge released the durable
+  claim as a plain failure, so a few refusals in a row could terminally drop a completion whose
+  session was alive and waiting. Transient refusals now return the claim as retryable, while hard
+  failures still use up the attempt budget. (#7758 by @ruizanthony)
 - **A first visit now uses the browser's language.** The server stores "no preference" as `null`
   instead of defaulting to `"en"`, so a first-time visitor gets `navigator.language` while an
   explicitly saved language (including English) still wins, and legacy `settings.json` files that

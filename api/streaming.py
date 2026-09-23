@@ -895,6 +895,32 @@ def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
     )
 
 
+# Session turn-lease notices emitted by the Agent (agent/turn_facade_lease.py)
+# while another Hermes process (gateway, CLI, cron) holds this session's turn
+# lease. Emitted via ``_emit_status`` (kind ``lifecycle``) while waiting and on
+# admission, and via ``_emit_warning`` (kind ``warn``) when the wait times out
+# and the message was not processed.
+_SESSION_LEASE_WAIT_MARKERS = (
+    'another hermes process is using this session',
+    'still waiting for the other hermes process',
+    'another hermes process kept this session busy',
+    'session is free; loading the latest transcript',
+)
+
+
+def _is_session_lease_wait_message(kind: str, message: str) -> bool:
+    """Return True for Agent session turn-lease wait notices.
+
+    Classification keys on the Agent status kind (``lifecycle`` / ``warn``) so
+    user-authored text can never be promoted to a warning.
+    """
+    k = str(kind or '').strip().lower()
+    if k not in ('lifecycle', 'warn'):
+        return False
+    m = str(message or '').strip().lower()
+    return any(marker in m for marker in _SESSION_LEASE_WAIT_MARKERS)
+
+
 def _is_agent_compression_start_status(kind: str, message: str) -> bool:
     """Return True only for real Hermes context-compression start notices.
 
@@ -9776,6 +9802,11 @@ def _run_agent_streaming(
             return
         # Pass through rate-limit and fallback messages so the frontend can
         # show them as warnings via the existing messages.js 'warning' listener.
+        # Session turn-lease waits (another Hermes process owns this session)
+        # use the same channel so a delayed turn explains itself.
+        if _is_session_lease_wait_message(_kind, _message):
+            put('warning', {'type': 'session_lease_wait', 'message': _message})
+            return
         _is_fallback_notice = _is_fallback_lifecycle_message(_kind, _message)
         if _is_fallback_notice:
             put('warning', {'type': 'fallback', 'message': _message})
