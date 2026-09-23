@@ -287,9 +287,9 @@ console.log(JSON.stringify(rows.map(r=>({sid:r.session_id, orphan:!!r._orphan_ch
 
 
 def test_5305_flagless_subagent_child_of_filtered_parent_is_suppressed():
-    """A delegated subagent row can arrive without ``_cross_surface_child_session``:
-    the all-profiles payload only enriches the active profile's lineage, and a
-    subagent->subagent edge is same-source. Such a child must still follow its
+    """A delegated subagent row can arrive without ``_cross_surface_child_session``
+    (all-profiles payloads, same-source subagent->subagent edges). When
+    ``parent_source`` proves the importer saw the parent, the child follows its
     out-of-view parent instead of leaking as a top-level "Subagent Session"."""
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = _preamble(js) + """
@@ -299,8 +299,8 @@ global._showArchived = false;
 global._sessionSourceFilter = 'webui';
 const allMatched = [
   { session_id:'proj_parent', title:'Parent WebUI', session_source:'webui', raw_source:'webui', source_tag:'webui', message_count:5, project_id:'projX', profile:'other', updated_at:100, last_message_at:100 },
-  { session_id:'orchestrator', title:'Subagent Session', parent_session_id:'proj_parent', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', profile:'other', message_count:3, updated_at:101, last_message_at:101 },
-  { session_id:'leaf', title:'Subagent Session', parent_session_id:'orchestrator', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', profile:'other', message_count:2, updated_at:102, last_message_at:102 },
+  { session_id:'orchestrator', title:'Subagent Session', parent_session_id:'proj_parent', relationship_type:'child_session', parent_source:'webui', raw_source:'subagent', source_tag:'subagent', session_source:'other', profile:'other', message_count:3, updated_at:101, last_message_at:101 },
+  { session_id:'leaf', title:'Subagent Session', parent_session_id:'orchestrator', relationship_type:'child_session', parent_source:'subagent', raw_source:'subagent', source_tag:'subagent', session_source:'other', profile:'other', message_count:2, updated_at:102, last_message_at:102 },
 ];
 const part = _partitionSidebarSessionRows(allMatched, null);
 const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw);
@@ -335,3 +335,62 @@ console.log(JSON.stringify({
     out = json.loads(_run_node(source))
     assert out["topLevel"] == ["webui_parent"]
     assert out["childSids"] == ["subagent_child"]
+
+
+def test_5305_flagless_subagent_child_of_unimported_parent_still_orphans():
+    """Without ``parent_source`` the importer never saw the parent (outside the
+    recency window), so the child stays an openable orphan row rather than vanishing."""
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + """
+global._showArchived = false;
+const raw = [
+  { session_id:'leaf', title:'Leaf', parent_session_id:'orch', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', message_count:2 },
+];
+const rows = _attachChildSessionsToSidebarRows([], raw);
+console.log(JSON.stringify(rows.map(r=>({sid:r.session_id, orphan:!!r._orphan_child_session}))));
+"""
+    out = json.loads(_run_node(source))
+    assert out == [{"sid": "leaf", "orphan": True}]
+
+
+def _importer_rows_to_sidebar(rows):
+    return [
+        {
+            "session_id": r["id"],
+            "title": r.get("title"),
+            "parent_session_id": r.get("parent_session_id"),
+            "relationship_type": r.get("relationship_type"),
+            "parent_source": r.get("parent_source"),
+            "raw_source": r.get("source"),
+            "source_tag": r.get("source"),
+            "session_source": "other",
+            "message_count": r.get("actual_message_count") or 2,
+        }
+        for r in rows
+    ]
+
+
+@pytest.mark.parametrize("filler,expect_orphan", [(22, False), (23, True)])
+def test_5305_importer_window_decides_flagless_subagent_orphaning(tmp_path, filler, expect_orphan):
+    """Drives the real importer: a parent inside the oversample is known and the
+    child nests; a parent beyond it is unknown and the child stays a top-level row."""
+    from api.agent_sessions import read_importable_agent_session_rows
+    from tests.test_subagent_parent_in_import_window import _window_db
+
+    db = tmp_path / "state.db"
+    _window_db(db, filler=filler)
+    imported = read_importable_agent_session_rows(db, limit=3, exclude_sources=None)
+    raw = [r for r in _importer_rows_to_sidebar(imported) if r["session_id"] in ("orch", "leaf")]
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global._showArchived = false;
+const raw = {json.dumps(raw)};
+const collapsed = raw.filter(r=>!r.parent_session_id);
+const rows = _attachChildSessionsToSidebarRows(collapsed, raw);
+console.log(JSON.stringify(rows.map(r=>({{sid:r.session_id, orphan:!!r._orphan_child_session, kids:(r._child_sessions||[]).map(c=>c.session_id)}}))));
+"""
+    out = json.loads(_run_node(source))
+    if expect_orphan:
+        assert out == [{"sid": "leaf", "orphan": True, "kids": []}]
+    else:
+        assert out == [{"sid": "orch", "orphan": False, "kids": ["leaf"]}]
