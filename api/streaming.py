@@ -13114,6 +13114,27 @@ def _run_agent_streaming(
                         })
             except Exception as _goal_exc:
                 logger.debug("Goal continuation hook failed for session %s: %s", session_id, _goal_exc)
+            # /loop parity: complete the in-flight tick (LOOP_COMPLETE marker, --until judge,
+            # caps) and schedule the next one. Only loop-wakeup turns carry a tick.
+            if _turn_pending_source == 'loop_wakeup':
+                try:
+                    from api.loops import evaluate_loop_after_turn, last_assistant_text
+
+                    _loop_decision = evaluate_loop_after_turn(
+                        session_id,
+                        last_assistant_text(s.messages or []),
+                        profile_home=_profile_home,
+                    )
+                    _loop_message = str(_loop_decision.get('message') or '').strip()
+                    if _loop_message:
+                        put('loop', {
+                            'session_id': session_id,
+                            'message': _loop_message,
+                            'status': _loop_decision.get('status'),
+                            'loop': _loop_decision.get('loop'),
+                        })
+                except Exception as _loop_exc:
+                    logger.debug("Loop completion hook failed for session %s: %s", session_id, _loop_exc)
             with _stream_writeback_stage(_writeback_timings, "done_payload"):
                 raw_session = _session_payload_with_full_messages(s, tool_calls=tool_calls)
                 _done_payload = {'session': redact_session_data(raw_session), 'usage': usage}

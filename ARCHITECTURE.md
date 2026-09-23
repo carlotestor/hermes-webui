@@ -442,6 +442,30 @@ whose default `SessionDB()` path remains frozen at module import. Keep this fall
 compatibility-only: new goal semantics belong in Hermes Agent's native manager rather
 than a second WebUI implementation.
 
+### 4.8a Recurring `/loop` Wakeups
+
+`api/loops.py` bridges the WebUI `/loop` command to Hermes Agent's
+`hermes_cli.loops.LoopManager`, which owns all loop state (`loop:<session_id>` in the
+session profile's `state.db`, shared with the CLI, TUI and gateway). The bridge adds
+no state of its own. Every call runs under the session's profile home via
+`set_hermes_home_override()`.
+
+WebUI loops carry `route={"platform": "webui", "chat_id": <session_id>}`. The gateway's
+wakeup scanner finds no adapter for that platform, and the TUI poller skips routed
+loops, so only the WebUI scheduler fires them. `start_loop_scheduler()` runs one daemon
+thread that scans every profile's active loops every 15s, or immediately after a loop
+is set. It claims a due tick with `fire_tick()` and starts the turn server-side through
+`routes.start_session_turn(source="loop_wakeup")`, so loops keep running with the tab
+closed. A busy session or an active `/goal` defers the tick; a start refused with a
+4xx/5xx rolls it back with `abandon_tick()`.
+
+After a `loop_wakeup` turn, the streaming and gateway-chat post-turn hooks call
+`complete_tick()` (`LOOP_COMPLETE` marker, `--until` judge, `--times`, the
+`loops.max_ticks` backstop) and emit a `loop` SSE status event. A tick whose turn never
+reached that hook (provider error, cancel, restart) is completed by the scheduler once
+the session has been idle for 60s, so the loop cannot wedge. Looping a slash command
+is rejected in the WebUI for now.
+
 ### 4.9 Hermes Agent Moved-Name Compatibility
 
 Hermes Agent owns its module layout. Its September 2026 decomposition moved names the

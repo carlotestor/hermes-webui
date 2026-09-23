@@ -662,6 +662,13 @@ def main() -> None:
         print(f'[!!] WARNING: SessionChannel reaper failed to start: {e}', flush=True)
 
     try:
+        from api.loops import start_loop_scheduler
+        if start_loop_scheduler():
+            print('[ok] /loop scheduler thread started', flush=True)
+    except Exception as e:
+        print(f'[!!] WARNING: /loop scheduler failed to start: {e}', flush=True)
+
+    try:
         from api.plugins import load_plugins
         load_plugins()
     except Exception as e:
