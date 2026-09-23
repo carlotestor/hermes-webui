@@ -1,5 +1,5 @@
 const _WEBUI_DISPATCHABLE_AGENT_COMMANDS = new Set([
-  'reload-mcp','reload-skills','codex-runtime','credits',
+  'reload-mcp','reload-skills','codex-runtime','credits','loop',
   'moa','sessions','resume','pet'
 ]);
 // ── Slash commands ──────────────────────────────────────────────────────────
@@ -24,7 +24,6 @@ const COMMANDS=[
   {name:'use',       desc:t('cmd_use'),      fn:cmdUse,      arg:'skill-name', subArgs:'skills', noEcho:true},
   {name:'stop',      desc:t('cmd_stop'),     fn:cmdStop,      noEcho:true},
   {name:'goal',      desc:t('cmd_goal'),     fn:cmdGoal,      arg:'[status|pause|resume|clear|text]', subArgs:['status','pause','resume','clear']},
-  {name:'loop',      desc:t('cmd_loop'),     fn:cmdLoop,      arg:'[interval] prompt | status|pause|resume|stop', subArgs:['status','pause','resume','stop','help']},
   {name:'queue',     desc:t('cmd_queue'),    fn:cmdQueue,     arg:'message', noEcho:true},
   {name:'interrupt', desc:t('cmd_interrupt'), fn:cmdInterrupt, arg:'message', noEcho:true},
   {name:'steer',     desc:t('cmd_steer'),    fn:cmdSteer,     arg:'message', noEcho:true},
@@ -502,7 +501,7 @@ async function _runAgentCommandTransport(text,_meta){
   if(!command) throw new Error('command is required');
   const data=await api('/api/commands/exec',{
     method:'POST',
-    body:JSON.stringify({command})
+    body:JSON.stringify({command,session_id:S.session&&S.session.session_id||''})
   });
   return String(data&&data.output||'(no output)');
 }
@@ -1395,29 +1394,6 @@ async function cmdGoal(args){
   }catch(e){
     const err=String((e&&e.message)||e||'Goal command failed');
     S.messages.push({role:'assistant',content:`**Goal command failed:** ${err}`,_ts:Date.now()/1000,_error:true});
-    renderMessages({preserveScroll:true});
-    showToast(err,3000);
-  }
-}
-
-// /loop — recurring in-session wakeups backed by hermes_cli.loops.LoopManager.
-// The server-side scheduler starts every tick (including the first), so this
-// only sets/controls the loop and shows the status line.
-async function cmdLoop(args){
-  if(!S.session){await newSession();await renderSessionList();}
-  if(!S.session||!S.session.session_id){showToast(t('no_active_session'));return;}
-  const activeSid=S.session.session_id;
-  try{
-    const r=await api('/api/loop',{method:'POST',body:JSON.stringify({session_id:activeSid,args:args||''})});
-    const msg=String((r&&r.message)||'').trim();
-    if(msg&&S.session&&S.session.session_id===activeSid){
-      S.messages.push({role:'assistant',content:msg,_ts:Date.now()/1000,_loopStatus:true,_transient:true});
-      renderMessages({preserveScroll:true});
-      showToast(msg.split('\n')[0],2600);
-    }
-  }catch(e){
-    const err=String((e&&e.message)||e||'Loop command failed');
-    S.messages.push({role:'assistant',content:`**Loop command failed:** ${err}`,_ts:Date.now()/1000,_error:true});
     renderMessages({preserveScroll:true});
     showToast(err,3000);
   }

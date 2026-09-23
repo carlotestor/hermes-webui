@@ -893,7 +893,7 @@ def test_busy_path_intercepts_stop_before_mode_routing():
     mode_idx = MESSAGES_JS.find("const defaultMessageMode=", busy_idx)
     assert mode_idx != -1
     busy_block = MESSAGES_JS[busy_idx:mode_idx]
-    assert "['steer','interrupt','queue','terminal','goal','loop','yolo','stop']" in busy_block
+    assert "['steer','interrupt','queue','terminal','goal','yolo','stop']" in busy_block
     assert "cmdStop" in busy_block or "COMMANDS.find(c=>c.name===_pc.name)" in busy_block
 
 

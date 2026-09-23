@@ -1454,26 +1454,6 @@ def _run_gateway_chat_streaming(
                 session_id,
                 goal_exc,
             )
-        if pending_source == "loop_wakeup":
-            try:
-                from api.loops import evaluate_loop_after_turn
-                from api.profiles import get_hermes_home_for_profile
-
-                loop_decision = evaluate_loop_after_turn(
-                    session_id,
-                    assistant_text,
-                    profile_home=get_hermes_home_for_profile(getattr(s, "profile", None)),
-                )
-                loop_message = str(loop_decision.get("message") or "").strip()
-                if loop_message:
-                    put_gateway_event("loop", {
-                        "session_id": session_id,
-                        "message": loop_message,
-                        "status": loop_decision.get("status"),
-                        "loop": loop_decision.get("loop"),
-                    })
-            except Exception as loop_exc:
-                logger.debug("Gateway loop completion hook failed for session %s: %s", session_id, loop_exc)
         from api.streaming import _session_payload_with_full_messages
         gateway_session_payload = _session_payload_with_full_messages(s, tool_calls=[])
         put_gateway_event("done", {"session": redact_session_data(gateway_session_payload), "usage": usage})

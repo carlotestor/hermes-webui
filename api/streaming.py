@@ -13114,27 +13114,6 @@ def _run_agent_streaming(
                         })
             except Exception as _goal_exc:
                 logger.debug("Goal continuation hook failed for session %s: %s", session_id, _goal_exc)
-            # /loop parity: complete the in-flight tick (LOOP_COMPLETE marker, --until judge,
-            # caps) and schedule the next one. Only loop-wakeup turns carry a tick.
-            if _turn_pending_source == 'loop_wakeup':
-                try:
-                    from api.loops import evaluate_loop_after_turn, last_assistant_text
-
-                    _loop_decision = evaluate_loop_after_turn(
-                        session_id,
-                        last_assistant_text(s.messages or []),
-                        profile_home=_profile_home,
-                    )
-                    _loop_message = str(_loop_decision.get('message') or '').strip()
-                    if _loop_message:
-                        put('loop', {
-                            'session_id': session_id,
-                            'message': _loop_message,
-                            'status': _loop_decision.get('status'),
-                            'loop': _loop_decision.get('loop'),
-                        })
-                except Exception as _loop_exc:
-                    logger.debug("Loop completion hook failed for session %s: %s", session_id, _loop_exc)
             with _stream_writeback_stage(_writeback_timings, "done_payload"):
                 raw_session = _session_payload_with_full_messages(s, tool_calls=tool_calls)
                 _done_payload = {'session': redact_session_data(raw_session), 'usage': usage}
@@ -14099,8 +14078,6 @@ def cancel_stream(stream_id: str) -> bool:
     _snap_agent = None
     _snap_owner_session_id = None
     _cancel_session_payload = None
-    _cancel_was_loop_wakeup = False
-    _cancel_profile = None
 
     with streams_lock:
         stream_present = stream_id in streams
@@ -14355,8 +14332,6 @@ def cancel_stream(stream_id: str) -> bool:
                         _cancel_session_id,
                     )
                 _cs.active_stream_id = None
-                _cancel_was_loop_wakeup = getattr(_cs, 'pending_user_source', None) == 'loop_wakeup'
-                _cancel_profile = getattr(_cs, 'profile', None)
                 _cs.pending_user_message = None
                 _cs.pending_attachments = []
                 _cs.pending_started_at = None
@@ -14426,31 +14401,7 @@ def cancel_stream(stream_id: str) -> bool:
             except Exception:
                 logger.debug("Failed to clear session state on cancel for %s", _cancel_session_id)
 
-    # /loop parity with the CLI's Ctrl+C: stopping a loop wakeup pauses the loop.
-    _loop_pause_payload = None
-    if _cancel_was_loop_wakeup and _cancel_session_id:
-        try:
-            from api.loops import pause_loop_after_interrupt
-            from api.profiles import get_hermes_home_for_profile
-
-            _decision = pause_loop_after_interrupt(
-                _cancel_session_id, profile_home=get_hermes_home_for_profile(_cancel_profile))
-            if _decision.get('message'):
-                _loop_pause_payload = {
-                    'session_id': _cancel_session_id,
-                    'message': _decision['message'],
-                    'status': _decision.get('status'),
-                    'loop': _decision.get('loop'),
-                }
-        except Exception:
-            logger.debug("Failed to pause /loop after cancel for %s", _cancel_session_id, exc_info=True)
-
     if _emit_cancel_event and q:
-        if _loop_pause_payload:
-            try:
-                q.put_nowait(('loop', _loop_pause_payload))
-            except Exception:
-                logger.debug("Failed to put loop pause event to queue")
         _cancel_event_id = STREAM_LAST_EVENT_ID.get(stream_id)
         if _cancel_event_id and hasattr(q, "note_last_event_id"):
             try:

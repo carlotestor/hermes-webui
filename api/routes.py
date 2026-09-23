@@ -16806,9 +16806,6 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/goal":
         return _handle_goal_command(handler, body)
 
-    if parsed.path == "/api/loop":
-        return _handle_loop_command(handler, body)
-
     if parsed.path == "/api/bg-task-complete-ack":
         return _handle_bg_task_complete_ack(handler, body)
 
@@ -16991,6 +16988,12 @@ def handle_post(handler, parsed) -> bool:
         command = str(body.get("command", "") or "").strip()
         if not command:
             return bad(handler, "command is required")
+        sid = str(body.get("session_id", "") or "")
+        if sid and not _session_id_visible_to_request_profile(handler, sid):
+            return True
+        if command.split()[0].lower() in ("/loop", "loop"):
+            from api.loops import run_loop_command
+            return j(handler, {"output": run_loop_command(sid, command.partition(" ")[2])})
 
         try:
             return j(handler, {"output": execute_agent_command(command)})
@@ -24420,42 +24423,6 @@ def _handle_session_compression_recovery_start(handler, body):
             ),
         },
     )
-
-
-def _handle_loop_command(handler, body):
-    """Handle WebUI /loop: set/status/pause/resume/stop via hermes_cli.loops.LoopManager.
-
-    Ticks are started server-side by the api.loops scheduler, never by this request.
-    """
-    try:
-        require(body, "session_id")
-    except ValueError as e:
-        return bad(handler, str(e))
-    sid = str(body.get("session_id") or "")
-    if _session_is_subagent_view_only(sid):
-        return bad(handler, "Subagent sessions are view-only and cannot run /loop from WebUI", 400)
-    try:
-        s = get_session(sid, metadata_only=True)
-    except KeyError:
-        return bad(handler, "Session not found", 404)
-    try:
-        from api.profiles import get_hermes_home_for_profile
-
-        profile_home = get_hermes_home_for_profile(getattr(s, "profile", None))
-    except Exception:
-        profile_home = None
-    from api.loops import loop_command_payload
-
-    payload = loop_command_payload(
-        s.session_id,
-        str(body.get("args", "") or ""),
-        profile_home=profile_home,
-        profile=getattr(s, "profile", None),
-    )
-    if not payload.get("ok", True):
-        status = 501 if payload.get("error") == "loops_unavailable" else 400
-        return j(handler, payload, status=status)
-    return j(handler, payload)
 
 
 def _handle_goal_command(handler, body):
