@@ -317,6 +317,9 @@ def test_agent_session_pinned_flags_reads_state_db(tmp_path, monkeypatch):
     assert models.agent_session_pinned_flags(["p", "u", "missing"]) == {"p": True, "u": False}
     monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: None)
     assert models.agent_session_pinned_flags(["p"]) == {}
+    # A failed read is None, never an empty "no pins" mapping.
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: tmp_path / "missing.db")
+    assert models.agent_session_pinned_flags(["p"]) is None
 
 
 def test_reconcile_loads_session_under_agent_lock(monkeypatch):

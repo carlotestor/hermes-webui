@@ -2136,11 +2136,14 @@ def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> bool:
         ]
         if legacy:
             flags = agent_session_pinned_flags(legacy, profile=profile)
+            if flags is None:
+                logger.warning("Could not read pins from %s; legacy pin migration will retry", key)
+                return False
             for sid in legacy:
                 if flags.get(sid) is False:
                     sync_session_pinned(sid, True, profile=profile)
             flags = agent_session_pinned_flags(legacy, profile=profile)
-            if any(flags.get(sid) is False for sid in legacy):
+            if flags is None or any(flags.get(sid) is False for sid in legacy):
                 logger.warning("Legacy pin migration into %s incomplete; will retry", key)
                 return False
         migrated.add(key)

@@ -172,3 +172,25 @@ def test_migration_is_recorded_once_per_state_db(upgrade_env):
     finally:
         _SqliteSessionDB.set_session_pinned = orig
     assert writes == []
+
+
+def test_failed_pin_read_does_not_finalize_migration(upgrade_env, monkeypatch):
+    from api import models
+
+    env = upgrade_env
+    _make_db(env.db, ["legacy_a"])
+    env.sidecars.update({"legacy_a": True})
+    real_open = models.open_state_db_readonly
+
+    def _broken(*_a, **_kw):
+        raise OSError("database is locked")
+
+    monkeypatch.setattr(models, "open_state_db_readonly", _broken)
+    assert _sidebar_build(env) == {"legacy_a": True}
+    assert list(env.session_dir.glob("_pin*migration*")) == []
+
+    # The read recovers: the migration retries and the sidecar pin reaches state.db.
+    monkeypatch.setattr(models, "open_state_db_readonly", real_open)
+    assert _sidebar_build(env) == {"legacy_a": True}
+    assert _db_pins(env.db) == {"legacy_a": True}
+    assert env.sidecars == {"legacy_a": True}

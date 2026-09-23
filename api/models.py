@@ -5930,14 +5930,14 @@ def agent_session_pinned_flags(
     session_ids: list[str] | set[str] | frozenset[str],
     *,
     profile=None,
-) -> dict[str, bool]:
+) -> dict[str, bool] | None:
     """Return ``{session_id: pinned}`` for ids that have a row in the agent ``sessions`` table.
 
     ``sessions.pinned`` is the pin record shared with Hermes Desktop and
     ``hermes sessions pin``; the sidebar reconciles its cached flag from it.
-    Batched like ``agent_session_rows_existing``. Returns ``{}`` on any error,
-    when the DB is missing, or when the column is absent, so a transient
-    failure never flips a pin: ids absent from the result are left untouched.
+    Batched like ``agent_session_rows_existing``. Returns ``{}`` when the
+    profile has no state.db, and ``None`` when the pins could not be read (read
+    error or no ``pinned`` column), so callers never mistake a failure for "no pins".
     """
     wanted = {str(sid).strip() for sid in (session_ids or []) if str(sid or "").strip()}
     if not wanted:
@@ -5952,7 +5952,7 @@ def agent_session_pinned_flags(
             cur.execute("PRAGMA table_info(sessions)")
             cols = {str(row[1]) for row in cur.fetchall()}
             if 'id' not in cols or 'pinned' not in cols:
-                return {}
+                return None
             flags: dict[str, bool] = {}
             ids = list(wanted)
             chunk_size = 500
@@ -5972,7 +5972,7 @@ def agent_session_pinned_flags(
             len(wanted),
             exc_info=True,
         )
-        return {}
+        return None
 
 
 def agent_session_zero_message_sids(
