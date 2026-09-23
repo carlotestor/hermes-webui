@@ -12481,7 +12481,12 @@ def _run_agent_streaming(
                         if _turn_idx < _prev_asst:
                             continue  # prior-turn message — never touch its reasoning
                         _seg_reasoning = _reasoning_segments.get(_turn_idx - _prev_asst, '')
-                        _existing_reasoning = _seg_reasoning or _rm.get('reasoning') or ''
+                        # The agent's own `reasoning` key (even None) is authoritative;
+                        # stream segments drift off by one when a step has no thinking.
+                        if 'reasoning' in _rm:
+                            _existing_reasoning = _rm.get('reasoning') or ''
+                        else:
+                            _existing_reasoning = _seg_reasoning
                         _content = _rm.get('content')
                         if isinstance(_content, str) and _content:
                             _new_content, _merged_reasoning = _split_thinking_from_content(
