@@ -203,7 +203,7 @@ def _failed_carry(env):
     from api.streaming import _carry_pin_to_compression_child
 
     SqliteSessionDB.fail_writes = True
-    assert _carry_pin_to_compression_child("root", "child", "default", True) is False
+    assert _carry_pin_to_compression_child("root", "child", "default") is False
     SqliteSessionDB.fail_writes = False
     env.sidecars["child"] = True  # the rotation keeps the sidecar pin
 

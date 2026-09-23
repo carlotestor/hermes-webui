@@ -123,3 +123,20 @@ def test_reservations_are_scoped_by_profile_and_session(monkeypatch):
     assert post("same")[0] == 200
     assert reservations[("work", "same")] == {"row": work_row, "committed_seq": None}
     assert reservations[("default", "same")]["committed_seq"] == 1
+
+
+def test_stale_sidecar_pin_does_not_bypass_quota(tmp_path, monkeypatch):
+    from api import models, routes
+
+    db = tmp_path / "state.db"
+    # Desktop unpinned "stale" and pinned three others; the sidecar still says pinned.
+    _state_db(db, [("stale", None, None, None, 0)] + [(f"d{i}", None, None, None, 1) for i in range(3)])
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: db)
+    monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}])
+    writes = []
+    monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: writes.append(p) or True)
+    sess = PinSess("stale")
+    sess.pinned = True
+    post = patch_pin_endpoint(monkeypatch, {"stale": sess})
+    assert post("stale")[0] == 400
+    assert writes == []

@@ -17616,7 +17616,8 @@ def handle_post(handler, parsed) -> bool:
                 pass
             reserved_quota = False
             reservation_key = (getattr(s, "profile", None), s.session_id)
-            if pin_requested and not getattr(s, "pinned", False):
+            # The cached sidecar pin may be stale, so every pin request is checked against state.db.
+            if pin_requested:
                 # TOCTOU guard (Opus stage-389): count and reserve under one LOCK; all_sessions()
                 # takes LOCK itself, so the persisted snapshot is read outside it.
                 with LOCK:

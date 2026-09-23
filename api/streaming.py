@@ -9252,20 +9252,16 @@ def _cached_agent_session_identity(agent) -> str | None:
     return None
 
 
-def _carry_pin_to_compression_child(old_sid: str, new_sid: str, profile, sidecar_pinned: bool) -> bool | None:
-    """Pin the compression child in state.db when the parent is pinned there (sidecar flag as fallback).
+def _carry_pin_to_compression_child(old_sid: str, new_sid: str, profile) -> bool | None:
+    """Pin the compression child in state.db when state.db confirms the parent is pinned.
 
-    None when the parent is unpinned, else whether state.db confirms it; a missed carry is
-    re-derived from state.db's lineage on the next sidebar build.
+    None when the parent is not confirmed pinned (fail closed), else whether state.db confirms
+    the child; a missed carry is re-derived from state.db's lineage on the next sidebar build.
     """
     from api.state_sync import sync_session_pinned
     from api.models import agent_session_pinned_flags
     profile = profile or 'default'
-    flags = agent_session_pinned_flags([old_sid], profile=profile)
-    parent_pinned = flags.get(old_sid) if flags else None
-    if parent_pinned is None:
-        parent_pinned = bool(sidecar_pinned)
-    if not parent_pinned:
+    if (agent_session_pinned_flags([old_sid], profile=profile) or {}).get(old_sid) is not True:
         return None
     try:
         sync_session_pinned(new_sid, True, profile=profile)
@@ -11872,7 +11868,6 @@ def _run_agent_streaming(
                     # A pinned parent keeps the child pinned; a failed carry is retried.
                     s.pinned = _carry_pin_to_compression_child(
                         old_sid, new_sid, getattr(s, 'profile', None) or _resolved_profile_name,
-                        getattr(s, 'pinned', False),
                     ) is not None
                     _compressed = True
 

@@ -62,7 +62,7 @@ def test_pin_survives_later_compression_then_unpin_archives(real_db):
     db.close()
     assert not _row(hermes_state, path, "child")["pinned"]
 
-    assert _carry_pin_to_compression_child("root", "child", "default", False) is True
+    assert _carry_pin_to_compression_child("root", "child", "default") is True
     assert _row(hermes_state, path, "child")["pinned"]
 
     time.sleep(0.01)
@@ -104,7 +104,7 @@ def test_carry_uses_state_db_pin_not_stale_sidecar(tmp_path, monkeypatch):
 
     # Desktop pinned the parent in state.db; the WebUI sidecar still says unpinned.
     pins = _sqlite_pins(tmp_path, monkeypatch, [("root", 1), ("child", 0)])
-    assert _carry_pin_to_compression_child("root", "child", "default", False) is True
+    assert _carry_pin_to_compression_child("root", "child", "default") is True
     assert pins()["child"] is True
 
 
@@ -113,7 +113,7 @@ def test_carry_skips_when_state_db_parent_unpinned(tmp_path, monkeypatch):
 
     # Desktop unpinned the parent; a stale sidecar pin must not re-pin the child.
     pins = _sqlite_pins(tmp_path, monkeypatch, [("root", 0), ("child", 0)])
-    assert _carry_pin_to_compression_child("root", "child", "default", True) is None
+    assert _carry_pin_to_compression_child("root", "child", "default") is None
     assert pins()["child"] is False
 
 
@@ -127,7 +127,7 @@ def test_failed_carry_keeps_child_pinned_and_retries(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "SESSION_DIR", tmp_path)
     real_sync = state_sync.sync_session_pinned
     monkeypatch.setattr(state_sync, "sync_session_pinned", lambda *a, **kw: False)
-    assert _carry_pin_to_compression_child("root", "child", "default", False) is False
+    assert _carry_pin_to_compression_child("root", "child", "default") is False
     assert pins()["child"] is False
 
     # The rotation keeps the sidecar pin whenever the parent was pinned.
@@ -146,3 +146,14 @@ def test_failed_carry_keeps_child_pinned_and_retries(tmp_path, monkeypatch):
         [{"session_id": sid, "pinned": p, "profile": "default"} for sid, p in sidecar.items()])
     assert pins() == {"root": True, "child": True}
     assert sidecar == {"root": True, "child": True}
+
+
+def test_carry_fails_closed_when_parent_pin_unknown(tmp_path, monkeypatch):
+    from api import models
+    from api.streaming import _carry_pin_to_compression_child
+
+    # state.db cannot confirm the parent; a stale sidecar pin must not pin the child.
+    pins = _sqlite_pins(tmp_path, monkeypatch, [("root", 0), ("child", 0)])
+    monkeypatch.setattr(models, "agent_session_pinned_flags", lambda *a, **kw: None)
+    assert _carry_pin_to_compression_child("root", "child", "default") is None
+    assert pins()["child"] is False
