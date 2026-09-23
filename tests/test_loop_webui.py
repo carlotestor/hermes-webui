@@ -27,7 +27,7 @@ def test_webui_loop_matches_cli(tmp_path, monkeypatch):
     out = loops.run_loop_command("s1", "5m check the deploy")
     with loops._home(None):
         assert out == agent.dispatch_loop_command(agent.LoopManager(session_id="c1"), "5m check the deploy")["output"]
-        assert "--times" in loops.run_loop_command("s1", "5m x --times 2")
+        assert "slash" in loops.run_loop_command("s1", "10m /recap")
         assert tick("still rolling").next_due_at > 0 and started[0].startswith("[/loop wakeup #1, every 5m]")
         assert "1/100 budget" in loops.run_loop_command("s1", "status")
         assert tick("still rolling", max_ticks=2).paused_reason == "tick budget exhausted (2/2)"  # pause, as CLI
@@ -35,3 +35,15 @@ def test_webui_loop_matches_cli(tmp_path, monkeypatch):
         assert tick("Task cancelled.").paused_reason == "user-interrupted (Stop)"  # CLI Ctrl+C parity
         loops.run_loop_command("s1", "resume")
         assert tick("done\nLOOP_COMPLETE").status == "done" and len(started) == 4
+        for cmd in ("5m poll CI --times 2", "5m watch the queue --until queue is empty"):  # CLI flags, CLI text
+            loops.run_loop_command("s1", "stop")
+            agent.LoopManager(session_id="c1").clear()
+            assert loops.run_loop_command("s1", cmd) == agent.dispatch_loop_command(
+                agent.LoopManager(session_id="c1"), cmd)["output"]
+        monkeypatch.setattr(goals, "judge_goal", lambda goal, reply, **kw: ("done", f"{goal}: yes", False, None, False))
+        s = tick("queue drained")
+        assert "Stop condition: queue is empty" in started[-1] and s.status == "done"
+        assert s.last_stop_reason == "stop condition met: queue is empty: yes"
+        loops.run_loop_command("s1", "5m poll CI --times 2")
+        assert "0/2 runs" in loops.run_loop_command("s1", "status")
+        assert tick("a").status == "active" and tick("b").last_stop_reason == "completed the requested 2 runs"

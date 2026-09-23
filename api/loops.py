@@ -21,8 +21,8 @@ def run_loop_command(session_id, args):
     from api.models import get_session
     from hermes_cli.loops import LoopManager, dispatch_loop_command, parse_loop_args
     p = parse_loop_args(args)
-    if not p["error"] and (p["times"] or p["until"] or p["prompt"].startswith("/")):
-        return "/loop: --times, --until and looping slash commands aren't supported in the WebUI."
+    if not p["error"] and p["prompt"].startswith("/"):  # WebUI slash commands run in the browser, not the agent
+        return "/loop: looping slash commands isn't supported in the WebUI."
     with _home(get_session(session_id, metadata_only=True).profile):
         out = dispatch_loop_command(LoopManager(session_id=session_id), args,
                                     route={"platform": "webui", "chat_id": session_id})
