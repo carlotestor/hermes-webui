@@ -7321,10 +7321,11 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // genuinely external (messaging/CLI) parent is handled by the parentIsExternal
       // branch above and still orphans as before.
       // A flag-less subagent is suppressed only when parent_source proves a parent that shares its
-      // (WebUI) sidebar bucket; an unimported or CLI/TUI parent never attaches here, so it stays an orphan.
+      // (WebUI) sidebar bucket, classified by the same _isCliSession the partition uses; an unimported
+      // or CLI/TUI/ACP parent never attaches here, so it stays an orphan.
       // While searching, a matching child stays openable whatever its lineage flags.
       const childParentSource=String(child.parent_source||'').trim().toLowerCase();
-      const subagentParentKnown=childIsDelegatedSubagent&&(childParentSource==='webui'||childParentSource==='subagent');
+      const subagentParentKnown=childIsDelegatedSubagent&&!!childParentSource&&!_isCliSession({raw_source: childParentSource});
       const crossSurfaceChild=!!(child&&child._cross_surface_child_session&&_isChildSession(child));
       if(!searchActive&&(subagentParentKnown||crossSurfaceChild)) continue;
       orphans.push({...child,_orphan_child_session:true});

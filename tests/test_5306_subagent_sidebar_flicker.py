@@ -68,9 +68,12 @@ function extractFunc(name) {{
   }}
   return src.slice(start, i);
 }}
-function _isCliSession(s){{ return !!(s && (s.is_cli_session || s.session_source==='cli')); }}
-function _isExternalSession(s){{ return !!(s && (s.is_cli_session || s.session_source === 'messaging')); }}
-function _isMessagingSession(s){{ return !!(s && s.session_source==='messaging'); }}
+// Real source classifiers: the partition and the attach step must agree on the sidebar bucket.
+eval(src.match(/const _MESSAGING_RAW_SOURCES = [^;]*;/)[0].replace('const ', 'global.'));
+eval(extractFunc('_isMessagingSession'));
+eval(extractFunc('_isWebUiSourceSession'));
+eval(extractFunc('_isExternalSession'));
+eval(extractFunc('_isCliSession'));
 function _hasUnreadForSession(s){{ return !!(s && s.has_unread); }}
 global._isCliSession=_isCliSession; global._isExternalSession=_isExternalSession;
 global._isMessagingSession=_isMessagingSession; global._hasUnreadForSession=_hasUnreadForSession;
@@ -470,3 +473,27 @@ console.log(JSON.stringify(out));
     out = json.loads(_run_node(source))
     assert out["webui"] == [{"sid": "sub", "orphan": True, "kids": []}]
     assert out["cli"] == [{"sid": "cli_parent", "orphan": False, "kids": []}]
+
+
+@pytest.mark.parametrize("parent_source", ["cron", "webhook", "kanban", "tool", "api_server", "telegram"])
+def test_5305_flagless_subagent_of_filtered_non_cli_parent_is_suppressed(parent_source):
+    """Any non-CLI parent shares the WebUI bucket with its subagent (``_isCliSession``
+    decides the partition), so when that parent is filtered out the flag-less child
+    must follow it instead of leaking as a top-level "Subagent Session"."""
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global.S = {{ session: null, busy: false, activeStreamId: null }};
+global._activeProject = null;
+global._showArchived = false;
+global._sessionSourceFilter = 'webui';
+const allMatched = [
+  {{ session_id:'p', title:'Parent', session_source:'other', raw_source:'{parent_source}', source_tag:'{parent_source}', default_hidden:true, message_count:5, updated_at:100, last_message_at:100 }},
+  {{ session_id:'sub', title:'Subagent Session', parent_session_id:'p', relationship_type:'child_session', parent_source:'{parent_source}', raw_source:'subagent', source_tag:'subagent', session_source:'other', message_count:3, updated_at:101, last_message_at:101 }},
+];
+const part = _partitionSidebarSessionRows(allMatched, null);
+const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw);
+console.log(JSON.stringify({{ sessionsRaw: part.sessionsRaw.map(s=>s.session_id), topLevel: rows.map(r=>r.session_id) }}));
+"""
+    out = json.loads(_run_node(source))
+    assert out["sessionsRaw"] == ["sub"]  # the child reaches attach; the parent is filtered out
+    assert out["topLevel"] == []
