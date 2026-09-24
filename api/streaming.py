@@ -3995,7 +3995,11 @@ def _stream_reasoning_owner(msg, is_last, positional_idx, tool_call_segments, op
     content = msg.get('content')
     interim = None
     compact = _compact_for_echo_compare(content) if isinstance(content, str) else ''
-    hit = next((i for i, (text, _) in enumerate(interim_segments) if compact and text in compact), None)
+    # Exact text first, then the longest contained one, so an omitted interim
+    # that is a prefix of this step's text cannot claim it.
+    hits = [i for i, (text, _) in enumerate(interim_segments) if compact and text and text in compact]
+    hit = max(hits, key=lambda i: (interim_segments[i][0] == compact, len(interim_segments[i][0]), -i),
+              default=None)
     if hit is not None:
         interim = interim_segments[hit][1]
         del interim_segments[:hit + 1]

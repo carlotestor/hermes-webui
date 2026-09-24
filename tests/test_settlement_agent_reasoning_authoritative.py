@@ -277,3 +277,14 @@ def test_unmatched_interim_does_not_block_later_ones():
     _settle_turn_reasoning(s, [], {0: 'seg0', 1: 'seg1', 2: 'seg2'}, {}, 2,
                            [('Firstnote.', 0), ('Secondnote.', 1)])
     assert _reasonings(s.messages) == ['seg1', 'seg2']
+
+
+def test_omitted_prefix_interim_does_not_claim_later_step():
+    s = SimpleNamespace(messages=[
+        {'role': 'user', 'content': 'q'},
+        {'role': 'assistant', 'content': 'Checking logs', 'reasoning': None},
+        {'role': 'assistant', 'content': 'done', 'reasoning': None},
+    ])
+    _settle_turn_reasoning(s, [], {0: 'seg0', 1: 'seg1', 2: 'seg2'}, {}, 2,
+                           [('Check', 0), ('Checkinglogs', 1)])
+    assert _reasonings(s.messages) == ['seg1', 'seg2']
