@@ -3980,18 +3980,36 @@ def _split_thinking_from_content(raw_content, existing_reasoning=''):
     )
 
 
+def _step_tool_call_ids(messages, pos, started_ids, claimed):
+    """Tool call IDs of the assistant step at ``messages[pos]``, in order.
+
+    From its ``tool_calls``, else its following tool results' IDs, else the
+    next unclaimed live tool starts (one per following tool result).
+    """
+    msg = messages[pos]
+    ids = [tc.get('id') for tc in msg.get('tool_calls') or [] if isinstance(tc, dict) and tc.get('id')]
+    if not ids:
+        results = []
+        for m in messages[pos + 1:]:
+            if not (isinstance(m, dict) and m.get('role') == 'tool'):
+                break
+            results.append(m.get('tool_call_id'))
+        ids = [r for r in results if r]
+        if not ids and results:
+            ids = [i for i in started_ids if i not in claimed][:len(results)]
+    claimed.update(ids)
+    return ids
+
+
 def _stream_reasoning_owner(msg, is_last, positional_idx, tool_call_segments, open_segment,
-                            interim_segments):
+                            interim_segments, call_ids):
     """Return the stream segment index this assistant step owns, or None.
 
     ``interim_segments`` is consumed in order: a step whose content holds an
     interim message's visible text takes the segment bound to it (earlier
     unmatched interims are dropped).
     """
-    bound = [
-        tool_call_segments[tc.get('id')] for tc in msg.get('tool_calls') or []
-        if isinstance(tc, dict) and tc.get('id') in tool_call_segments
-    ]
+    bound = [tool_call_segments[i] for i in call_ids if i in tool_call_segments]
     content = msg.get('content')
     interim = None
     compact = _compact_for_echo_compare(content) if isinstance(content, str) else ''
@@ -4038,7 +4056,11 @@ def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
     )
     _total_asst = sum(1 for m in s.messages if isinstance(m, dict) and m.get('role') == 'assistant')
     _asst_count = 0
+    _started_ids = list(tool_call_segments)  # dict order = tool start order
+    _claimed = set()
+    _pos = -1
     for _rm in s.messages:
+        _pos += 1
         if not (isinstance(_rm, dict) and _rm.get('role') == 'assistant'):
             continue
         _turn_idx = _asst_count
@@ -4048,6 +4070,7 @@ def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
         _owner = _stream_reasoning_owner(
             _rm, _asst_count == _total_asst, (_turn_idx - _prev_asst) if _positional else None,
             tool_call_segments, open_segment, interim_segments,
+            _step_tool_call_ids(s.messages, _pos, _started_ids, _claimed),
         )
         _existing_reasoning = _rm.get('reasoning') or _reasoning_segments.get(_owner, '')
         _content = _rm.get('content')

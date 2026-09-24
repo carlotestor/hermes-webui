@@ -288,3 +288,28 @@ def test_omitted_prefix_interim_does_not_claim_later_step():
     _settle_turn_reasoning(s, [], {0: 'seg0', 1: 'seg1', 2: 'seg2'}, {}, 2,
                            [('Check', 0), ('Checkinglogs', 1)])
     assert _reasonings(s.messages) == ['seg1', 'seg2']
+
+
+def _bare_tool_step():
+    return {'role': 'assistant', 'content': '', 'reasoning': None}  # no tool_calls
+
+
+def test_bare_tool_step_owns_reasoning_via_tool_result_id(cleanup_test_sessions):
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'c1'), ('reasoning', 'final thinking'), ('token', 'done')],
+        [_bare_tool_step(), _tool_result('c1'),
+         {'role': 'assistant', 'content': 'done', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', 'final thinking']
+
+
+def test_bare_tool_steps_without_ids_follow_live_tool_start_order(cleanup_test_sessions):
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'c1'), ('tool', 'c2'),
+         ('reasoning', 'think C'), ('tool', 'c3'), ('token', 'done')],
+        [_bare_tool_step(), {'role': 'tool', 'content': 'ok'},
+         _bare_tool_step(), {'role': 'tool', 'content': 'ok'},
+         _bare_tool_step(), {'role': 'tool', 'content': 'ok'},
+         {'role': 'assistant', 'content': 'done', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', None, 'think C', None]

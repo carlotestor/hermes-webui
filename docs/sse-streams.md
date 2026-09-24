@@ -87,8 +87,10 @@ earlier turns are never modified.
   since the previous tool, or to `None` if that step streamed no thinking.
   A visible interim message (`on_interim_assistant()`) also closes its step:
   the open segment is bound to that message's text, so the next tool call
-  cannot claim it. Settlement resolves a tool-call step through its call id,
-  or through its interim binding when the step carried commentary. Other
+  cannot claim it. Settlement resolves a tool-call step through its call ids:
+  from `tool_calls`, else from the following tool results' `tool_call_id`,
+  else from the next unclaimed live tool starts in order. A step with
+  commentary can also resolve through its interim binding. Other
   steps are matched to interim bindings by their content, in order. The final
   step takes the segment still open at settlement. The positional index is
   used only when there are no bindings, as with older agents that lack
