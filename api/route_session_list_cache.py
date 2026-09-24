@@ -53,6 +53,8 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "model",
     "model_provider",
     "message_count",
+    "transcript_generation",
+    "transcript_generation_baseline",
     "user_message_count",
     "created_at",
     "updated_at",

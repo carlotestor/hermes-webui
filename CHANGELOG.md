@@ -44,6 +44,48 @@
 
 ### Fixed
 
+- **Gateway-backend turns survive a WebUI restart.** With the Gateway runs API enabled
+  (`HERMES_WEBUI_CHAT_BACKEND=gateway` + `HERMES_WEBUI_GATEWAY_USE_RUNS_API=true`), the Gateway
+  runs the turn, but restarting the WebUI still marked it interrupted, because the Gateway `run_id`
+  only lived in process memory. The run is now saved on the session as soon as the Gateway admits
+  it, with an `Idempotency-Key` so the Gateway keeps a durable record. On startup the WebUI
+  reattaches: it follows `GET /v1/runs/{id}` until the run settles and writes the real final
+  answer back. Text streamed before the restart isn't replayed; the settled answer replaces it.
+  Stop on a reattached turn goes to the Gateway that owns the run. Thanks @carlotestor. (#7785)
+
+- **Fewer self-inflicted console errors: git badge on CLI/subagent sessions, pollers after a
+  profile switch, and the PWA startup preload.** Three separate sources of noise in DevTools, all
+  caused by the WebUI itself. `/api/git-info` returned 404 for any session without a WebUI sidecar
+  (delegated subagents and CLI/TUI sessions), because it only looked up the sidecar. It now falls
+  back to the session's state.db metadata, and only for a workspace inside the trusted workspace
+  root. When another tab switched the shared profile cookie, an open session's approval and clarify
+  pollers kept re-requesting and getting `409 session_profile_mismatch` every few seconds. They now
+  pause after the first mismatch and re-arm when the tab regains focus or visibility (one retry
+  covers a switch-back that happened mid-request). The `pwa-startup.js` preload is gone: the
+  browser resolved it before the page's `<base href>` was written, so on `/session/<id>` it
+  fetched a wrong URL that was never used. Thanks @carlotestor. (#7789)
+
+- **CLI sessions you moved into a project stay in that project.** CLI sessions were cut to the
+  recent-session limit before project assignment was checked, so a CLI conversation you'd moved
+  into a project vanished from its project chip once enough newer sessions existed. The
+  assignment was still saved; only the row was gone. The recent limit now applies to unassigned
+  conversations only. Assigned ones stay in the payload (hidden from the main list once the recent
+  window is full) so the project chips can show them. Assigned rows have their own bound
+  (`CLI_PROJECT_ASSIGNED_CAP`, 200 across all projects, shared fairly so one busy project can't
+  take every slot), and a compressed CLI conversation keeps its project through its whole
+  continuation chain. Thanks @rodrigogs. (#6659)
+
+- **Two open WebUI windows no longer overwrite each other's unread state.** Two clients on the
+  same origin (for example the desktop PWA and a browser tab) share one `localStorage`, but each
+  kept its own in-memory copy of which sessions had been viewed. When one wrote, it replaced the
+  other's newer record, so read chats came back as unread or new completions lost their dot. Each
+  write now merges with what is on disk, keeps the newer record per session, and remembers
+  deletions and cleared completion dots so they don't come back. (#7577 by @snoyberg)
+- **Switching profiles no longer rebuilds the model list from scratch.** A profile switch used to
+  delete the saved models cache, so the next model-list load re-queried every provider. Each
+  profile now keeps its own cached model list across switches. The cache is still thrown away when
+  that profile's `config.yaml`, `.env` values, or model-provider plugins change, and when the
+  profile is deleted or recreated. (#7632 by @carlotestor)
 - **Picking a model from a named custom provider sends the right model name.** Choosing a model
   that belongs to a non-default custom provider (for example `@custom:my-server:model-x`) sent
   the whole picker id, prefix included, to the provider, which rejected the request. The
