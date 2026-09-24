@@ -1486,7 +1486,11 @@ Complete list of all HTTP endpoints as of Sprint 1 (v0.3).
     /api/chat/stream           ?stream_id=X -> SSE stream. Long-lived. Emits token/tool/
                                approval/done/error events.
     /api/chat/stream/status    ?stream_id=X -> {"active": true/false, "stream_id": X}
-    /api/approval/pending      ?session_id=X -> {"pending": entry_or_null}
+    /api/approval/pending      ?session_id=X -> {"pending": entry_or_null}. The approval/clarify
+                               fallback pollers stop on a 409 session_profile_mismatch.
+    /api/git-info              ?session_id=X -> {"git": status_or_null}. State.db-only sessions
+                               (CLI, subagents) use their stored workspace if it resolves via
+                               resolve_trusted_workspace; missing/untrusted -> {"git": null}.
     /api/approval/inject_test  ?session_id=X&pattern_key=K&command=C -> test-only endpoint.
                                Injects a pending approval entry into the server process.
     /api/file/raw              ?session_id=X&path=P -> raw file bytes with correct MIME type.
