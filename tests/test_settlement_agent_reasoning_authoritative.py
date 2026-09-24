@@ -115,7 +115,7 @@ def _run_turn(script, final_messages):
                      clarify_callback=None, interim_assistant_callback=None, **_kwargs):
             self.cb = {'reasoning': reasoning_callback, 'progress': tool_progress_callback,
                        'start': tool_start_callback, 'complete': tool_complete_callback,
-                       'token': stream_delta_callback}
+                       'token': stream_delta_callback, 'interim': interim_assistant_callback}
             self.context_compressor = None
             self.session_prompt_tokens = self.session_completion_tokens = 0
             self.session_estimated_cost_usd = 0
@@ -133,6 +133,8 @@ def _run_turn(script, final_messages):
                     self.cb['progress']('tool.started', 'terminal', 'ls', {})
                     self.cb['start'](value, 'terminal', {})
                     self.cb['complete'](value, 'terminal', {}, 'ok')
+                elif kind == 'interim':  # agent/stream_delivery.py:_deliver_interim
+                    self.cb['interim'](value, already_streamed=False)
                 elif kind == 'token':
                     self.cb['token'](value)
             return {'messages': kwargs.get('conversation_history', []) + [
@@ -224,3 +226,54 @@ def test_stream_only_and_skipped_thinking_in_one_turn(cleanup_test_sessions):
          {'role': 'assistant', 'content': 'done', 'reasoning': None}],
     )
     assert _reasonings(saved) == ['think A', None, 'think C', 'final thinking']
+
+
+def test_interim_step_keeps_reasoning_when_next_tool_step_skips_thinking(cleanup_test_sessions):
+    # A visible non-tool step, then a tool step that streamed no thinking: the
+    # tool call must not claim the interim step's segment.
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('interim', 'Let me check.'), ('tool', 'c1'),
+         ('reasoning', 'final thinking'), ('token', 'done')],
+        [{'role': 'assistant', 'content': 'Let me check.', 'reasoning': None},
+         _tool_step('c1', None), _tool_result('c1'),
+         {'role': 'assistant', 'content': 'done', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', None, 'final thinking']
+
+
+def test_interim_step_after_skipped_thinking_is_not_shifted(cleanup_test_sessions):
+    # Assistant ordinals and segment indexes diverge after a skipped step.
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'c1'), ('tool', 'c2'),
+         ('reasoning', 'think B'), ('interim', 'Halfway there.'),
+         ('reasoning', 'final thinking'), ('token', 'done')],
+        [_tool_step('c1', None), _tool_result('c1'),
+         _tool_step('c2', None), _tool_result('c2'),
+         {'role': 'assistant', 'content': 'Halfway there.', 'reasoning': None},
+         {'role': 'assistant', 'content': 'done', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', None, 'think B', 'final thinking']
+
+
+def test_tool_step_with_visible_commentary_keeps_its_reasoning(cleanup_test_sessions):
+    # agent/turn_tool_round.py emits the tool step's content as an interim
+    # message before its tools start.
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('interim', 'Checking the logs.'), ('tool', 'c1'),
+         ('tool', 'c2'), ('reasoning', 'final thinking'), ('token', 'done')],
+        [dict(_tool_step('c1', None), content='Checking the logs.'), _tool_result('c1'),
+         _tool_step('c2', None), _tool_result('c2'),
+         {'role': 'assistant', 'content': 'done', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', None, 'final thinking']
+
+
+def test_unmatched_interim_does_not_block_later_ones():
+    s = SimpleNamespace(messages=[
+        {'role': 'user', 'content': 'q'},
+        {'role': 'assistant', 'content': 'Second note.', 'reasoning': None},
+        {'role': 'assistant', 'content': 'done', 'reasoning': None},
+    ])
+    _settle_turn_reasoning(s, [], {0: 'seg0', 1: 'seg1', 2: 'seg2'}, {}, 2,
+                           [('Firstnote.', 0), ('Secondnote.', 1)])
+    assert _reasonings(s.messages) == ['seg1', 'seg2']

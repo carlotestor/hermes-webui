@@ -3980,32 +3980,45 @@ def _split_thinking_from_content(raw_content, existing_reasoning=''):
     )
 
 
-def _stream_reasoning_owner(msg, is_last, positional_idx, tool_call_segments, open_segment):
-    """Return the stream segment index this assistant step owns, or None."""
+def _stream_reasoning_owner(msg, is_last, positional_idx, tool_call_segments, open_segment,
+                            interim_segments):
+    """Return the stream segment index this assistant step owns, or None.
+
+    ``interim_segments`` is consumed in order: a step whose content holds an
+    interim message's visible text takes the segment bound to it (earlier
+    unmatched interims are dropped).
+    """
     bound = [
         tool_call_segments[tc.get('id')] for tc in msg.get('tool_calls') or []
         if isinstance(tc, dict) and tc.get('id') in tool_call_segments
     ]
-    if bound:  # parallel calls: only the first-started call carries the segment
-        return next((idx for idx in bound if idx is not None), None)
-    if not tool_call_segments:
-        return positional_idx  # no tool-boundary bindings: positional
-    if is_last and open_segment is not None:
-        return open_segment
-    if positional_idx in set(tool_call_segments.values()):
-        return None  # owned by a tool step
-    return positional_idx
+    content = msg.get('content')
+    interim = None
+    compact = _compact_for_echo_compare(content) if isinstance(content, str) else ''
+    hit = next((i for i, (text, _) in enumerate(interim_segments) if compact and text in compact), None)
+    if hit is not None:
+        interim = interim_segments[hit][1]
+        del interim_segments[:hit + 1]
+    if bound or interim is not None:
+        # parallel calls: only the first-started call carries the segment; a
+        # tool step with commentary had it bound at its interim message
+        return next((idx for idx in bound if idx is not None), interim)
+    if positional_idx is not None:
+        return positional_idx  # caller passes it only when no boundary bindings exist
+    return open_segment if is_last else None
 
 
 def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
-                           tool_call_segments=None, open_segment=None):
+                           tool_call_segments=None, open_segment=None, interim_segments=None):
     """Persist per-step reasoning on this turn's assistant messages in ``s.messages``.
 
     Contract (docs/sse-streams.md, "Reasoning settlement"): non-empty agent
     ``reasoning`` wins; otherwise the stream segment the step owns is used.
     Ownership comes from ``tool_call_segments`` (tool_call_id -> segment index,
-    bound when the tool starts) and ``open_segment`` (the final step's segment),
-    so a step that streamed no thinking never inherits a neighbour's segment.
+    bound when the tool starts), ``interim_segments`` ((compact visible text,
+    segment index) per interim message, bound when it is delivered) and
+    ``open_segment`` (the final step's segment), so a step that streamed no
+    thinking never inherits a neighbour's segment.
     Inline ``<think>`` blocks are split out of content either way.
     """
     # #3587: use per-message segments so each of this turn's assistant messages
@@ -4013,6 +4026,8 @@ def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
     if not s.messages:
         return
     tool_call_segments = tool_call_segments or {}
+    interim_segments = list(interim_segments or [])
+    _positional = not tool_call_segments and not interim_segments
     _prev_asst = sum(
         1 for m in (_previous_messages or [])
         if isinstance(m, dict) and m.get('role') == 'assistant'
@@ -4027,7 +4042,8 @@ def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
         if _turn_idx < _prev_asst:
             continue  # prior-turn message: never touch its reasoning
         _owner = _stream_reasoning_owner(
-            _rm, _asst_count == _total_asst, _turn_idx - _prev_asst, tool_call_segments, open_segment,
+            _rm, _asst_count == _total_asst, (_turn_idx - _prev_asst) if _positional else None,
+            tool_call_segments, open_segment, interim_segments,
         )
         _existing_reasoning = _rm.get('reasoning') or _reasoning_segments.get(_owner, '')
         _content = _rm.get('content')
@@ -10317,8 +10333,11 @@ def _run_agent_streaming(
             _current_reasoning_idx = 0
             _tool_boundary_advanced = False
             # Segment ownership: tool_call_id -> segment streamed before that call
-            # (None = its step streamed no thinking); unbound = the open step's segment.
+            # (None = its step streamed no thinking); interim -> (compact visible
+            # text, segment) per delivered interim message; unbound = the open
+            # step's segment.
             _tool_call_reasoning_idx: dict = {}
+            _interim_reasoning_idx: list = []
             _unbound_reasoning_idx = [None]
             _live_tool_calls = []  # tool progress fallback when final messages omit tool IDs
 
@@ -10524,6 +10543,12 @@ def _run_agent_streaming(
                 visible = str(text).strip()
                 if not visible:
                     return
+                # The interim message closes its step: bind the open segment to it
+                # so the next tool call cannot claim it (settlement matches by text).
+                # Agents without tool_start_callback keep positional settlement.
+                if 'tool_start_callback' in _agent_params:
+                    _interim_reasoning_idx.append((_compact_for_echo_compare(visible), _unbound_reasoning_idx[0]))
+                    _unbound_reasoning_idx[0] = None
                 reasoning_echo = _strip_reasoning_output_echo(visible)
                 already_streamed = bool(cb_kwargs.get('already_streamed', False)) or _is_visible_output_echo(visible)
                 payload = {
@@ -12535,7 +12560,7 @@ def _run_agent_streaming(
                 # persisted session file 30-50% and bypassing the thinking card.
                 _settle_turn_reasoning(
                     s, _previous_messages, _reasoning_segments,
-                    _tool_call_reasoning_idx, _unbound_reasoning_idx[0],
+                    _tool_call_reasoning_idx, _unbound_reasoning_idx[0], _interim_reasoning_idx,
                 )
                 try:
                     _turn_duration_seconds = max(0.0, time.time() - float(_turn_started_at))
