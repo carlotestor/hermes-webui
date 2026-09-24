@@ -406,6 +406,41 @@ console.log(JSON.stringify(rows.map(r=>({{sid:r.session_id, orphan:!!r._orphan_c
         assert out == [{"sid": "orch", "orphan": False, "kids": ["leaf"]}]
 
 
+@pytest.mark.parametrize("filler,expect_orphan", [(22, False), (23, True)])
+def test_5305_enrichment_keeps_importer_parent_source(tmp_path, monkeypatch, filler, expect_orphan):
+    """Importer -> lineage enrichment -> renderer: enrichment must not fill in the
+    ``parent_source`` of a parent the importer left out, or the child disappears."""
+    import sqlite3
+    import api.models as models
+    from tests.test_subagent_parent_in_import_window import _window_db
+
+    db = tmp_path / "state.db"
+    _window_db(db, filler=filler)
+    with sqlite3.connect(str(db)) as conn:  # lineage enrichment needs these columns
+        conn.execute("ALTER TABLE sessions ADD COLUMN ended_at REAL")
+        conn.execute("ALTER TABLE sessions ADD COLUMN end_reason TEXT")
+    rows = models._load_cli_sessions_uncached(
+        tmp_path, db, None, visible_session_limit=3, include_claude_code=False
+    )
+    rows = [r for r in rows if r["session_id"] in ("orch", "leaf")]
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    models._enrich_sidebar_lineage_metadata(rows)
+    leaf = next(r for r in rows if r["session_id"] == "leaf")
+    assert leaf["parent_source"] == (None if expect_orphan else "subagent")
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global._showArchived = false;
+const raw = {json.dumps(rows, default=str)};
+const rows = _attachChildSessionsToSidebarRows(raw.filter(r=>!r.parent_session_id), raw);
+console.log(JSON.stringify(rows.map(r=>({{sid:r.session_id, orphan:!!r._orphan_child_session, kids:(r._child_sessions||[]).map(c=>c.session_id)}}))));
+"""
+    out = json.loads(_run_node(source))
+    if expect_orphan:
+        assert out == [{"sid": "leaf", "orphan": True, "kids": []}]
+    else:
+        assert out == [{"sid": "orch", "orphan": False, "kids": ["leaf"]}]
+
+
 def test_5305_search_keeps_matching_subagent_when_parent_does_not_match():
     """While sidebar search is active, a delegated subagent that matches the query
     stays openable even though its known parent does not match and is not rendered."""
