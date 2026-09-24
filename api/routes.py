@@ -2182,12 +2182,65 @@ def _save_pin_migration_state(state: dict) -> bool:
         return False
 
 
+def _update_pending_pins(key: str, *, add=(), remove=()) -> bool:
+    """Add/remove ids in *key*'s pending-pin queue; False when the marker cannot be saved."""
+    with _PIN_MIGRATION_LOCK:
+        state = _load_pin_migration_state()
+        pending = set((state.get("pending_pins") or {}).get(key) or [])
+        updated = (pending - set(remove)) | set(add)
+        if updated == pending:
+            return True
+        state.setdefault("pending_pins", {})[key] = sorted(updated)
+        return _save_pin_migration_state(state)
+
+
+def _sidecar_pin_intent(sid: str) -> bool | None:
+    """The sidecar's current pin; None when it cannot be loaded. Caller holds the session lock."""
+    try:
+        return bool(getattr(_ensure_full_session_before_mutation(sid, get_session(sid)), "pinned", False))
+    except Exception:
+        logger.debug("Could not load sidecar pin for %s", sid, exc_info=True)
+        return None
+
+
+def _migrate_pin_under_session_lock(sid: str, profile) -> bool | None:
+    """Copy the sidecar pin of *sid* into state.db, serialized with ``/api/session/pin``.
+
+    True when state.db holds the pin, False when the sidecar no longer wants it, None if unresolved.
+    """
+    from api.state_sync import sync_session_pinned
+    with _get_session_agent_lock(sid):
+        intent = _sidecar_pin_intent(sid)
+        if intent is not True:
+            return None if intent is None else False
+        flags = agent_session_pinned_flags([sid], profile=profile)
+        if flags is None or sid not in flags:
+            return None
+        if flags[sid] is not True:
+            sync_session_pinned(sid, True, profile=profile)
+            flags = agent_session_pinned_flags([sid], profile=profile)
+        return True if (flags or {}).get(sid) is True else None
+
+
+def _carry_pin_under_session_lock(sid: str, profile) -> bool | None:
+    """Re-pin a compression child that missed its carry; None when state.db cannot be read."""
+    from api.state_sync import sync_session_pinned
+    with _get_session_agent_lock(sid):
+        uncarried = agent_session_uncarried_pins([sid], profile=profile)
+        if uncarried is None:
+            return None
+        if sid in uncarried:
+            sync_session_pinned(sid, True, profile=profile)
+            uncarried = agent_session_uncarried_pins([sid], profile=profile)
+        return None if uncarried is None else sid not in uncarried
+
+
 def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] | None:
     """Copy sidecar pins into ``sessions.pinned``: all of them once per state.db, then pending ones.
 
     Returns ids still pending (reconciliation must not overwrite them), or None if nothing may apply.
     """
-    from api.state_sync import _resolve_state_db_path, sync_session_pinned
+    from api.state_sync import _resolve_state_db_path
 
     db_path = _resolve_state_db_path(profile)
     if db_path is None:
@@ -2195,42 +2248,36 @@ def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] 
     key = str(db_path)
     with _PIN_MIGRATION_LOCK:
         state = _load_pin_migration_state()
+    migrated = set(state.get("migrated_state_dbs") or [])
+    pending = set((state.get("pending_pins") or {}).get(key) or [])
+    row_pins = {str(r.get("session_id")).strip(): r.get("pinned") is True for r in profile_rows}
+    todo = {sid for sid in pending if sid in row_pins}
+    if key not in migrated:
+        todo |= {sid for sid, pinned in row_pins.items() if pinned}
+    unresolved, resolved = set(), set()
+    for sid in sorted(todo):
+        outcome = _migrate_pin_under_session_lock(sid, profile)
+        (unresolved if outcome is None else resolved).add(sid)
+    # A compression child left unpinned under a pinned ancestor missed its carry.
+    uncarried = agent_session_uncarried_pins(row_pins, profile=profile)
+    if uncarried is None:
+        return None
+    for sid in sorted(uncarried):
+        if _carry_pin_under_session_lock(sid, profile) is True:
+            uncarried.discard(sid)
+    with _PIN_MIGRATION_LOCK:
+        state = _load_pin_migration_state()
         migrated = set(state.get("migrated_state_dbs") or [])
-        pending = set((state.get("pending_pins") or {}).get(key) or [])
-        row_pins = {str(r.get("session_id")).strip(): r.get("pinned") is True for r in profile_rows}
-        # A pending pin the sidecar no longer holds was unpinned in the WebUI.
-        todo = {sid for sid in pending if row_pins.get(sid)}
-        if key not in migrated:
-            todo |= {sid for sid, pinned in row_pins.items() if pinned}
-        still_pending = {sid for sid in pending if sid not in row_pins}
-        if todo:
-            flags = agent_session_pinned_flags(todo, profile=profile)
-            if flags is None:
-                logger.warning("Could not read pins from %s; pin migration will retry", key)
-                return None
-            for sid in todo:
-                if flags.get(sid) is False:
-                    sync_session_pinned(sid, True, profile=profile)
-            flags = agent_session_pinned_flags(todo, profile=profile)
-            if flags is None:
-                return None
-            still_pending |= {sid for sid in todo if flags.get(sid) is not True}
-        # A compression child left unpinned under a pinned ancestor missed its carry.
-        uncarried = agent_session_uncarried_pins(row_pins, profile=profile)
-        if uncarried is None:
-            return None
-        for sid in uncarried:
-            sync_session_pinned(sid, True, profile=profile)
-        if uncarried:
-            uncarried = agent_session_uncarried_pins(uncarried, profile=profile)
-            if uncarried is None:
-                return None
-        if key not in migrated or still_pending != pending:
+        current = set((state.get("pending_pins") or {}).get(key) or [])
+        # Ids enqueued by /api/session/pin meanwhile stay pending.
+        still_pending = (current - resolved) | unresolved
+        if key not in migrated or still_pending != current:
             state["migrated_state_dbs"] = sorted(migrated | {key})
             state.setdefault("pending_pins", {})[key] = sorted(still_pending)
             if not _save_pin_migration_state(state):
                 return None
-        return still_pending | uncarried
+    return still_pending | uncarried
+
 
 def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
     """Adopt state.db's pin (the record Desktop and the CLI share) into a sidecar cache row."""
@@ -15610,6 +15657,18 @@ def _llm_update_summary(system_prompt: str, user_prompt: str, active_profile: st
         return str(result.get("final_response") or "").strip()
 
 
+def _queue_pin_for_absent_row(sid: str, pinned: bool, profile) -> bool:
+    """Keep a pin pending until its state.db row exists, so the row's default cannot drop it."""
+    from api.state_sync import _resolve_state_db_path
+    db_path = _resolve_state_db_path(profile)
+    if db_path is None:
+        return True
+    key = str(db_path)
+    if pinned:
+        return _update_pending_pins(key, add=[sid])
+    return _update_pending_pins(key, remove=[sid])
+
+
 def _write_pin_to_state_db(s, pinned: bool) -> bool:
     """Write the pin to state.db; True only if it landed or the session has no state.db row.
 
@@ -15623,7 +15682,7 @@ def _write_pin_to_state_db(s, pinned: bool) -> bool:
         if known is None:
             return False
         if known is False:
-            return True
+            return _queue_pin_for_absent_row(sid, pinned, profile)
         return sync_session_pinned(sid, pinned, profile=profile)
     except Exception:
         logger.debug("Failed to write pin to state.db for %s", sid, exc_info=True)

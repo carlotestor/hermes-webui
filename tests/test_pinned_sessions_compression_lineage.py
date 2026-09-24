@@ -79,8 +79,21 @@ def test_compression_rotation_carries_the_pin():
     src = (ROOT / "api" / "streaming.py").read_text(encoding="utf-8")
     block = src.split("if _agent_sid and _agent_sid != session_id:", 1)[1]
     block = block.split("_compressed = True", 1)[0]
-    assert "_carry_pin_to_compression_child(\n                        old_sid, new_sid," in block
+    assert "_apply_compression_pin_carry(\n                        s, old_sid, new_sid," in block
     assert "if getattr(s, 'pinned', False):" not in block
+
+
+@pytest.mark.parametrize("carried, prior, expected", [
+    (True, False, True), (None, True, False), (False, True, True), (False, False, False),
+])
+def test_rotation_pin_follows_state_db_and_keeps_prior_on_unknown(monkeypatch, carried, prior, expected):
+    import api.streaming as streaming
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(streaming, "_carry_pin_to_compression_child", lambda *a: carried)
+    s = SimpleNamespace(pinned=prior)
+    streaming._apply_compression_pin_carry(s, "root", "child", "default")
+    assert s.pinned is expected
 
 
 def _sqlite_pins(tmp_path, monkeypatch, rows):
@@ -130,16 +143,18 @@ def test_failed_carry_keeps_child_pinned_and_retries(tmp_path, monkeypatch):
     assert _carry_pin_to_compression_child("root", "child", "default") is False
     assert pins()["child"] is False
 
-    # The rotation keeps the sidecar pin whenever the parent was pinned.
-    src = (ROOT / "api" / "streaming.py").read_text(encoding="utf-8")
-    block = src.split("if _agent_sid and _agent_sid != session_id:", 1)[1]
-    block = block.split("_compressed = True", 1)[0]
-    assert "s.pinned = _carry_pin_to_compression_child(" in block
-    assert ") is not None\n" in block
+    # The rotation keeps the sidecar pin whenever the carry outcome is unknown.
+    from types import SimpleNamespace
+    import api.streaming as streaming
+    rotated = SimpleNamespace(pinned=True)
+    streaming._apply_compression_pin_carry(rotated, "root", "child", "default")
+    assert rotated.pinned is True
 
     # The next sidebar build retries the carry; state.db must not unpin the sidecar first.
     monkeypatch.setattr(state_sync, "sync_session_pinned", real_sync)
     sidecar = {"root": True, "child": True}
+    monkeypatch.setattr(routes, "get_session", lambda sid, *a, **kw: SimpleNamespace(pinned=sidecar[sid]))
+    monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda sid, s: s)
     monkeypatch.setattr(routes, "_reconcile_sidebar_pin_with_state_db",
                         lambda row, meta: sidecar.__setitem__(row["session_id"], meta["pinned"]))
     routes._reconcile_sidebar_pins_with_state_db(
@@ -152,8 +167,9 @@ def test_carry_fails_closed_when_parent_pin_unknown(tmp_path, monkeypatch):
     from api import models
     from api.streaming import _carry_pin_to_compression_child
 
-    # state.db cannot confirm the parent; a stale sidecar pin must not pin the child.
+    # state.db cannot confirm the parent: nothing is written, and the outcome is unknown (False),
+    # so the rotation keeps the prior sidecar pin instead of clearing it.
     pins = _sqlite_pins(tmp_path, monkeypatch, [("root", 0), ("child", 0)])
     monkeypatch.setattr(models, "agent_session_pinned_flags", lambda *a, **kw: None)
-    assert _carry_pin_to_compression_child("root", "child", "default") is None
+    assert _carry_pin_to_compression_child("root", "child", "default") is False
     assert pins()["child"] is False

@@ -235,3 +235,83 @@ def test_failed_carry_retry_keeps_a_newer_desktop_unpin(upgrade_env):
     assert _sidebar_build(env) == {"root": False, "child": False}
     assert db_pins(env.db) == {"root": False, "child": False}
     assert env.sidecars == {"root": False, "child": False}
+
+
+def test_pin_on_absent_row_after_migration_survives_the_row_default(upgrade_env):
+    from tests._pin_helpers import PinSess
+
+    env = upgrade_env
+    _make_db(env.db, ["other"])
+    env.sidecars.update({"other": False})
+    _sidebar_build(env)  # migration marked complete
+
+    # WebUI pins a session the Agent has not inserted into state.db yet.
+    env.sidecars["late"] = True
+    assert env.routes._write_pin_to_state_db(PinSess("late"), True) is True
+    conn = sqlite3.connect(str(env.db))
+    conn.execute("INSERT INTO sessions (id, pinned) VALUES ('late', 0)")
+    conn.commit()
+    conn.close()
+
+    assert _sidebar_build(env) == {"other": False, "late": True}
+    assert db_pins(env.db) == {"other": False, "late": True}
+    assert env.sidecars == {"other": False, "late": True}
+
+
+def test_unpin_of_absent_row_drops_its_pending_pin(upgrade_env):
+    from tests._pin_helpers import PinSess
+
+    env = upgrade_env
+    _make_db(env.db, ["other"])
+    env.sidecars.update({"other": False})
+    _sidebar_build(env)
+    env.sidecars["late"] = True
+    assert env.routes._write_pin_to_state_db(PinSess("late"), True) is True
+    env.sidecars["late"] = False
+    assert env.routes._write_pin_to_state_db(PinSess("late"), False) is True
+    conn = sqlite3.connect(str(env.db))
+    conn.execute("INSERT INTO sessions (id, pinned) VALUES ('late', 0)")
+    conn.commit()
+    conn.close()
+    assert _sidebar_build(env) == {"other": False, "late": False}
+    assert db_pins(env.db) == {"other": False, "late": False}
+
+
+def test_unpin_during_migration_is_not_overwritten(upgrade_env, monkeypatch):
+    import threading
+    from tests._pin_helpers import PinSess, patch_pin_endpoint
+
+    env = upgrade_env
+    _make_db(env.db, ["a"])
+    env.sidecars["a"] = True
+    sess = PinSess("a", on_save=lambda s: env.sidecars.__setitem__(s.session_id, bool(s.pinned)))
+    sess.pinned = True
+    post = patch_pin_endpoint(monkeypatch, {"a": sess})
+
+    # Park the migration right after it read the pin it is about to copy.
+    paused, release = threading.Event(), threading.Event()
+    real_flags = env.routes.agent_session_pinned_flags
+
+    def flags(*a, **kw):
+        out = real_flags(*a, **kw)
+        if threading.current_thread().name == "migration" and not paused.is_set():
+            paused.set()
+            release.wait(5)
+        return out
+
+    monkeypatch.setattr(env.routes, "agent_session_pinned_flags", flags)
+    migration = threading.Thread(target=_sidebar_build, args=(env,), name="migration")
+    migration.start()
+    assert paused.wait(5)
+    result = {}
+    unpin = threading.Thread(target=lambda: result.update(r=post("a", False)), name="unpin")
+    unpin.start()
+    unpin.join(0.5)
+    release.set()
+    migration.join(5)
+    unpin.join(5)
+    assert not migration.is_alive() and not unpin.is_alive()
+
+    assert result["r"][0] == 200
+    assert env.sidecars == {"a": False}
+    assert db_pins(env.db) == {"a": False}

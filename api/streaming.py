@@ -9652,13 +9652,17 @@ def _cached_agent_session_identity(agent) -> str | None:
 def _carry_pin_to_compression_child(old_sid: str, new_sid: str, profile) -> bool | None:
     """Pin the compression child in state.db when state.db confirms the parent is pinned.
 
-    None when the parent is not confirmed pinned (fail closed), else whether state.db confirms
-    the child; a missed carry is re-derived from state.db's lineage on the next sidebar build.
+    None when state.db says the parent is unpinned or has no row; False when the parent read
+    or the child write failed (keep the sidecar pin, retried from state.db's lineage); else True.
     """
     from api.state_sync import sync_session_pinned
     from api.models import agent_session_pinned_flags
     profile = profile or 'default'
-    if (agent_session_pinned_flags([old_sid], profile=profile) or {}).get(old_sid) is not True:
+    parent_flags = agent_session_pinned_flags([old_sid], profile=profile)
+    if parent_flags is None:
+        logger.warning("Could not read the pin of %s; keeping the child's sidecar pin", old_sid)
+        return False
+    if parent_flags.get(old_sid) is not True:
         return None
     try:
         sync_session_pinned(new_sid, True, profile=profile)
@@ -9669,6 +9673,13 @@ def _carry_pin_to_compression_child(old_sid: str, new_sid: str, profile) -> bool
     if not ok:
         logger.warning("Could not carry pin to compression child %s; will retry", new_sid)
     return ok
+
+
+def _apply_compression_pin_carry(s, old_sid: str, new_sid: str, profile) -> None:
+    """Set the rotated session's pin from state.db; an unknown outcome keeps the prior pin."""
+    carried = _carry_pin_to_compression_child(old_sid, new_sid, profile)
+    if carried is not False:
+        s.pinned = carried is True
 
 
 def _cached_agent_matches_session(agent, session_id: str) -> bool:
@@ -12311,10 +12322,9 @@ def _run_agent_streaming(
                             _close_cached_agent_entry_at_session_boundary(old_sid, _skipped_agent_migration_entry)
                         except Exception:
                             logger.debug("Failed to close skipped compression-migration cached agent for session %s", old_sid, exc_info=True)
-                    # A pinned parent keeps the child pinned; a failed carry is retried.
-                    s.pinned = _carry_pin_to_compression_child(
-                        old_sid, new_sid, getattr(s, 'profile', None) or _resolved_profile_name,
-                    ) is not None
+                    _apply_compression_pin_carry(
+                        s, old_sid, new_sid, getattr(s, 'profile', None) or _resolved_profile_name,
+                    )
                     _compressed = True
 
                 # ── Detect silent agent failure (no assistant reply produced) ──
