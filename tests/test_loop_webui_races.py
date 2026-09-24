@@ -139,3 +139,59 @@ def test_retag_without_agent_modules_still_retags(monkeypatch):
     s = SimpleNamespace(session_id="s1", profile=None)
     loops.retag_session_profile(s, "b")
     assert s.profile == "b"
+
+
+@requires_agent_modules
+def test_loop_command_rechecks_profile_under_retag_lock(tmp_path, monkeypatch):
+    session = NS(session_id="s1", profile=None, messages=[])
+    agent, loops, started = _setup(tmp_path, monkeypatch, session)
+    loops.run_loop_command("s1", "stop")
+    loops.retag_session_profile(session, "b")  # lands after the route's ownership check, before the command
+    out = loops.run_loop_command("s1", "5m check", request_profile="default")
+    assert "another profile" in out
+    with loops._home("b"):
+        assert agent.load_loop("s1") is None  # profile b's store was never written
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "api" / "routes.py").read_text(encoding="utf-8")
+    assert "request_profile=_get_active_profile_name())" in src
+
+
+@requires_agent_modules
+def test_compression_mid_wakeup_keeps_turn_and_loop(tmp_path, monkeypatch):
+    from api import config
+    session = NS(session_id="s1", profile=None, messages=[])
+    agent, loops, started = _setup(tmp_path, monkeypatch, session)
+    with loops._home(None):
+        _due(agent)
+        loops.run_due_loops()
+        db = agent._get_session_db()
+        db.create_session("s1", "webui")
+        db.create_session("c1", "webui", parent_session_id="s1")
+        assert agent.migrate_loop_to_session("s1", "c1")  # agent compressed; WebUI hasn't rotated yet
+    monkeypatch.setattr(config, "ACTIVE_RUNS", {"stream1": {"session_id": "s1"}})  # turn still running
+    loops.run_due_loops()
+    with loops._home(None):
+        s = agent.load_loop("c1")
+    assert s.status == "active" and s.awaiting_response  # not cleared, not judged mid-turn
+    monkeypatch.setattr(config, "ACTIVE_RUNS", {})
+    session.session_id = "c1"
+    session.messages.append({"role": "assistant", "content": "done\nLOOP_COMPLETE"})
+    loops.run_due_loops()
+    with loops._home(None):
+        assert agent.load_loop("c1").status == "done"
+
+
+@requires_agent_modules
+def test_message_after_stop_does_not_hide_stop(tmp_path, monkeypatch):
+    session = NS(session_id="s1", profile=None, messages=[])
+    agent, loops, started = _setup(tmp_path, monkeypatch, session)
+    with loops._home(None):
+        _due(agent)
+    loops.run_due_loops()
+    session.messages += [{"role": "assistant", "content": "Task cancelled."},
+                         {"role": "user", "content": "next question", "timestamp": 2000.0},
+                         {"role": "assistant", "content": "answer"}]
+    loops.run_due_loops()
+    with loops._home(None):
+        s = agent.load_loop("s1")
+    assert s.status == "paused" and s.paused_reason == "user-interrupted (Stop)"

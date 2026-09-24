@@ -43,21 +43,45 @@ def _cas(db, key, expected, value):
     return db._execute_write(_do)
 
 
-def _wakeup_reply(messages, turn):
-    """Assistant text answering the recorded wakeup turn; "" if that turn produced none or is not found."""
+def _wakeup_outcome(messages, turn):
+    """(cancelled, reply) of the recorded wakeup turn, read from that turn's own rows only."""
+    from types import SimpleNamespace
+    from api.streaming import _session_has_cancel_marker
     msgs = list(messages or [])
     token, at = (turn or {}).get("token"), (turn or {}).get("started_at")
     for i, m in enumerate(msgs):
         if m.get("role") == "user" and ((token and m.get("_active_turn_token") == token)
                                          or (at and m.get("timestamp") == at)):
-            reply = ""
+            rows = []
             for n in msgs[i + 1:]:
                 if n.get("role") == "user":
                     break
-                if n.get("role") == "assistant":
-                    reply = str(n.get("content") or "")
-            return reply
-    return ""
+                rows.append(n)
+            replies = [n for n in rows if n.get("role") == "assistant"]
+            return (_session_has_cancel_marker(SimpleNamespace(messages=rows)),
+                    str(replies[-1].get("content") or "") if replies else "")
+    return False, ""
+
+
+def _turn_record(db, sid):
+    """The wakeup turn fired for this loop; follows compression's child->parent link, then re-keys it to sid."""
+    raw = db.get_meta(_TURN_PREFIX + sid)
+    if raw is None:
+        parent = (db.get_session(sid) or {}).get("parent_session_id")
+        raw = db.get_meta(_TURN_PREFIX + parent) if parent else None
+        if raw is not None:
+            db.set_meta(_TURN_PREFIX + sid, raw)
+    return json.loads(raw or "{}")
+
+
+def _turn_running(turn):
+    """True while the wakeup turn's own stream is alive, whatever session id it is filed under now."""
+    from api import config
+    stream_id = turn.get("stream_id")
+    with config.STREAMS_LOCK:
+        live = stream_id in config.STREAMS
+    with config.ACTIVE_RUNS_LOCK:
+        return bool(stream_id) and (live or stream_id in config.ACTIVE_RUNS)
 
 
 def retag_session_profile(session, profile):
@@ -73,8 +97,10 @@ def retag_session_profile(session, profile):
             LoopManager(session_id=session.session_id).clear()
 
 
-def run_loop_command(session_id, args):
+def run_loop_command(session_id, args, request_profile=None):
+    """`request_profile`: the caller's profile; re-checked under the lock a retag takes."""
     from api.models import get_session
+    from api.profiles import _profiles_match
     from hermes_cli.loops import LoopManager, dispatch_loop_command, parse_loop_args
     p = parse_loop_args(args)
     if not p["error"] and p["prompt"].startswith("/"):  # WebUI slash commands run in the browser, not the agent
@@ -84,6 +110,8 @@ def run_loop_command(session_id, args):
             profile = get_session(session_id, metadata_only=True).profile
         except KeyError:  # fail closed: never fall back to another profile's state.db
             return "/loop: open a saved chat first."
+        if request_profile is not None and not _profiles_match(profile, request_profile):
+            return "/loop: this chat moved to another profile; nothing was changed."
         with _home(profile):
             out = dispatch_loop_command(LoopManager(session_id=session_id), args,
                                         route={"platform": "webui", "chat_id": session_id})
@@ -118,7 +146,6 @@ def _run_one(profile, sid):
     from api.process_event_utils import build_active_turn_token
     from api.profiles import _profiles_match
     from api.routes import start_session_turn
-    from api.streaming import _session_has_cancel_marker
     from hermes_cli import loops as cli
     db = cli._get_session_db()
     if db is None:
@@ -129,12 +156,15 @@ def _run_one(profile, sid):
             or _session_has_active_turn(sid)):
         return
     try:
-        if state.awaiting_response:  # wakeup turn ended: same verdicts as the CLI post-turn hook
-            s = get_session(sid)
-            if _session_has_cancel_marker(s):
+        if state.awaiting_response:  # judge only once the wakeup turn settled: same verdicts as the CLI hook
+            turn = _turn_record(db, sid)
+            if _turn_running(turn):  # e.g. compression moved the loop to a child id mid-turn
+                return
+            cancelled, reply = _wakeup_outcome(get_session(sid).messages, turn)
+            if cancelled:
                 mgr.pause(reason="user-interrupted (Stop)")
             else:
-                mgr.complete_tick(_wakeup_reply(s.messages, json.loads(db.get_meta(_TURN_PREFIX + sid) or "{}")))
+                mgr.complete_tick(reply)
             return
         if cli.goal_blocks_loop_tick(sid):
             return
@@ -155,7 +185,8 @@ def _run_one(profile, sid):
             return
         at = resp.get("pending_started_at")
         db.set_meta(_TURN_PREFIX + sid, json.dumps(
-            {"token": build_active_turn_token(resp.get("stream_id"), at), "started_at": at}))
+            {"token": build_active_turn_token(resp.get("stream_id"), at), "started_at": at,
+             "stream_id": resp.get("stream_id")}))
     except KeyError:  # session deleted
         mgr.clear()
 

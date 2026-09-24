@@ -17101,7 +17101,8 @@ def handle_post(handler, parsed) -> bool:
             return True
         if command.split()[0].lower() in ("/loop", "loop"):
             from api.loops import run_loop_command
-            return j(handler, {"output": run_loop_command(sid, command.partition(" ")[2])})
+            return j(handler, {"output": run_loop_command(sid, command.partition(" ")[2],
+                                                          request_profile=_get_active_profile_name())})
 
         try:
             return j(handler, {"output": execute_agent_command(command)})
