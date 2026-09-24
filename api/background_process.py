@@ -1883,7 +1883,22 @@ def recover_processes_for_webui(process_registry=None, get_session_fn=None) -> i
             try:
                 proc_session = process_registry.get(process_id)
                 session_key = str(getattr(proc_session, "session_key", "") or "")
-                if not session_key or get_session_fn(session_key, metadata_only=True) is None:
+                if not session_key:
+                    continue
+                # The session resolver (``api.models._resolve_session_once``)
+                # raises ``KeyError(sid)`` for a missing session — that is its
+                # documented contract for the "owner gone" outcome, not a
+                # fault. Treat it identically to a ``None`` return: skip the
+                # process without logging, and let a neighbouring live
+                # process still rebind. The narrow ``except KeyError`` lives
+                # INSIDE the outer try so an unrelated ``KeyError`` from
+                # ``process_registry.get()`` (or any routing-index work) still
+                # surfaces in the existing warning path.
+                try:
+                    resolved = get_session_fn(session_key, metadata_only=True)
+                except KeyError:
+                    continue
+                if resolved is None:
                     continue
             except Exception:
                 logger.warning(
