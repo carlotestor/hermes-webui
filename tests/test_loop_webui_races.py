@@ -122,3 +122,20 @@ def test_user_turn_before_judgment_does_not_decide_tick(tmp_path, monkeypatch):
     with loops._home(None):
         s = agent.load_loop("s1")
     assert s.status == "active" and not s.awaiting_response and s.ticks_fired == 1
+
+
+def test_retag_without_agent_modules_still_retags(monkeypatch):
+    import builtins
+    from types import SimpleNamespace
+    from api import loops
+    real = builtins.__import__
+
+    def no_agent(name, *a, **kw):
+        if name.startswith("hermes_cli"):
+            raise ImportError(name)
+        return real(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", no_agent)
+    s = SimpleNamespace(session_id="s1", profile=None)
+    loops.retag_session_profile(s, "b")
+    assert s.profile == "b"

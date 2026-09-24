@@ -62,10 +62,13 @@ def _wakeup_reply(messages, turn):
 
 def retag_session_profile(session, profile):
     """Move an empty session to `profile`, clearing the loop it left in its old profile."""
-    from hermes_cli.loops import LoopManager
     with _session_lock(session.session_id):
         old = getattr(session, "profile", None)
         session.profile = profile
+        try:
+            from hermes_cli.loops import LoopManager
+        except ImportError:  # no agent installed: no loop store, nothing to clear
+            return
         with _home(old):
             LoopManager(session_id=session.session_id).clear()
 
