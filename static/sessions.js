@@ -7245,11 +7245,11 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // trigger from archived to filtered-out. A cross-surface WebUI child of a
       // genuinely external (messaging/CLI) parent is handled by the parentIsExternal
       // branch above and still orphans as before.
-      // A flag-less subagent is suppressed only when parent_source proves the importer saw its parent;
-      // a parent outside the importer's recency window leaves this orphan row as the only way in.
-      // While searching, a matching child stays openable even when its parent is not in the results,
-      // whatever its lineage flags: search hits must not depend on enrichment metadata.
-      const subagentParentKnown=childIsDelegatedSubagent&&!!child.parent_source;
+      // A flag-less subagent is suppressed only when parent_source proves a parent that shares its
+      // (WebUI) sidebar bucket; an unimported or CLI/TUI parent never attaches here, so it stays an orphan.
+      // While searching, a matching child stays openable whatever its lineage flags.
+      const childParentSource=String(child.parent_source||'').trim().toLowerCase();
+      const subagentParentKnown=childIsDelegatedSubagent&&(childParentSource==='webui'||childParentSource==='subagent');
       const crossSurfaceChild=!!(child&&child._cross_surface_child_session&&_isChildSession(child));
       if(!searchActive&&(subagentParentKnown||crossSurfaceChild)) continue;
       orphans.push({...child,_orphan_child_session:true});

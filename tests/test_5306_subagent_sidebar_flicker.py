@@ -434,3 +434,32 @@ console.log(JSON.stringify({ search: render('zebra'), idle: render('') }));
     ]
     assert len(out["idle"]) == 1 and out["idle"][0]["sid"] == "parent"
     assert sorted(out["idle"][0]["kids"]) == ["sub", "subx"]
+
+
+@pytest.mark.parametrize("parent_source", ["cli", "tui", "acp"])
+def test_5305_subagent_of_cli_parent_stays_reachable_in_all_profiles(parent_source):
+    """All-profiles payloads carry no cross-surface flag. The partition puts a
+    CLI/TUI parent in the CLI bucket and its subagent in the WebUI bucket, so the
+    child can never attach there and must stay an openable orphan row."""
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global._activeProject = null;
+global._showArchived = false;
+global.window = {{ _showCliSessions: true }};
+const allMatched = [
+  {{ session_id:'cli_parent', title:'CLI run', session_source:'cli', raw_source:'{parent_source}', source_tag:'{parent_source}', is_cli_session:true, profile:'a', message_count:5, updated_at:100, last_message_at:100 }},
+  {{ session_id:'sub', title:'Subagent Session', parent_session_id:'cli_parent', relationship_type:'child_session', parent_source:'{parent_source}', raw_source:'subagent', source_tag:'subagent', session_source:'other', profile:'a', message_count:3, updated_at:101, last_message_at:101 }},
+];
+const out = {{}};
+for (const tab of ['webui', 'cli']) {{
+  global._sessionSourceFilter = tab;
+  const part = _partitionSidebarSessionRows(allMatched, null);
+  const ref = tab === 'cli' ? part.cliReferenceRaw : part.webuiReferenceRaw;
+  const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, ref);
+  out[tab] = rows.map(r=>({{sid:r.session_id, orphan:!!r._orphan_child_session, kids:(r._child_sessions||[]).map(c=>c.session_id)}}));
+}}
+console.log(JSON.stringify(out));
+"""
+    out = json.loads(_run_node(source))
+    assert out["webui"] == [{"sid": "sub", "orphan": True, "kids": []}]
+    assert out["cli"] == [{"sid": "cli_parent", "orphan": False, "kids": []}]
