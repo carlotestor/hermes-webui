@@ -79,7 +79,6 @@ def test_archived_and_hidden_state_db_pins_do_not_use_quota(tmp_path, monkeypatc
     _db(db, [("a1", "cli", True), ("a2", "cli", True), ("a3", "cli", True), ("cron_x", "cron", True)],
         archived={"a1", "a2", "a3"})
     monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: db)
-    monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "no-sidecars")
     monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}])
     writes = []
     monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: writes.append(p) or True)
@@ -129,3 +128,23 @@ def test_reconcile_rereads_the_pin_under_the_session_lock(tmp_path, monkeypatch)
     assert db_pins(root_db) == {"s": False}
     assert sidecars == {"s": False}
     assert row["pinned"] is False
+
+
+def test_another_profiles_sidecar_does_not_change_quota_archive_state(tmp_path, monkeypatch):
+    import json
+
+    from api import models, routes
+
+    db = tmp_path / "state.db"
+    _db(db, [(f"w{i}", "cli", True) for i in range(3)])
+    # The shared sidecar store holds an archived "w0" that belongs to another profile.
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "w0.json").write_text(json.dumps({"session_id": "w0", "profile": "default", "archived": True}))
+    monkeypatch.setattr(models, "SESSION_DIR", sessions)
+    models.clear_sidecar_metadata_cache()
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: db if profile == "work" else None)
+    monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}, {"name": "work"}])
+
+    rows = routes._pin_quota_rows_from_state_db([])
+    assert routes._visible_pinned_lineage_ids(rows) == {"w0", "w1", "w2"}

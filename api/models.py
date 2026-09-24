@@ -6525,13 +6525,8 @@ def agent_session_pin_lineage_rows(session_ids, *, profile=None) -> list[dict] |
         out = []
         for sid, parent_id, session_source, source, archived in _pin_db_chunks(cur, sql, session_ids):
             sid = str(sid).strip()
-            # Same visibility fields as the sidebar projection; the WebUI sidecar's archive flag wins.
-            sidecar_archived = _state_projection_sidecar_metadata(sid).get("archived")
-            row = {
-                "session_id": sid,
-                "pinned": True,
-                "archived": bool(archived) if sidecar_archived is None else sidecar_archived,
-            }
+            # Only ids without a WebUI row of this profile get here, so state.db's archive flag stands.
+            row = {"session_id": sid, "pinned": True, "archived": bool(archived)}
             if parent_id:
                 row["parent_session_id"] = str(parent_id).strip()
             if session_source:
