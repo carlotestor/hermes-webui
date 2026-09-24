@@ -3980,23 +3980,44 @@ def _split_thinking_from_content(raw_content, existing_reasoning=''):
     )
 
 
-def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments):
+def _stream_reasoning_owner(msg, is_last, positional_idx, tool_call_segments, open_segment):
+    """Return the stream segment index this assistant step owns, or None."""
+    bound = [
+        tool_call_segments[tc.get('id')] for tc in msg.get('tool_calls') or []
+        if isinstance(tc, dict) and tc.get('id') in tool_call_segments
+    ]
+    if bound:  # parallel calls: only the first-started call carries the segment
+        return next((idx for idx in bound if idx is not None), None)
+    if not tool_call_segments:
+        return positional_idx  # no tool-boundary bindings: positional
+    if is_last and open_segment is not None:
+        return open_segment
+    if positional_idx in set(tool_call_segments.values()):
+        return None  # owned by a tool step
+    return positional_idx
+
+
+def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
+                           tool_call_segments=None, open_segment=None):
     """Persist per-step reasoning on this turn's assistant messages in ``s.messages``.
 
-    Contract (docs/sse-streams.md, "Reasoning settlement"): a message's own
-    ``reasoning`` key, even None (the agent found no thinking for that step),
-    is authoritative. ``_reasoning_segments`` (live stream index -> text) fill
-    only messages without the key, because segments drift when a step has no
-    thinking. Inline ``<think>`` blocks are split out of content either way.
+    Contract (docs/sse-streams.md, "Reasoning settlement"): non-empty agent
+    ``reasoning`` wins; otherwise the stream segment the step owns is used.
+    Ownership comes from ``tool_call_segments`` (tool_call_id -> segment index,
+    bound when the tool starts) and ``open_segment`` (the final step's segment),
+    so a step that streamed no thinking never inherits a neighbour's segment.
+    Inline ``<think>`` blocks are split out of content either way.
     """
     # #3587: use per-message segments so each of this turn's assistant messages
     # gets its own trace; skip prior-turn messages (multi-turn off-by-N).
     if not s.messages:
         return
+    tool_call_segments = tool_call_segments or {}
     _prev_asst = sum(
         1 for m in (_previous_messages or [])
         if isinstance(m, dict) and m.get('role') == 'assistant'
     )
+    _total_asst = sum(1 for m in s.messages if isinstance(m, dict) and m.get('role') == 'assistant')
     _asst_count = 0
     for _rm in s.messages:
         if not (isinstance(_rm, dict) and _rm.get('role') == 'assistant'):
@@ -4005,10 +4026,10 @@ def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments):
         _asst_count += 1
         if _turn_idx < _prev_asst:
             continue  # prior-turn message: never touch its reasoning
-        if 'reasoning' in _rm:
-            _existing_reasoning = _rm.get('reasoning') or ''
-        else:
-            _existing_reasoning = _reasoning_segments.get(_turn_idx - _prev_asst, '')
+        _owner = _stream_reasoning_owner(
+            _rm, _asst_count == _total_asst, _turn_idx - _prev_asst, tool_call_segments, open_segment,
+        )
+        _existing_reasoning = _rm.get('reasoning') or _reasoning_segments.get(_owner, '')
         _content = _rm.get('content')
         if isinstance(_content, str) and _content:
             _new_content, _merged_reasoning = _split_thinking_from_content(
@@ -10295,6 +10316,10 @@ def _run_agent_streaming(
             _reasoning_buffer_index = _CompactEchoIndex()
             _current_reasoning_idx = 0
             _tool_boundary_advanced = False
+            # Segment ownership: tool_call_id -> segment streamed before that call
+            # (None = its step streamed no thinking); unbound = the open step's segment.
+            _tool_call_reasoning_idx: dict = {}
+            _unbound_reasoning_idx = [None]
             _live_tool_calls = []  # tool progress fallback when final messages omit tool IDs
 
             # Throttle: emit metering events at most every 100 ms so the per-message
@@ -10452,6 +10477,7 @@ def _run_agent_streaming(
                 _reasoning_segments[_current_reasoning_idx] = (
                     _reasoning_segments.get(_current_reasoning_idx, '') + reasoning_delta
                 )
+                _unbound_reasoning_idx[0] = _current_reasoning_idx
                 # Keep the folded index in step with the segment text.
                 _reasoning_segment_indexes.setdefault(
                     _current_reasoning_idx, _CompactEchoIndex()
@@ -10589,6 +10615,7 @@ def _run_agent_streaming(
                         _reasoning_segments[_current_reasoning_idx] = (
                             _reasoning_segments.get(_current_reasoning_idx, '') + reason_delta
                         )
+                        _unbound_reasoning_idx[0] = _current_reasoning_idx
                         _reasoning_segment_indexes.setdefault(
                             _current_reasoning_idx, _CompactEchoIndex()
                         ).append(reason_delta)
@@ -10735,6 +10762,9 @@ def _run_agent_streaming(
                     return
 
             def on_tool_start(tool_call_id, name, args):
+                if tool_call_id and tool_call_id not in _tool_call_reasoning_idx:
+                    _tool_call_reasoning_idx[tool_call_id] = _unbound_reasoning_idx[0]
+                    _unbound_reasoning_idx[0] = None
                 try:
                     _record_live_tool_start(tool_call_id, name, args)
                     if tool_call_id and tool_call_id not in _live_tool_event_start_ids:
@@ -12503,7 +12533,10 @@ def _run_agent_streaming(
                 # _splitThinkFromContent). Inline-thinking providers (e.g. MiniMax-M3)
                 # otherwise leave the thinking trace in m['content'], bloating the
                 # persisted session file 30-50% and bypassing the thinking card.
-                _settle_turn_reasoning(s, _previous_messages, _reasoning_segments)
+                _settle_turn_reasoning(
+                    s, _previous_messages, _reasoning_segments,
+                    _tool_call_reasoning_idx, _unbound_reasoning_idx[0],
+                )
                 try:
                     _turn_duration_seconds = max(0.0, time.time() - float(_turn_started_at))
                 except Exception:

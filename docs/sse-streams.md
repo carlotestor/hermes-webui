@@ -78,16 +78,19 @@ When a `/api/chat/stream` turn settles, `_settle_turn_reasoning()` in
 assistant messages before the session is saved. Assistant messages from
 earlier turns are never modified.
 
-- **The agent's `reasoning` key wins.** If the message carries a `reasoning`
-  key, its value is used, including `None`. The agent writes this key on every
-  assistant message it builds, and `None` means the model produced no thinking
-  for that step. It is not backfilled from the stream.
-- **Stream segments are only a fallback.** The live `_reasoning_segments`
-  (stream step index -> text) fill a message only when it has no `reasoning`
-  key at all. They are not authoritative because the index advances only at a
-  tool boundary that already holds reasoning text. With adaptive-thinking
-  models that skip thinking on some tool-call steps, segment `k` can therefore
-  hold step `k+1`'s trace.
+- **Non-empty agent `reasoning` wins.** The agent writes the key on every
+  assistant message it builds, but `None` only means the provider did not
+  return final reasoning. It is not evidence the step had no thinking, so
+  stream-only providers fall through to the stream.
+- **Stream segments are bound to the step that owns them.** When a tool
+  starts, `on_tool_start()` binds its `tool_call_id` to the segment streamed
+  since the previous tool, or to `None` if that step streamed no thinking.
+  Settlement resolves a tool-call step through its call id. The final step
+  takes the segment still open at settlement. The positional index is used
+  only when there are no bindings, as with older agents that lack
+  `tool_start_callback`. It is not authoritative on its own: it advances
+  only at a tool boundary that already holds reasoning, so with
+  adaptive-thinking models segment `k` can hold step `k+1`'s trace.
 - **Inline `<think>` blocks** in the content are always split into `reasoning`
   and merged with the value chosen above.
 
