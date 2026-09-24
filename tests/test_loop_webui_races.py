@@ -195,3 +195,35 @@ def test_message_after_stop_does_not_hide_stop(tmp_path, monkeypatch):
     with loops._home(None):
         s = agent.load_loop("s1")
     assert s.status == "paused" and s.paused_reason == "user-interrupted (Stop)"
+
+
+@requires_agent_modules
+def test_stop_on_wakeup_via_real_cancel_pauses_loop(tmp_path, monkeypatch):
+    import queue
+    from api import config, models, routes, streaming
+    from api.models import Session
+    session = Session(session_id="s1", title="loop", messages=[])
+    session.save = lambda *a, **kw: None
+    agent, loops, started = _setup(tmp_path, monkeypatch, session)
+    monkeypatch.setattr(streaming, "get_session", lambda sid, **kw: session)
+
+    def start(sid, msg, source):  # deferred save mode: the prompt lives only in pending_* until the turn ends
+        started.append(msg)
+        session.active_stream_id, session.pending_user_message = "stream1", msg
+        session.pending_started_at, session.pending_user_source = 1000.75, source
+        config.STREAMS["stream1"], config.CANCEL_FLAGS["stream1"] = queue.Queue(), threading.Event()
+        config.register_stream_owner("stream1", sid)
+        return {"stream_id": "stream1", "pending_started_at": 1000.75}
+
+    monkeypatch.setattr(routes, "start_session_turn", start)
+    with loops._home(None):
+        _due(agent)
+    loops.run_due_loops()
+    assert streaming.cancel_stream("stream1")
+    user = [m for m in session.messages if m.get("role") == "user"][-1]
+    assert user["timestamp"] == 1000 and "_active_turn_token" not in user  # the recovered row
+    config.ACTIVE_RUNS.pop("stream1", None)
+    loops.run_due_loops()
+    with loops._home(None):
+        s = agent.load_loop("s1")
+    assert s.status == "paused" and s.paused_reason == "user-interrupted (Stop)"
