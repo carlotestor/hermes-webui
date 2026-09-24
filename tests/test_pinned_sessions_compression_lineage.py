@@ -156,7 +156,7 @@ def test_failed_carry_keeps_child_pinned_and_retries(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "get_session", lambda sid, *a, **kw: SimpleNamespace(pinned=sidecar[sid]))
     monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda sid, s: s)
     monkeypatch.setattr(routes, "_reconcile_sidebar_pin_with_state_db",
-                        lambda row, meta: sidecar.__setitem__(row["session_id"], meta["pinned"]))
+                        lambda row, meta, profile: sidecar.__setitem__(row["session_id"], meta["pinned"]))
     routes._reconcile_sidebar_pins_with_state_db(
         [{"session_id": sid, "pinned": p, "profile": "default"} for sid, p in sidecar.items()])
     assert pins() == {"root": True, "child": True}

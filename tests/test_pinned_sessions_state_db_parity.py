@@ -211,6 +211,8 @@ def test_reconcile_state_db_wins_over_sidecar_after_migration(monkeypatch):
             saved.append((self.pinned, kw))
 
     monkeypatch.setattr(routes, "get_session", lambda *_a, **_kw: _Session())
+    state_db = {"s1": False, "s2": True}
+    monkeypatch.setattr(routes, "agent_session_pinned_flags", lambda ids, profile=None: {i: state_db[i] for i in ids})
 
     # Unpinned in Desktop -> sidecar pin dropped.
     row = {"session_id": "s1", "pinned": True, "profile": "default"}
@@ -268,7 +270,7 @@ def test_sidebar_build_reconciles_pins_without_show_cli_sessions(monkeypatch):
     reconciled = []
     monkeypatch.setattr(
         routes, "_reconcile_sidebar_pin_with_state_db",
-        lambda row, meta: reconciled.append((row["session_id"], meta["pinned"])),
+        lambda row, meta, profile: reconciled.append((row["session_id"], meta["pinned"])),
     )
     monkeypatch.setattr(routes, "get_cli_sessions", lambda *a, **kw: pytest.fail("cli listing must not run"))
     rows = [
@@ -320,6 +322,7 @@ def test_reconcile_loads_session_under_agent_lock(monkeypatch):
     monkeypatch.setattr(routes, "_get_session_agent_lock", lambda sid: lock)
     monkeypatch.setattr(routes, "get_session", lambda sid: events.append(("load", lock._is_owned())) or _Sess())
     monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda sid, s: s)
+    monkeypatch.setattr(routes, "agent_session_pinned_flags", lambda ids, profile=None: {"s1": True})
     row = {"session_id": "s1", "pinned": False}
     routes._reconcile_sidebar_pin_with_state_db(row, {"pinned": True})
     assert row["pinned"] is True

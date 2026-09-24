@@ -456,15 +456,22 @@ def _pin_quota_reservation_rows(exclude_key: tuple, snapshot_seq: int) -> list[d
     return rows
 
 
+def _pin_profile(profile) -> str:
+    """Profile whose state.db holds a row's pin: legacy rows without one belong to the root profile."""
+    if not isinstance(profile, str) or not profile or _is_root_profile(profile):
+        return "default"
+    return profile
+
+
 def _pin_quota_profile_keys(rows) -> list | None:
     """Profiles whose pins count toward the global limit; ``None`` when they cannot be listed."""
-    keys = {_session_field(row, "profile", None) for row in rows}
+    keys = {_pin_profile(_session_field(row, "profile", None)) for row in rows}
     try:
-        keys.update(p.get("name") for p in list_profiles_api() if p.get("name"))
+        keys.update(_pin_profile(p.get("name")) for p in list_profiles_api() if p.get("name"))
     except Exception:
         logger.warning("Could not list profiles for the pin quota", exc_info=True)
         return None
-    return sorted(keys, key=lambda k: (k is None, str(k)))
+    return sorted(keys)
 
 
 def _pin_quota_rows_from_state_db(rows) -> list[dict] | None:
@@ -472,16 +479,17 @@ def _pin_quota_rows_from_state_db(rows) -> list[dict] | None:
 
     State.db-only pins join their compression lineage; a profile with no pin store keeps cached flags.
     """
-    by_profile: dict[object, list[dict]] = defaultdict(list)
+    by_profile: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
-        by_profile[_session_field(row, "profile", None)].append(dict(row))
+        profile = _pin_profile(_session_field(row, "profile", None))
+        by_profile[profile].append(dict(row, profile=profile))
     profile_keys = _pin_quota_profile_keys(rows)
     if profile_keys is None:
         return None
     out: list[dict] = []
     for profile_key in profile_keys:
         profile_rows = by_profile.get(profile_key, [])
-        profile = profile_key if isinstance(profile_key, str) and profile_key else None
+        profile = profile_key
         pinned_ids = agent_session_pinned_ids(profile=profile)
         if pinned_ids is None:
             return None
@@ -2135,12 +2143,11 @@ def __getattr__(name):
 
 def _reconcile_sidebar_pins_with_state_db(rows: list[dict]) -> None:
     """Adopt state.db's ``pinned`` into every sidebar row that has a state.db row, once per profile."""
-    by_profile: dict[object, list[dict]] = defaultdict(list)
+    by_profile: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         if str(row.get("session_id") or "").strip():
-            by_profile[row.get("profile")].append(row)
-    for profile_key, profile_rows in by_profile.items():
-        profile = profile_key if isinstance(profile_key, str) and profile_key else None
+            by_profile[_pin_profile(row.get("profile"))].append(row)
+    for profile, profile_rows in by_profile.items():
         pending = _migrate_legacy_sidecar_pins(profile_rows, profile)
         if pending is None:
             continue
@@ -2153,7 +2160,7 @@ def _reconcile_sidebar_pins_with_state_db(rows: list[dict]) -> None:
         for row in profile_rows:
             sid = str(row.get("session_id")).strip()
             if sid in flags and sid not in pending:
-                _reconcile_sidebar_pin_with_state_db(row, {"pinned": flags[sid]})
+                _reconcile_sidebar_pin_with_state_db(row, {"pinned": flags[sid]}, profile)
 
 
 _PIN_MIGRATION_MARKER_NAME = "_pin_state_db_migration.json"
@@ -2279,20 +2286,24 @@ def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] 
     return still_pending | uncarried
 
 
-def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict) -> None:
-    """Adopt state.db's pin (the record Desktop and the CLI share) into a sidecar cache row."""
-    remote = meta.get("pinned")
-    if not isinstance(remote, bool):
-        return
-    if remote == bool(row.get("pinned")):
+def _reconcile_sidebar_pin_with_state_db(row: dict, meta: dict, profile="default") -> None:
+    """Adopt state.db's pin (the record Desktop and the CLI share) into a sidecar cache row.
+
+    *meta* is the unlocked batch read; the pin is re-read under the session lock before either
+    copy changes, so a concurrent ``/api/session/pin`` is never overwritten with a stale value.
+    """
+    hint = meta.get("pinned")
+    if not isinstance(hint, bool) or hint == bool(row.get("pinned")):
         return
     sid = str(row.get("session_id") or "")
     if not sid:
         return
-    row["pinned"] = remote
     try:
-        # Under the session lock so a stale object cannot overwrite a concurrent mutation.
         with _get_session_agent_lock(sid):
+            remote = (agent_session_pinned_flags([sid], profile=profile) or {}).get(sid)
+            if not isinstance(remote, bool):
+                return
+            row["pinned"] = remote
             session = get_session(sid)
             session = _ensure_full_session_before_mutation(sid, session)
             if bool(getattr(session, "pinned", False)) != remote:
@@ -15675,7 +15686,7 @@ def _write_pin_to_state_db(s, pinned: bool) -> bool:
     A failed lookup fails closed.
     """
     from api.state_sync import sync_session_pinned, state_db_knows_session
-    profile = getattr(s, "profile", None) or "default"
+    profile = _pin_profile(getattr(s, "profile", None))
     sid = s.session_id
     try:
         known = state_db_knows_session(sid, profile=profile)
@@ -17782,7 +17793,7 @@ def handle_post(handler, parsed) -> bool:
             except KeyError:
                 pass
             reserved_quota = False
-            reservation_key = (getattr(s, "profile", None), s.session_id)
+            reservation_key = (_pin_profile(getattr(s, "profile", None)), s.session_id)
             # The cached sidecar pin may be stale, so every pin request is checked against state.db.
             if pin_requested:
                 # TOCTOU guard (Opus stage-389): count and reserve under one LOCK; all_sessions()

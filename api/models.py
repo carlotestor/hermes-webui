@@ -6513,20 +6513,31 @@ def agent_session_pin_lineage_rows(session_ids, *, profile=None) -> list[dict] |
     def query(cur, cols):
         if "id" not in cols:
             return None
-        source = "child.session_source" if "session_source" in cols else "NULL"
+        def col(name):
+            return f"child.{name}" if name in cols else "NULL"
         parent, join = "NULL", ""
         if {"parent_session_id", "end_reason"} <= cols:
             parent = "parent.id"
             join = (" LEFT JOIN sessions parent ON parent.id = child.parent_session_id"
                     " AND parent.end_reason = 'compression'")
-        sql = f"SELECT child.id, {parent}, {source} FROM sessions child{join} WHERE child.id IN ({{ids}})"
+        sql = (f"SELECT child.id, {parent}, {col('session_source')}, {col('source')}, {col('archived')}"
+               f" FROM sessions child{join} WHERE child.id IN ({{ids}})")
         out = []
-        for sid, parent_id, src in _pin_db_chunks(cur, sql, session_ids):
-            row = {"session_id": str(sid).strip(), "pinned": True}
+        for sid, parent_id, session_source, source, archived in _pin_db_chunks(cur, sql, session_ids):
+            sid = str(sid).strip()
+            # Same visibility fields as the sidebar projection; the WebUI sidecar's archive flag wins.
+            sidecar_archived = _state_projection_sidecar_metadata(sid).get("archived")
+            row = {
+                "session_id": sid,
+                "pinned": True,
+                "archived": bool(archived) if sidecar_archived is None else sidecar_archived,
+            }
             if parent_id:
                 row["parent_session_id"] = str(parent_id).strip()
-            if src:
-                row["session_source"] = str(src)
+            if session_source:
+                row["session_source"] = str(session_source)
+            if source:
+                row["source"] = str(source)
             out.append(row)
         return out
     return _read_pin_db(profile, query, missing=[]) if session_ids else []
