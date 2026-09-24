@@ -200,7 +200,7 @@ def test_message_after_stop_does_not_hide_stop(tmp_path, monkeypatch):
 @requires_agent_modules
 def test_stop_on_wakeup_via_real_cancel_pauses_loop(tmp_path, monkeypatch):
     import queue
-    from api import config, models, routes, streaming
+    from api import config, routes, streaming
     from api.models import Session
     session = Session(session_id="s1", title="loop", messages=[])
     session.save = lambda *a, **kw: None
