@@ -307,14 +307,18 @@ const allMatched = [
 ];
 const part = _partitionSidebarSessionRows(allMatched, null);
 const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw);
+const direct = _attachChildSessionsToSidebarRows([], allMatched.slice(1));
 console.log(JSON.stringify({
   sessionsRaw: part.sessionsRaw.map(s=>s.session_id),
   topLevel: rows.map(r=>r.session_id),
+  directTopLevel: direct.map(r=>r.session_id),
 }));
 """
     out = json.loads(_run_node(source))
-    assert out["sessionsRaw"] == ["orchestrator", "leaf"]
+    # The partition already drops project-inheriting children (#7765); attach must suppress them too.
+    assert out["sessionsRaw"] == []
     assert out["topLevel"] == []
+    assert out["directTopLevel"] == []
 
 
 def test_5305_flagless_subagent_child_still_stacks_under_visible_parent():
