@@ -2201,6 +2201,19 @@ def _update_pending_pins(key: str, *, add=(), remove=()) -> bool:
         return _save_pin_migration_state(state)
 
 
+def _state_db_pin_confirmed(sid: str, profile) -> bool:
+    """Whether state.db's pin of *sid* is authoritative: legacy migration ran and no pin is pending."""
+    from api.state_sync import _resolve_state_db_path
+    db_path = _resolve_state_db_path(_pin_profile(profile))
+    if db_path is None:
+        return True
+    with _PIN_MIGRATION_LOCK:
+        state = _load_pin_migration_state()
+    key = str(db_path)
+    pending = set((state.get("pending_pins") or {}).get(key) or [])
+    return key in set(state.get("migrated_state_dbs") or []) and sid not in pending
+
+
 def _sidecar_pin_intent(sid: str) -> bool | None:
     """The sidecar's current pin; None when it cannot be loaded. Caller holds the session lock."""
     try:

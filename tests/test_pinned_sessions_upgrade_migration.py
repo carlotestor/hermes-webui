@@ -315,3 +315,53 @@ def test_unpin_during_migration_is_not_overwritten(upgrade_env, monkeypatch):
     assert result["r"][0] == 200
     assert env.sidecars == {"a": False}
     assert db_pins(env.db) == {"a": False}
+
+
+def _rotate(env, sidecar_pinned=True):
+    import api.streaming as streaming
+
+    s = types.SimpleNamespace(pinned=sidecar_pinned)
+    streaming._apply_compression_pin_carry(s, "root", "child", "default")
+    env.sidecars["child"] = s.pinned
+    return s.pinned
+
+
+def test_compression_keeps_pin_when_parent_row_is_absent(upgrade_env):
+    env = upgrade_env
+    _make_db(env.db, ["other"])
+    env.sidecars.update({"other": False})
+    _sidebar_build(env)  # migration marked complete; neither root nor child has a row yet
+
+    assert _rotate(env) is True
+    conn = sqlite3.connect(str(env.db))
+    conn.execute("INSERT INTO sessions (id, pinned) VALUES ('child', 0)")
+    conn.commit()
+    conn.close()
+    assert _sidebar_build(env)["child"] is True
+    assert db_pins(env.db)["child"] is True
+
+
+def test_compression_keeps_unmigrated_legacy_pin(upgrade_env):
+    env = upgrade_env
+    # Legacy sidecar pin; the profile's migration has not run, so state.db still holds pinned=0.
+    _make_db(env.db, ["root", "child"])
+    env.sidecars["root"] = True
+
+    assert _rotate(env) is True
+    assert db_pins(env.db) == {"root": False, "child": True}
+    assert _sidebar_build(env) == {"root": True, "child": True}
+    assert db_pins(env.db) == {"root": True, "child": True}
+
+
+def test_compression_honours_a_confirmed_unpin_after_migration(upgrade_env):
+    env = upgrade_env
+    _make_db(env.db, ["root", "child"], pinned=["root"])
+    env.sidecars.update({"root": True, "child": False})
+    _sidebar_build(env)
+    conn = sqlite3.connect(str(env.db))
+    conn.execute("UPDATE sessions SET pinned = 0")  # Desktop unpins after the migration
+    conn.commit()
+    conn.close()
+
+    assert _rotate(env) is False
+    assert db_pins(env.db) == {"root": False, "child": False}
