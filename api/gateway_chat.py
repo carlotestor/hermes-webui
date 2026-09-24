@@ -38,6 +38,7 @@ from api.config import (
 from api.helpers import _redact_text, redact_session_data
 from api.models import clear_process_wakeup_pause, get_session, merge_session_messages_append_only
 from api.run_journal import RunJournalWriter, bound_run_journal_snapshot_args
+from api.turn_journal import append_turn_journal_event_for_stream
 
 logger = logging.getLogger(__name__)
 
@@ -1297,7 +1298,11 @@ def _run_gateway_chat_streaming(
             # role/content ordering instead of turn order.
             assistant_ts = now + 0.000001
             pending_source = getattr(s, "pending_user_source", None) or "webui"
-            from api.streaming import _active_turn_authority, _materialize_active_turn_user
+            from api.streaming import (
+                _active_turn_authority,
+                _active_turn_token_matches,
+                _materialize_active_turn_user,
+            )
 
             active_turn_identity = _active_turn_authority(s, stream_id, msg_text)
             user_msg = _materialize_active_turn_user(
@@ -1358,6 +1363,9 @@ def _run_gateway_chat_streaming(
                     s.context_messages,
                     str(msg_text or ""),
                     source=pending_source,
+                    verification_nudge_provenance={
+                        "active_turn_identity": active_turn_identity,
+                    },
                 )
             except Exception:
                 logger.debug("Failed to merge gateway display transcript", exc_info=True)
@@ -1370,6 +1378,14 @@ def _run_gateway_chat_streaming(
                         if latest_text == msg_norm:
                             display = display[:-1]
                 s.messages = display + [user_msg, assistant_msg]
+            if active_turn_identity.get("token"):
+                current_display_rows = [
+                    message
+                    for message in s.messages
+                    if _active_turn_token_matches(message, active_turn_identity)
+                ]
+                if len(current_display_rows) == 1:
+                    current_display_rows[0]["timestamp"] = user_msg["timestamp"]
             s.active_stream_id = None
             s.pending_user_message = None
             s.pending_attachments = None
@@ -1404,6 +1420,21 @@ def _run_gateway_chat_streaming(
             if cancel_event.is_set():
                 _restore_cancelled_success_writeback()
                 return
+            # #6366 re-gate: record the durable same-stream completion
+            # event in the crash-safe turn journal. The run journal's
+            # terminal state is only reached on its own ``stream_end``
+            # write path, so a Gateway run whose terminal write is lost
+            # would otherwise leave no completion evidence at all and
+            # stale-cancel recovery would re-append a duplicate
+            # recovered row after the valid final answer.
+            try:
+                append_turn_journal_event_for_stream(
+                    session_id,
+                    stream_id,
+                    {"event": "completed", "created_at": time.time()},
+                )
+            except Exception:
+                logger.debug("Failed to append completed turn journal event", exc_info=True)
             success_writeback_committed = True
         try:
             from api.goals import evaluate_goal_after_turn, has_active_goal
