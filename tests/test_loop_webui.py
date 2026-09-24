@@ -13,14 +13,16 @@ def test_webui_loop_matches_cli(tmp_path, monkeypatch):
     monkeypatch.setattr(profiles, "_profiles_root", lambda: tmp_path / "none")
     monkeypatch.setattr(models, "get_session", lambda sid, **kw: NS(profile=None, messages=msgs))
     monkeypatch.setattr(background_process, "_session_has_active_turn", lambda sid: False)
-    monkeypatch.setattr(routes, "start_session_turn", lambda sid, m, source: started.append(m) or {})
+    monkeypatch.setattr(routes, "start_session_turn",
+                        lambda sid, m, source: started.append(m) or {"pending_started_at": float(len(started))})
 
     def tick(reply, max_ticks=100):  # a due tick fires, its turn ends with `reply`, the scheduler judges it
         s = agent.load_loop("s1")
         s.next_due_at, s.max_ticks = 0, max_ticks
         agent.save_loop("s1", s)
         loops.run_due_loops()
-        msgs.extend([{"role": "user", "content": started[-1]}, {"role": "assistant", "content": reply}])
+        msgs.extend([{"role": "user", "content": started[-1], "timestamp": float(len(started))},
+                     {"role": "assistant", "content": reply}])
         loops.run_due_loops()
         return agent.load_loop("s1")
 

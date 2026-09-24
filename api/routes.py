@@ -24569,7 +24569,8 @@ def _handle_goal_command(handler, body):
             or getattr(s, "pending_user_message", None)
         )
         if not has_persisted_turns:
-            s.profile = requested_profile
+            from api.loops import retag_session_profile
+            retag_session_profile(s, requested_profile)
 
     current_stream_id = getattr(s, "active_stream_id", None)
     stream_running = False
@@ -24850,7 +24851,8 @@ def _handle_chat_start(handler, body, diag=None):
             ):
                 # Empty placeholders can still be retagged when the
                 # requested profile matches the active request profile.
-                s.profile = requested_profile
+                from api.loops import retag_session_profile
+                retag_session_profile(s, requested_profile)
             elif session_profile:
                 # #7710: known other profile → 409 ``session_profile_mismatch``
                 # so the client can offer to switch to it (#5419).
