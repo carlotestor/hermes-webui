@@ -4178,7 +4178,7 @@ def _turn_step_tool_call_ids(messages, prev_asst, started_ids):
     reserved = {i for ids in step_ids.values() for i in ids}
     remaining = [i for i in started_ids if i not in reserved]
     if idless and len(idless) == len(remaining):
-        for pos, call_id in zip(idless, remaining):
+        for pos, call_id in zip(idless, remaining, strict=True):
             step_ids[pos].append(call_id)
     return step_ids
 
