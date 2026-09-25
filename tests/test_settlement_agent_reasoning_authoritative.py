@@ -313,3 +313,27 @@ def test_bare_tool_steps_without_ids_follow_live_tool_start_order(cleanup_test_s
          {'role': 'assistant', 'content': 'done', 'reasoning': None}],
     )
     assert _reasonings(saved) == ['think A', None, 'think C', None]
+
+
+def test_mixed_id_and_idless_results_do_not_shift_later_step(cleanup_test_sessions):
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'c1'), ('tool', 'c2'),
+         ('reasoning', 'think B'), ('tool', 'c3'), ('token', 'done')],
+        [_bare_tool_step(), _tool_result('c1'), {'role': 'tool', 'content': 'ok'},
+         _bare_tool_step(), {'role': 'tool', 'content': 'ok'},
+         {'role': 'assistant', 'content': 'done', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == ['think A', 'think B', None]
+
+
+def test_start_without_persisted_result_leaves_idless_steps_unbound(cleanup_test_sessions):
+    # c2 started but its result was never persisted: 3 starts vs 2 ID-less
+    # results can't be matched one-to-one, so no step borrows another's card.
+    saved = _run_turn(
+        [('reasoning', 'think A'), ('tool', 'c1'), ('tool', 'c2'),
+         ('reasoning', 'think B'), ('tool', 'c3'), ('token', 'done')],
+        [_bare_tool_step(), {'role': 'tool', 'content': 'ok'},
+         _bare_tool_step(), {'role': 'tool', 'content': 'ok'},
+         {'role': 'assistant', 'content': 'done', 'reasoning': None}],
+    )
+    assert _reasonings(saved) == [None, None, None]

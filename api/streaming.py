@@ -4151,25 +4151,36 @@ def _split_thinking_from_content(raw_content, existing_reasoning=''):
     )
 
 
-def _step_tool_call_ids(messages, pos, started_ids, claimed):
-    """Tool call IDs of the assistant step at ``messages[pos]``, in order.
+def _turn_step_tool_call_ids(messages, prev_asst, started_ids):
+    """Map this turn's assistant step positions to their tool call IDs, in order.
 
-    From its ``tool_calls``, else its following tool results' IDs, else the
-    next unclaimed live tool starts (one per following tool result).
+    ``prev_asst`` assistant messages belong to prior turns and are skipped.
+
+    IDs come from the step's ``tool_calls``, else its following tool results.
+    Every explicit ID in the turn is reserved first; ID-less results then take
+    the remaining live starts in order, but only when the counts match
+    one-to-one. Otherwise they stay unbound: misattribution is worse than loss.
     """
-    msg = messages[pos]
-    ids = [tc.get('id') for tc in msg.get('tool_calls') or [] if isinstance(tc, dict) and tc.get('id')]
-    if not ids:
-        results = []
-        for m in messages[pos + 1:]:
-            if not (isinstance(m, dict) and m.get('role') == 'tool'):
-                break
-            results.append(m.get('tool_call_id'))
-        ids = [r for r in results if r]
-        if not ids and results:
-            ids = [i for i in started_ids if i not in claimed][:len(results)]
-    claimed.update(ids)
-    return ids
+    step_ids, idless = {}, []
+    positions = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get('role') == 'assistant']
+    for pos in positions[prev_asst:]:
+        msg = messages[pos]
+        ids = [tc.get('id') for tc in msg.get('tool_calls') or [] if isinstance(tc, dict) and tc.get('id')]
+        if not ids:
+            for m in messages[pos + 1:]:
+                if not (isinstance(m, dict) and m.get('role') == 'tool'):
+                    break
+                if m.get('tool_call_id'):
+                    ids.append(m['tool_call_id'])
+                else:
+                    idless.append(pos)
+        step_ids[pos] = ids
+    reserved = {i for ids in step_ids.values() for i in ids}
+    remaining = [i for i in started_ids if i not in reserved]
+    if idless and len(idless) == len(remaining):
+        for pos, call_id in zip(idless, remaining):
+            step_ids[pos].append(call_id)
+    return step_ids
 
 
 def _stream_reasoning_owner(msg, is_last, positional_idx, tool_call_segments, open_segment,
@@ -4227,8 +4238,8 @@ def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
     )
     _total_asst = sum(1 for m in s.messages if isinstance(m, dict) and m.get('role') == 'assistant')
     _asst_count = 0
-    _started_ids = list(tool_call_segments)  # dict order = tool start order
-    _claimed = set()
+    # dict order = tool start order
+    _step_ids = _turn_step_tool_call_ids(s.messages, _prev_asst, list(tool_call_segments))
     _pos = -1
     for _rm in s.messages:
         _pos += 1
@@ -4241,7 +4252,7 @@ def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
         _owner = _stream_reasoning_owner(
             _rm, _asst_count == _total_asst, (_turn_idx - _prev_asst) if _positional else None,
             tool_call_segments, open_segment, interim_segments,
-            _step_tool_call_ids(s.messages, _pos, _started_ids, _claimed),
+            _step_ids[_pos],
         )
         _existing_reasoning = _rm.get('reasoning') or _reasoning_segments.get(_owner, '')
         _content = _rm.get('content')
