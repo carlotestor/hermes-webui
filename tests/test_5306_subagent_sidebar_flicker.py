@@ -532,3 +532,69 @@ console.log(JSON.stringify({{ sessionsRaw: part.sessionsRaw.map(s=>s.session_id)
     out = json.loads(_run_node(source))
     assert out["sessionsRaw"] == ["sub"]  # the child reaches attach; the parent is filtered out
     assert out["topLevel"] == []
+
+
+def _compressed_parent_db(path, newer):
+    """Compressed subagent parent (orch -> orch_tip), a child linked to the OLD segment, `newer` newer rows."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, model TEXT, message_count INTEGER, "
+        "started_at REAL, source TEXT, parent_session_id TEXT, ended_at REAL, end_reason TEXT)"
+    )
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, timestamp REAL)")
+    rows = [
+        ("orch", "Orchestrator", 100.0, "subagent", None, 150.0, "compression"),
+        ("orch_tip", "Orchestrator", 151.0, "subagent", "orch", None, None),
+        # Delegated before the compression: it names the parent's old segment.
+        ("leaf", "Leaf", 120.0, "subagent", "orch", None, None),
+    ]
+    rows += [(f"new{i}", f"Newer {i}", 300.0 + i, "subagent", None, None, None) for i in range(newer)]
+    for sid, title, started, source, parent, ended, reason in rows:
+        conn.execute(
+            "INSERT INTO sessions (id, title, model, message_count, started_at, source, parent_session_id, "
+            "ended_at, end_reason) VALUES (?,?,?,?,?,?,?,?,?)",
+            (sid, title, "gpt", 2, started, source, parent, ended, reason),
+        )
+    ts = {"orch": 110.0, "orch_tip": 160.0, "leaf": 9000.0}
+    ts.update({f"new{i}": 400.0 + i for i in range(newer)})
+    for sid, t in ts.items():
+        conn.execute("INSERT INTO messages (session_id, role, timestamp) VALUES (?,?,?)", (sid, "user", t))
+        conn.execute("INSERT INTO messages (session_id, role, timestamp) VALUES (?,?,?)", (sid, "assistant", t + 0.5))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("newer,nested", [(19, True), (160, False)])
+def test_5305_subagent_of_compressed_parent_stays_reachable_at_default_limit(tmp_path, monkeypatch, newer, nested):
+    """Re-gate: the child links to the parent's pre-compression segment while the sidebar
+    projects the parent under its compression tip. With the default 20-row window and 19
+    newer rows the child must still be reachable (nested under the parent, or an orphan)."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    _compressed_parent_db(db, newer=newer)
+    rows = models._load_cli_sessions_uncached(
+        tmp_path, db, None, visible_session_limit=20, include_claude_code=False
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    models._enrich_sidebar_lineage_metadata(rows)
+    ids = [r["session_id"] for r in rows]
+    assert "leaf" in ids
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global._showArchived = false;
+const raw = {json.dumps(rows, default=str)};
+const rows = _attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(raw), raw);
+const top = rows.map(r=>r.session_id);
+const nested = rows.flatMap(r=>(r._child_sessions||[]).map(c=>[r.session_id, c.session_id]));
+console.log(JSON.stringify({{top, nested}}));
+"""
+    out = json.loads(_run_node(source))
+    reachable = "leaf" in out["top"] or any(c == "leaf" for _, c in out["nested"])
+    assert reachable, out
+    if nested:  # parent inside the oversample: re-added under its tip id, child nests
+        assert out["nested"] == [["orch_tip", "leaf"]], out
+    else:  # parent beyond the limit * 8 oversample: child stays an openable top-level row
+        assert "leaf" in out["top"] and out["nested"] == [], out
