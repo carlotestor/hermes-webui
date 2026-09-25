@@ -10488,19 +10488,164 @@ def _cli_visible_session_cap() -> int:
     return CLI_VISIBLE_SESSION_LIMIT
 
 
-def _cap_recent_cli_sessions(sessions: list[dict], cli_cap: int | None = None) -> list[dict]:
-    """Keep only the most recent CLI-visible sessions after filtering."""
+# Bound on project-assigned CLI rows in the FINAL MERGED payload, across EVERY
+# project. This is the only place that sees every source of assigned rows at
+# once — state.db's own bounded passes plus imported WebUI sidecars from
+# all_sessions(), which no model-side cap applies to — so it is the only place
+# that can actually bound the assigned set (#6659 review finding 1).
+#
+# It has to bound the MERGED set, not one project: 200 rows x N projects grows
+# with the project count, and 1,000 assigned conversations spread over 5 projects
+# still returned all 1,000 — the exact reproduction from that finding. Pinned
+# equal to models.PROJECT_ASSIGNED_CLI_LIMIT (an independent literal on the
+# model side; the test is what keeps the two in lockstep) by
+# test_route_merged_assigned_cap_is_the_existing_model_row_cap.
+CLI_PROJECT_ASSIGNED_CAP = 200
+
+
+def _draw_assigned_cli_rows_fairly(
+    rows_by_project: dict[str, list[int]], budget: int
+) -> set[int]:
+    """Pick ``budget`` assigned row indices, spread fairly across the projects.
+
+    ``rows_by_project`` maps project id -> that project's row indices, newest
+    first, keyed in order of each project's most recent assigned conversation
+    (``sessions`` is newest-first, so insertion order already is that order).
+
+    Each round hands one slot to every project that still has history left, so:
+
+    * the drawn set never exceeds ``budget`` — that is the whole point, a
+      per-project bound does not bound the payload (#6659 review finding 1);
+    * no single busy project can eat every slot, which a flat ``sessions[:200]``
+      truncation would do to whichever project sorts first — the starvation
+      greptile rejected as P1 on #6659;
+    * every project keeps at least one row whenever
+      ``budget >= len(rows_by_project)``. Past that the bound wins: with more
+      assigned projects than slots, the ``budget`` most recently active projects
+      get one row each, because the review's number is the hard constraint.
+
+    Within a project the draw is newest-first, so what a chip loses is always the
+    oldest end of its own history.
+    """
+    drawn: set[int] = set()
+    if budget <= 0 or not rows_by_project:
+        return drawn
+    queues = list(rows_by_project.values())
+    offsets = [0] * len(queues)
+    remaining = budget
+    while remaining > 0:
+        progressed = False
+        for position, project_rows in enumerate(queues):
+            offset = offsets[position]
+            if offset >= len(project_rows):
+                continue
+            drawn.add(project_rows[offset])
+            offsets[position] = offset + 1
+            remaining -= 1
+            progressed = True
+            if remaining <= 0:
+                break
+        if not progressed:
+            # Every project is exhausted — the whole assigned set fits.
+            break
+    return drawn
+
+
+def _cap_recent_cli_sessions(
+    sessions: list[dict],
+    cli_cap: int | None = None,
+    project_cap: int = CLI_PROJECT_ASSIGNED_CAP,
+) -> list[dict]:
+    """Cap the default CLI list while retaining project-addressable rows.
+
+    ``sessions`` is newest-first and already deduplicated (WebUI sidecars merged,
+    lineages collapsed, messaging sources folded), so every row counted here is
+    one logical conversation.
+
+    Two independent budgets, because they answer to different users (#6659):
+
+    * ``cli_cap`` unassigned conversations own the default sidebar window. An
+      assigned row must not spend one of those slots, or assigning three sessions
+      to a project silently shortens everyone's sidebar to 17 rows. Resolved
+      lazily from the shared configurable window (HERMES_WEBUI_VISIBLE_SESSION_LIMIT),
+      never a second hard-coded 20.
+    * ``project_cap`` assigned conversations IN TOTAL, across every project, stay
+      in the payload so the project chips can reveal them, marked
+      ``default_hidden`` once the recent window is full. Past that bound they are
+      dropped: keeping assigned rows past the *recent* cap is the fix, keeping
+      them past *all* bounds just trades a vanishing session for a stalled
+      sidebar.
+
+    That assigned budget is spent by a fair round-robin draw across the projects
+    (see ``_draw_assigned_cli_rows_fairly``) instead of by truncating the merged
+    list, so bounding the payload cannot starve a quiet project (greptile P1 on
+    #6659). ``project_cap <= 0`` disables the assigned bound entirely.
+    """
     if cli_cap is None:
         cli_cap = _cli_visible_session_cap()
     if cli_cap <= 0:
         return sessions
-    kept = []
-    cli_seen = 0
-    for session in sessions:
-        if _is_cli_session_for_settings(session):
-            cli_seen += 1
-            if cli_seen > cli_cap:
+    # Group the assigned rows per project first: the draw has to weigh the
+    # projects against each other, which a single forward pass cannot do.
+    rows_by_project: dict[str, list[int]] = {}
+    for index, session in enumerate(sessions):
+        if not _is_cli_session_for_settings(session):
+            continue
+        project_id = str(session.get("project_id") or "").strip()
+        if project_id:
+            rows_by_project.setdefault(project_id, []).append(index)
+    if project_cap > 0 and rows_by_project:
+        # Reserve the CLI rows the recent window already shows — the first
+        # ``cli_cap`` CLI rows in sort order, assigned or not — before the fair
+        # draw spreads the REST of the assigned budget across projects. Without
+        # this, a project holding all the newest sessions can lose its newest
+        # rows in the draw and the payload drops sessions the base displays
+        # (2026-09-24 re-gate reproduction: 11 projects x 20 sessions, all 20
+        # newest in one project, ``p0-19`` vanished from the payload).
+        reserved: set[int] = set()
+        seen_cli = 0
+        for index, session in enumerate(sessions):
+            if not _is_cli_session_for_settings(session):
                 continue
+            if seen_cli >= cli_cap:
+                break
+            seen_cli += 1
+            reserved.add(index)
+        # The reserved rows have already been paid for by the recent window;
+        # draw the remaining budget over the queues MINUS those rows, so the
+        # reservation cannot double-spend slots the draw would have granted.
+        remaining_rows_by_project: dict[str, list[int]] = {
+            project: [index for index in indices if index not in reserved]
+            for project, indices in rows_by_project.items()
+        }
+        assigned_reserved = sum(
+            1 for index in reserved
+            if str(sessions[index].get("project_id") or "").strip()
+        )
+        drawn = reserved | _draw_assigned_cli_rows_fairly(
+            remaining_rows_by_project, max(project_cap - assigned_reserved, 0)
+        )
+    else:
+        drawn = None if project_cap <= 0 else set()
+    kept = []
+    recent_seen = 0
+    unassigned_seen = 0
+    for index, session in enumerate(sessions):
+        if _is_cli_session_for_settings(session):
+            project_id = str(session.get("project_id") or "").strip()
+            if not project_id:
+                unassigned_seen += 1
+                if unassigned_seen > cli_cap:
+                    continue
+                recent_seen += 1
+            else:
+                if drawn is not None and index not in drawn:
+                    continue
+                if recent_seen >= cli_cap:
+                    session = dict(session)
+                    session["default_hidden"] = True
+                else:
+                    recent_seen += 1
         kept.append(session)
     return kept
 
@@ -14650,13 +14795,22 @@ def handle_get(handler, parsed) -> bool:
         if not sid:
             return bad(handler, "session_id required")
         try:
-            s = get_session(sid)
+            workspace = get_session(sid).workspace
         except KeyError:
-            return bad(handler, "Session not found", 404)
+            # state.db-only sessions (CLI, delegated subagents): same fallback as /api/list.
+            cli_meta = _lookup_cli_session_metadata(sid)
+            if not cli_meta:
+                return bad(handler, "Session not found", 404)
+            if not cli_meta.get("workspace"):
+                return j(handler, {"git": None})
+            try:
+                workspace = resolve_trusted_workspace(cli_meta["workspace"])
+            except (FileNotFoundError, ValueError):
+                return j(handler, {"git": None})
         from api.workspace_git import GitWorkspaceError, git_status
 
         try:
-            status = git_status(Path(s.workspace))
+            status = git_status(Path(workspace))
         except GitWorkspaceError as e:
             return _git_bad(handler, e)
         totals = status.get("totals") or {}
@@ -17155,8 +17309,9 @@ def handle_post(handler, parsed) -> bool:
             # Invalidate the models cache so the very next /api/models request
             # rebuilds from the new profile's config.yaml rather than returning
             # the old profile's cached model list (#1200 — profile-switch model bug).
+            # The per-profile disk snapshot is fingerprint-guarded, so keep it.
             from api.config import invalidate_models_cache
-            invalidate_models_cache()
+            invalidate_models_cache(delete_disk=False)
             try:
                 from api.gateway_watcher import restart_watcher_for_profile
                 restart_watcher_for_profile(name)
@@ -26943,8 +27098,8 @@ def _relay_gateway_run_approval(
     Both the approval-card endpoint and the ordinary session-YOLO endpoint use
     this chokepoint so one tab cannot retire another tab's parked remote run.
     """
-    from api.config import gateway_supports_approval_identity_v1, get_config as _get_config
-    from api.gateway_chat import _gateway_api_key, _gateway_base_url
+    from api.config import gateway_supports_approval_identity_v1
+    from api.gateway_chat import gateway_run_endpoint
     from api.runner_client import HttpRunnerClient, RunnerClientError
 
     run_id = str(mirror.get("run_id") or "").strip()
@@ -26986,8 +27141,7 @@ def _relay_gateway_run_approval(
                 enable_yolo=enable_yolo,
             )
 
-        base_url = _gateway_base_url(_get_config())
-        api_key = _gateway_api_key()
+        base_url, api_key = gateway_run_endpoint(run_id)
         identity_v1 = bool(current_mirror.get(_GATEWAY_AGENT_IDENTITY_V1)) and (
             gateway_supports_approval_identity_v1(base_url, api_key)
         )
