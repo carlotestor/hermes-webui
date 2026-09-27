@@ -500,7 +500,7 @@ for (const tab of ['webui', 'cli']) {{
   global._sessionSourceFilter = tab;
   const part = _partitionSidebarSessionRows(allMatched, null);
   const ref = tab === 'cli' ? part.cliReferenceRaw : part.webuiReferenceRaw;
-  const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, ref);
+  const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, ref, part.rowsById);
   out[tab] = rows.map(r=>({{sid:r.session_id, orphan:!!r._orphan_child_session, kids:(r._child_sessions||[]).map(c=>c.session_id)}}));
 }}
 console.log(JSON.stringify(out));
@@ -508,6 +508,63 @@ console.log(JSON.stringify(out));
     out = json.loads(_run_node(source))
     assert out["webui"] == [{"sid": "sub", "orphan": True, "kids": []}]
     assert out["cli"] == [{"sid": "cli_parent", "orphan": False, "kids": []}]
+
+
+@pytest.mark.parametrize("parent", [
+    # A claimed Desktop sidecar keeps is_cli_session:true with a non-literal raw source.
+    {"raw_source": "desktop", "session_source": "other", "is_cli_session": True},
+    # A Claude Code import is CLI-bucketed through session_source, not the raw source.
+    {"raw_source": "claude_code", "session_source": "external_agent", "is_cli_session": True},
+])
+def test_5305_subagent_of_cli_bucket_parent_with_non_literal_source_stays_reachable(parent):
+    """The partition files the parent in the CLI bucket via its normalized row metadata
+    (is_cli_session / session_source), so the attach step must classify the SAME row, not a
+    synthetic ``{raw_source: parent_source}``; otherwise the child is suppressed in the WebUI
+    tab and absent from the CLI tab, i.e. unreachable."""
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global._activeProject = null;
+global._showArchived = false;
+global.window = {{ _showCliSessions: true }};
+const parentMeta = {json.dumps(parent)};
+const allMatched = [
+  {{ session_id:'p', title:'Parent', source_tag:parentMeta.raw_source, profile:'a', message_count:5, updated_at:100, last_message_at:100, ...parentMeta }},
+  {{ session_id:'sub', title:'Subagent Session', parent_session_id:'p', relationship_type:'child_session', parent_source:parentMeta.raw_source, raw_source:'subagent', source_tag:'subagent', session_source:'other', profile:'a', message_count:3, updated_at:101, last_message_at:101 }},
+];
+const out = {{}};
+for (const tab of ['webui', 'cli']) {{
+  global._sessionSourceFilter = tab;
+  const part = _partitionSidebarSessionRows(allMatched, null);
+  const ref = tab === 'cli' ? part.cliReferenceRaw : part.webuiReferenceRaw;
+  const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, ref, part.rowsById);
+  out[tab] = rows.map(r=>({{sid:r.session_id, orphan:!!r._orphan_child_session, kids:(r._child_sessions||[]).map(c=>c.session_id)}}));
+}}
+console.log(JSON.stringify(out));
+"""
+    out = json.loads(_run_node(source))
+    assert out["cli"] == [{"sid": "p", "orphan": False, "kids": []}]
+    assert out["webui"] == [{"sid": "sub", "orphan": True, "kids": []}]
+
+
+def test_5305_flagless_subagent_of_zero_message_webui_parent_in_payload_is_suppressed():
+    """The parent's real payload row decides: a WebUI parent that is in the payload but not
+    rendered (no visible messages) shares the child's bucket, so the child follows it."""
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + """
+global._activeProject = null;
+global._showArchived = false;
+global._sessionSourceFilter = 'webui';
+const allMatched = [
+  { session_id:'p', title:'Parent', session_source:'webui', raw_source:'webui', source_tag:'webui', message_count:0, updated_at:100 },
+  { session_id:'sub', title:'Subagent Session', parent_session_id:'p', relationship_type:'child_session', parent_source:'webui', raw_source:'subagent', source_tag:'subagent', session_source:'other', message_count:3, updated_at:101, last_message_at:101 },
+];
+const part = _partitionSidebarSessionRows(allMatched, null);
+const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw, part.rowsById);
+console.log(JSON.stringify({ sessionsRaw: part.sessionsRaw.map(s=>s.session_id), topLevel: rows.map(r=>r.session_id) }));
+"""
+    out = json.loads(_run_node(source))
+    assert out["sessionsRaw"] == ["sub"]
+    assert out["topLevel"] == []
 
 
 @pytest.mark.parametrize("parent_source", ["cron", "webhook", "kanban", "tool", "api_server", "telegram"])
@@ -526,7 +583,7 @@ const allMatched = [
   {{ session_id:'sub', title:'Subagent Session', parent_session_id:'p', relationship_type:'child_session', parent_source:'{parent_source}', raw_source:'subagent', source_tag:'subagent', session_source:'other', message_count:3, updated_at:101, last_message_at:101 }},
 ];
 const part = _partitionSidebarSessionRows(allMatched, null);
-const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw);
+const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw, part.rowsById);
 console.log(JSON.stringify({{ sessionsRaw: part.sessionsRaw.map(s=>s.session_id), topLevel: rows.map(r=>r.session_id) }}));
 """
     out = json.loads(_run_node(source))
