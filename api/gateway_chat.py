@@ -505,6 +505,14 @@ def _gateway_reasoning_delta(payload: dict) -> str:
     return ""
 
 
+# Primary argument each tool's gateway preview is built from (hermes-agent agent/display.py).
+_GATEWAY_PREVIEW_ARG_KEYS = {
+    "terminal": "command", "execute_code": "code", "web_search": "query", "web_extract": "urls",
+    "search_files": "pattern", "browser_navigate": "url", "image_generate": "prompt",
+    "vision_analyze": "question", "delegate_task": "goal", "clarify": "question",
+}
+
+
 def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
     """Translate Hermes Gateway tool-progress SSE payloads to WebUI events."""
     if not isinstance(payload, dict):
@@ -528,15 +536,24 @@ def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
     status = str(payload.get("status") or "running").strip().lower()
     tid = payload.get("toolCallId") or payload.get("tool_call_id") or payload.get("id")
     is_complete = event_type == "tool.completed" or status in {"completed", "complete", "success", "error", "failed"}
+    preview = payload.get("label") or payload.get("preview")
+    args = payload.get("args")
+    if isinstance(args, dict) and args:
+        args = bound_run_journal_snapshot_args(args)
+    elif not is_complete and isinstance(preview, str) and preview.strip() and name in _GATEWAY_PREVIEW_ARG_KEYS:
+        # Runs API tool.started carries only the preview of the primary argument.
+        args = {_GATEWAY_PREVIEW_ARG_KEYS[name]: preview}
+    else:
+        args = None
     event_payload = {
         "event_type": "tool.completed" if is_complete else "tool.started",
         "name": name,
-        "preview": payload.get("label") or payload.get("preview"),
-        "args": bound_run_journal_snapshot_args(payload.get("args"))
-        if isinstance(payload.get("args"), dict)
-        else {},
+        "preview": preview,
         "is_error": bool(payload.get("error")) or status in {"error", "failed"},
     }
+    # Omitted on completion so the frontend keeps the args captured at start.
+    if args is not None or not is_complete:
+        event_payload["args"] = args or {}
     if tid:
         event_payload["tid"] = str(tid)
     return ("tool_complete" if is_complete else "tool"), event_payload

@@ -118,7 +118,7 @@ def test_gateway_tool_progress_event_translates_gateway_lifecycle_payloads():
             "event_type": "tool.started",
             "name": "terminal",
             "preview": "terminal: pytest",
-            "args": {},
+            "args": {"command": "terminal: pytest"},
             "is_error": False,
             "tid": "call-1",
         },
@@ -131,7 +131,6 @@ def test_gateway_tool_progress_event_translates_gateway_lifecycle_payloads():
             "event_type": "tool.completed",
             "name": "terminal",
             "preview": None,
-            "args": {},
             "is_error": False,
             "tid": "call-1",
         },
@@ -153,6 +152,22 @@ def test_gateway_tool_progress_event_translates_gateway_lifecycle_payloads():
         },
     )
     assert _gateway_tool_progress_event({"tool": "_thinking", "status": "running"}) is None
+
+
+def test_gateway_tool_started_preview_only_payload_keeps_command_args():
+    # Runs API tool.started wire shape: {"tool", "preview"} with no args.
+    _, started = _gateway_tool_progress_event(
+        {"event": "tool.started", "tool": "terminal", "preview": "git status"}
+    )
+    assert started["args"] == {"command": "git status"}
+    _, other = _gateway_tool_progress_event(
+        {"event": "tool.started", "tool": "my_plugin_tool", "preview": "x"}
+    )
+    assert other["args"] == {}
+    _, completed = _gateway_tool_progress_event(
+        {"event": "tool.completed", "tool": "terminal", "preview": "output text", "duration": 0.1}
+    )
+    assert "args" not in completed
 
 
 def test_gateway_tool_progress_event_bounds_pathological_args():
@@ -381,7 +396,7 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
         "event_type": "tool.started",
         "name": "terminal",
         "preview": "terminal: pytest",
-        "args": {},
+        "args": {"command": "terminal: pytest"},
         "is_error": False,
         "tid": "call-1",
     }) in event_pairs
@@ -391,7 +406,6 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
         "event_type": "tool.completed",
         "name": "terminal",
         "preview": None,
-        "args": {},
         "is_error": False,
         "tid": "call-1",
     }) in event_pairs
@@ -720,7 +734,7 @@ def test_gateway_chat_worker_persists_reasoning_and_tool_state_on_terminal_error
     assert partial_message["reasoning"] == "Preview reasoning"
     assert partial_message["_partial_tool_calls"] == [{
         "name": "terminal",
-        "args": {},
+        "args": {"command": "terminal: pytest"},
         "done": True,
         "tid": "call-1",
         "_sealed_by_terminal_error": True,
