@@ -1004,9 +1004,10 @@ def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
         return _gateway_base_url(cfg, {**process_env, **profile_env}), _gateway_api_key({**process_env, **profile_env})
     if profile_env.get(_WEBUI_GATEWAY_BASE_URL_ENV) or cfg.get("webui_gateway_base_url"):
         return _gateway_base_url(cfg, profile_env), _gateway_api_key({**process_env, **profile_env})
-    # No profile-owned URL: the shared listener serves this profile only under /p/<name>, with its own key.
-    root_cfg = get_config_for_profile_home(_profiles.get_hermes_home_for_profile("default"))
-    shared_url = _gateway_base_url(root_cfg, process_env)
+    # No profile-owned URL: the shared listener (root .env/config) serves this profile under /p/<name>, with its own key.
+    root_home = _profiles.get_hermes_home_for_profile("default")
+    root_env = _profiles.filter_runtime_env_for_gateway_parity(_profiles.get_profile_runtime_env(root_home))
+    shared_url = _gateway_base_url(get_config_for_profile_home(root_home), {**process_env, **root_env})
     return f"{shared_url}/p/{urllib.parse.quote(name, safe='')}", _gateway_api_key(profile_env)
 
 

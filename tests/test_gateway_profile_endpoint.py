@@ -40,6 +40,16 @@ def test_named_profile_without_key_never_borrows_the_root_key(homes):
     assert gateway_chat._gateway_endpoint_for_profile("work") == (f"{SHARED}/p/work", "")
 
 
+def test_shared_url_loaded_from_root_env_reaches_named_profile(homes, monkeypatch):
+    root, work = homes
+    (root / ".env").write_text("HERMES_WEBUI_GATEWAY_BASE_URL=http://shared-gw:7000\nAPI_SERVER_KEY=root-key-0123456789\n")
+    (work / ".env").write_text("API_SERVER_KEY=work-key-0123456789\n")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://shared-gw:7000")
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {"HERMES_WEBUI_GATEWAY_BASE_URL", "API_SERVER_KEY"})
+
+    assert gateway_chat._gateway_endpoint_for_profile("work") == ("http://shared-gw:7000/p/work", "work-key-0123456789")
+
+
 @pytest.mark.parametrize("source", ["env", "config"])
 def test_named_profile_with_own_url_is_used_verbatim(homes, source):
     _, work = homes
