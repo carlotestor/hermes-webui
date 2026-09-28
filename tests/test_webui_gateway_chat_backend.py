@@ -170,6 +170,21 @@ def test_gateway_tool_started_preview_only_payload_keeps_command_args():
     assert "args" not in completed
 
 
+def test_gateway_tool_started_preview_only_payload_bounds_huge_preview():
+    huge = "echo " + "x" * (4 * 1024 * 1024)
+    _, started = _gateway_tool_progress_event(
+        {"event": "tool.started", "tool": "terminal", "preview": huge}
+    )
+    command = started["args"]["command"]
+    assert isinstance(command, str) and command.startswith("echo ")
+    assert len(command) < len(huge)
+    assert len(json.dumps(started["args"], sort_keys=True)) < 100_000
+    _, completed = _gateway_tool_progress_event(
+        {"event": "tool.completed", "tool": "terminal", "preview": huge}
+    )
+    assert "args" not in completed
+
+
 def test_gateway_tool_progress_event_bounds_pathological_args():
     long_command = "python -c " + repr("print('x')\n" * 24)
     event_name, event_payload = _gateway_tool_progress_event(

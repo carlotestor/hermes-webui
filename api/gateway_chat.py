@@ -542,7 +542,7 @@ def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
         args = bound_run_journal_snapshot_args(args)
     elif not is_complete and isinstance(preview, str) and preview.strip() and name in _GATEWAY_PREVIEW_ARG_KEYS:
         # Runs API tool.started carries only the preview of the primary argument.
-        args = {_GATEWAY_PREVIEW_ARG_KEYS[name]: preview}
+        args = bound_run_journal_snapshot_args({_GATEWAY_PREVIEW_ARG_KEYS[name]: preview})
     else:
         args = None
     event_payload = {
