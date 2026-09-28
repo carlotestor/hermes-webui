@@ -43,6 +43,8 @@ global._toolActionKind = (tc) => 'shell';
 eval(grab('_redactToolTargetLabel'));   // REAL redactor
 eval(grab('_toolTargetLabel'));
 eval(grab('_toolFullCommandLabel'));
+eval(grab('_toolCommandIsPreviewOnly'));
+eval(grab('_toolDetailLeadLabel'));
 eval(grab('_toolDetailLeadText'));
 let buf = '';
 process.stdin.on('data', c => { buf += c; });
@@ -52,6 +54,7 @@ process.stdin.on('end', () => {
   process.stdout.write(JSON.stringify({
     header: _toolTargetLabel(tc),
     lead: _toolDetailLeadText('shell', tc),
+    label: _toolDetailLeadLabel('shell', tc),
   }));
 });
 """
@@ -171,3 +174,17 @@ def test_benign_assignment_not_over_redacted(driver_path):
     out = _run(driver_path, {"args": {"command": "export PATH=/usr/bin:/bin\necho ok"}})
     assert "/usr/bin:/bin" in out["lead"]
     assert "echo ok" in out["lead"]
+
+
+def test_gateway_preview_only_command_is_labelled_as_preview(driver_path):
+    # Gateway runs send only the producer's summarized preview (display_command).
+    out = _run(driver_path, {"name": "terminal", "args": {}, "display_command": "npm ci + 1 command"})
+    assert out["label"] == "Command preview"
+    assert out["lead"] == "npm ci + 1 command"
+    assert not out["lead"].startswith("$ ")
+
+
+def test_real_command_keeps_shell_label_over_display_command(driver_path):
+    out = _run(driver_path, {"args": {"command": "git status"}, "display_command": "git status"})
+    assert out["label"] == "Shell"
+    assert out["lead"] == "$ git status"

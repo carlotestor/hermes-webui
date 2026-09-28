@@ -19571,8 +19571,13 @@ function _toolCardAllowsDetail(kind, tc){
   if(infoKinds[kind]&&!(tc&&tc.is_error)) return false;
   return true;
 }
-function _toolDetailLeadLabel(kind){
-  if(kind==='shell') return 'Shell';
+function _toolCommandIsPreviewOnly(tc){
+  // Gateway runs send only a summarized display_command, not the executed command.
+  const a=tc&&tc.args||{};
+  return !!(tc&&tc.display_command)&&!(a.cmd||a.command||tc.command||tc.raw_command||tc.original_command);
+}
+function _toolDetailLeadLabel(kind, tc){
+  if(kind==='shell') return _toolCommandIsPreviewOnly(tc)?'Command preview':'Shell';
   if(kind==='write') return 'Target';
   return 'Input';
 }
@@ -19583,6 +19588,7 @@ function _toolDetailLeadText(kind, tc){
     // first line (#4926). Fall back to the first-line target if full is empty.
     const full=_toolFullCommandLabel(tc);
     const cmd=full||target;
+    if(cmd&&_toolCommandIsPreviewOnly(tc)) return cmd;
     return cmd?`$ ${cmd}`:'';
   }
   if(!target) return '';
@@ -19601,7 +19607,7 @@ function buildToolCard(tc){
   const disclosureKey=typeof _toolDisclosureIdentity==='function'?_toolDisclosureIdentity(tc):'';
   if(disclosureKey) row.setAttribute('data-tool-disclosure-key', disclosureKey);
   const icon=toolIcon(tc.name);
-  const hasRawDetail=!!(tc.snippet)||(tc.args&&Object.keys(tc.args).length>0);
+  const hasRawDetail=!!(tc.snippet)||!!(tc.display_command)||(tc.args&&Object.keys(tc.args).length>0);
   const allowsDetail=typeof _toolCardAllowsDetail==='function'?_toolCardAllowsDetail(toolKind,tc):true;
   const hasDetail=hasRawDetail&&allowsDetail;
   let displaySnippet='';
@@ -19631,7 +19637,7 @@ function buildToolCard(tc){
   if(toolKind==='shell'||previewText===argPreview||previewText==='Completed'||previewText==='Running'||previewText==='Failed') previewText='';
   if(isSubagent) previewText=previewText.replace(/^(?:\u{1F500}|↳)\s*/u,'');
   const detailLeadText=hasDetail&&typeof _toolDetailLeadText==='function'?_toolDetailLeadText(toolKind,tc):'';
-  const detailLeadLabel=typeof _toolDetailLeadLabel==='function'?_toolDetailLeadLabel(toolKind):(toolKind==='shell'?'Shell':'Input');
+  const detailLeadLabel=typeof _toolDetailLeadLabel==='function'?_toolDetailLeadLabel(toolKind,tc):(toolKind==='shell'?'Shell':'Input');
   const detailLead=detailLeadText?`<div class="tool-card-detail-lead"><div class="tool-card-detail-lead-label">${esc(detailLeadLabel)}</div><pre>${esc(detailLeadText)}</pre></div>`:'';
   const argsEntries=tc.args&&Object.keys(tc.args).length?Object.entries(tc.args):[];
   const visibleArgs=(detailLeadText&&toolKind==='shell')?[]:argsEntries;

@@ -505,12 +505,9 @@ def _gateway_reasoning_delta(payload: dict) -> str:
     return ""
 
 
-# Primary argument each tool's gateway preview is built from (hermes-agent agent/display.py).
-_GATEWAY_PREVIEW_ARG_KEYS = {
-    "terminal": "command", "execute_code": "code", "web_search": "query", "web_extract": "urls",
-    "search_files": "pattern", "browser_navigate": "url", "image_generate": "prompt",
-    "vision_analyze": "question", "delegate_task": "goal", "clarify": "question",
-}
+# Shell tools whose runs-API preview is a display summary of the command (agent/display.py
+# summarize_shell_command). It is shown as display_command, never written back into args.
+_GATEWAY_SHELL_PREVIEW_TOOLS = frozenset({"terminal", "execute_code"})
 
 
 def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
@@ -538,13 +535,7 @@ def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
     is_complete = event_type == "tool.completed" or status in {"completed", "complete", "success", "error", "failed"}
     preview = payload.get("label") or payload.get("preview")
     args = payload.get("args")
-    if isinstance(args, dict) and args:
-        args = bound_run_journal_snapshot_args(args)
-    elif not is_complete and isinstance(preview, str) and preview.strip() and name in _GATEWAY_PREVIEW_ARG_KEYS:
-        # Runs API tool.started carries only the preview of the primary argument.
-        args = bound_run_journal_snapshot_args({_GATEWAY_PREVIEW_ARG_KEYS[name]: preview})
-    else:
-        args = None
+    args = bound_run_journal_snapshot_args(args) if isinstance(args, dict) and args else None
     event_payload = {
         "event_type": "tool.completed" if is_complete else "tool.started",
         "name": name,
@@ -554,6 +545,12 @@ def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
     # Omitted on completion so the frontend keeps the args captured at start.
     if args is not None or not is_complete:
         event_payload["args"] = args or {}
+    if (
+        not is_complete and args is None and name in _GATEWAY_SHELL_PREVIEW_TOOLS
+        and isinstance(preview, str) and preview.strip()
+    ):
+        # Runs API tool.started carries only {tool, preview}; keep it labelled as a preview.
+        event_payload["display_command"] = bound_run_journal_snapshot_args({"c": preview})["c"]
     if tid:
         event_payload["tid"] = str(tid)
     return ("tool_complete" if is_complete else "tool"), event_payload
@@ -771,6 +768,7 @@ def _run_gateway_runs_api_streaming(
                             STREAM_LIVE_TOOL_CALLS[stream_id].append({
                                 "name": event_payload.get("name"),
                                 "args": event_payload.get("args") or {},
+                                **({"display_command": event_payload["display_command"]} if event_payload.get("display_command") else {}),
                                 "done": False,
                                 **({"tid": event_payload.get("tid")} if event_payload.get("tid") else {}),
                             })
@@ -1487,6 +1485,7 @@ def _run_gateway_chat_streaming(
                                     STREAM_LIVE_TOOL_CALLS[stream_id].append({
                                         "name": event_payload.get("name"),
                                         "args": event_payload.get("args") or {},
+                                        **({"display_command": event_payload["display_command"]} if event_payload.get("display_command") else {}),
                                         "done": False,
                                         **({"tid": event_payload.get("tid")} if event_payload.get("tid") else {}),
                                     })
