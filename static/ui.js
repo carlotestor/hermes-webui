@@ -11932,6 +11932,18 @@ function _worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, visi
   const visibleTexts=Array.isArray(turnVisibleContents)?turnVisibleContents:[];
   return _stripVisibleAssistantEchoFromThinking(thinkingText, visibleContent, turnFinalVisibleContent, ...visibleTexts);
 }
+// A transcript read without a live stream (e.g. a still-running delegated subagent
+// loaded from state.db) whose last turn ends in tool activity has no answer yet;
+// collapsing its worklog would leave only an empty "Processed" chip.
+function _settledTurnAwaitingAnswer(inner, anchorTurn){
+  if(!inner||!anchorTurn||S.busy) return false;
+  const turns=inner.querySelectorAll('.assistant-turn');
+  if(!turns.length||turns[turns.length-1]!==anchorTurn) return false;
+  const last=(S.messages||[])[(S.messages||[]).length-1];
+  if(!last) return false;
+  if(last.role==='tool') return true;
+  return last.role==='assistant'&&Array.isArray(last.tool_calls)&&last.tool_calls.length>0;
+}
 function _worklogDetailsExpandedDefault(){
   return window._worklogDetailsExpandedByDefault===true;
 }
@@ -18570,7 +18582,7 @@ function renderMessages(options){
           if(includeTurnDuration) durationAssignedTurns.add(anchorTurn);
           const activityKey=`assistant:${aIdx}`;
           const group=ensureActivityGroup(anchorParent,{
-            collapsed:true,
+            collapsed:!_settledTurnAwaitingAnswer(inner,anchorTurn),
             anchor:anchorRow,
             beforeAnchor:!!thinkingText&&!anchorIsWorklogSource,
             syncAnchorReason:anchorIsWorklogSource,

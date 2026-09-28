@@ -420,6 +420,7 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
     # evaluated with it. The shim's createElement() returns no template `content`, so the
     # helper takes its insertAdjacentHTML fallback here, exactly as before.
     insert_block_source = _function_source(_ui_js(), "_insertSegmentBlock")
+    awaiting_answer_source = _function_source(_ui_js(), "_settledTurnAwaitingAnswer")
     script = textwrap.dedent(
         f"""
         class FakeClassList {{
@@ -708,6 +709,7 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
         eval({json.dumps(transparent_source)});
         eval({json.dumps(legacy_metadata_source)});
         eval({json.dumps(insert_block_source)});
+        eval({json.dumps(awaiting_answer_source)});
         eval({json.dumps(render_source)});
 
         const toolResult = {{ role: 'tool', tool_call_id: 'toolu_1', content: 'tool result' }};
