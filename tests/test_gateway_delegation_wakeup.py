@@ -20,6 +20,8 @@ def _deliver(db, sid, deleg_id):
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    if not gdw._claim_api_available():
+        pytest.skip("Hermes Agent without the delivery claim/release API")
     home = tmp_path / "home"
     sessions = tmp_path / "sessions"
     home.mkdir(); sessions.mkdir()
@@ -38,7 +40,6 @@ def env(tmp_path, monkeypatch):
         return {"_status": status["v"], "stream_id": "s"}
 
     monkeypatch.setattr("api.routes.start_session_turn", fake_start)
-    gdw._RETRY.clear()
     yield db, calls, status
     db.close()
 
@@ -64,7 +65,7 @@ def test_busy_session_leaves_row_unclaimed(env, monkeypatch):
     assert gdw.poll_once(time.time() - 60) == 1
 
 
-def test_start_race_409_is_retried(env):
+def test_start_race_409_releases_rows_for_the_next_poll(env):
     db, calls, status = env
     _deliver(db, "sid1", "deleg_c")
     status["v"] = 409
@@ -72,6 +73,35 @@ def test_start_race_409_is_retried(env):
     status["v"] = 200
     assert gdw.poll_once(time.time() - 60) == 1
     assert "deleg_c" in calls[-1][1]
+
+
+def test_failed_start_leaves_row_unconsumed(env, monkeypatch):
+    db, calls, _ = env
+    _deliver(db, "sid1", "deleg_e")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("gateway unreachable")
+
+    monkeypatch.setattr("api.routes.start_session_turn", boom)
+    assert gdw.poll_once(time.time() - 60) == 0
+    # A restart now loses nothing: the row is still claimable by the Gateway's next-run fold.
+    rows = db.claim_caller_history_deliveries("sid1")
+    assert [r["display_metadata"]["delegation_id"] for r in rows] == ["deleg_e"]
+
+
+def test_sidecar_of_another_profile_is_not_woken(env, tmp_path):
+    db, calls, _ = env
+    (tmp_path / "sessions" / "sid1.json").write_text(json.dumps({"session_id": "sid1", "profile": "work"}))
+    _deliver(db, "sid1", "deleg_f")
+    assert gdw.poll_once(time.time() - 60) == 0
+    assert calls == []
+    assert len(db.claim_caller_history_deliveries("sid1")) == 1
+
+
+def test_poller_inert_without_agent_claim_api(monkeypatch):
+    monkeypatch.setattr("api.gateway_chat.webui_gateway_chat_enabled", lambda _cfg: True)
+    monkeypatch.setattr(hermes_state.SessionDB, "release_caller_history_deliveries", None, raising=False)
+    assert gdw.start_gateway_delegation_poller() is False
 
 
 def test_non_webui_session_is_ignored(env):

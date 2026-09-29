@@ -11,7 +11,10 @@ parent agent only sees the result when the user next types.
 
 This poller claims those rows with the Agent's own exactly-once primitive
 (``SessionDB.claim_caller_history_deliveries``, the same claim the Gateway's
-next run uses to fold them) and starts a wakeup turn for idle sessions.
+next run uses to fold them) and starts a wakeup turn for idle sessions. A turn
+that is not accepted hands its rows back (``release_caller_history_deliveries``),
+so a failure or a restart never strands a completion: the next poll, or the
+Gateway's next-run fold, claims it again. Without both methods it stays inert.
 """
 from __future__ import annotations
 
@@ -27,8 +30,6 @@ POLL_INTERVAL_S = 5.0
 MAX_ROW_AGE_S = 6 * 3600
 
 _THREAD: threading.Thread | None = None
-# Claimed prompts whose wakeup turn lost a start race; retried each poll (webui sid -> prompt).
-_RETRY: dict[str, str] = {}
 _STOP = threading.Event()
 _LOCK = threading.Lock()
 
@@ -62,8 +63,26 @@ def _pending_session_ids(db_path: Path, since: float) -> list[str]:
         conn.close()
 
 
-def _webui_session_id(db_path: Path, session_id: str) -> str | None:
-    """The WebUI sidecar that owns *session_id*, following compression lineage upward."""
+def _claim_api_available() -> bool:
+    from hermes_state import SessionDB
+
+    return all(callable(getattr(SessionDB, name, None))
+               for name in ("claim_caller_history_deliveries", "release_caller_history_deliveries"))
+
+
+def _sidecar_profile_matches(sidecar: Path, profile: str) -> bool:
+    import json
+    from api.profiles import _profiles_match
+
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and _profiles_match(data.get("profile"), profile)
+
+
+def _webui_session_id(db_path: Path, session_id: str, profile: str) -> str | None:
+    """The WebUI sidecar of *profile* that owns *session_id*, following compression lineage upward."""
     import sqlite3
     from api.config import SESSION_DIR
 
@@ -71,8 +90,9 @@ def _webui_session_id(db_path: Path, session_id: str) -> str | None:
     try:
         sid, seen = session_id, set()
         while sid and sid not in seen:
-            if (Path(SESSION_DIR) / f"{sid}.json").is_file():
-                return sid
+            sidecar = Path(SESSION_DIR) / f"{sid}.json"
+            if sidecar.is_file():
+                return sid if _sidecar_profile_matches(sidecar, profile) else None
             seen.add(sid)
             row = conn.execute(
                 "SELECT p.id FROM sessions s JOIN sessions p ON p.id = s.parent_session_id"
@@ -83,24 +103,23 @@ def _webui_session_id(db_path: Path, session_id: str) -> str | None:
         conn.close()
 
 
-def _start_wakeup(webui_sid: str, prompt: str) -> int:
+def _start_wakeup(webui_sid: str, prompt: str) -> bool:
+    """True once the turn is accepted; any other outcome leaves the rows to be released."""
     from api.routes import start_session_turn
 
-    resp = start_session_turn(webui_sid, prompt, source="process_wakeup") or {}
+    try:
+        resp = start_session_turn(webui_sid, prompt, source="process_wakeup") or {}
+    except Exception:
+        logger.warning("gateway delegation wakeup raised for %s", webui_sid, exc_info=True)
+        return False
     status = int(resp.get("_status", 200) or 200)
-    if status == 409:
-        with _LOCK:
-            prior = _RETRY.get(webui_sid)
-            _RETRY[webui_sid] = f"{prior}\n\n{prompt}" if prior else prompt
-        return 0
-    if status >= 400:
+    if status >= 400 and status != 409:
         logger.warning("gateway delegation wakeup failed for %s: %s %r", webui_sid, status, resp.get("error"))
-        return 0
-    return 1
+    return status < 400
 
 
 def _claim_and_wake(db_path: Path, state_sid: str, webui_sid: str) -> int:
-    """Claim the session's unconsumed delivery rows and start one wakeup turn."""
+    """Claim the session's unconsumed delivery rows and start one wakeup turn, or hand them back."""
     from api.background_process import _session_has_active_turn
     from hermes_state import SessionDB
 
@@ -109,33 +128,18 @@ def _claim_and_wake(db_path: Path, state_sid: str, webui_sid: str) -> int:
     db = SessionDB(db_path)
     try:
         rows = db.claim_caller_history_deliveries(state_sid)
+        texts = [r["content"] for r in rows if isinstance(r.get("content"), str) and r["content"].strip()]
+        if texts and _start_wakeup(webui_sid, "\n\n".join(texts)):
+            return 1
+        if texts:
+            db.release_caller_history_deliveries(state_sid, [r["id"] for r in rows])
+        return 0
     finally:
         db.close()
-    texts = [r["content"] for r in rows if isinstance(r.get("content"), str) and r["content"].strip()]
-    if not texts:
-        return 0
-    return _start_wakeup(webui_sid, "\n\n".join(texts))
-
-
-def _retry_deferred() -> int:
-    from api.background_process import _session_has_active_turn
-
-    woken = 0
-    with _LOCK:
-        pending = list(_RETRY.items())
-    for webui_sid, prompt in pending:
-        if _session_has_active_turn(webui_sid):
-            continue
-        with _LOCK:
-            if _RETRY.get(webui_sid) != prompt:
-                continue
-            del _RETRY[webui_sid]
-        woken += _start_wakeup(webui_sid, prompt)
-    return woken
 
 
 def poll_once(since: float) -> int:
-    woken = _retry_deferred()
+    woken = 0
     for profile, db_path in _profile_state_dbs():
         try:
             session_ids = _pending_session_ids(db_path, since)
@@ -144,7 +148,7 @@ def poll_once(since: float) -> int:
             continue
         for sid in session_ids:
             try:
-                webui_sid = _webui_session_id(db_path, sid)
+                webui_sid = _webui_session_id(db_path, sid, profile)
                 if webui_sid:
                     woken += _claim_and_wake(db_path, sid, webui_sid)
             except Exception:
@@ -166,6 +170,9 @@ def start_gateway_delegation_poller() -> bool:
         from api.gateway_chat import webui_gateway_chat_enabled
 
         if not webui_gateway_chat_enabled(get_config()):
+            return False
+        if not _claim_api_available():
+            logger.info("gateway delegation poller inactive: installed Hermes Agent lacks the delivery claim API")
             return False
         with _LOCK:
             if _THREAD is not None and _THREAD.is_alive():
