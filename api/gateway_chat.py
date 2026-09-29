@@ -860,6 +860,41 @@ def stop_gateway_run(run_id: str) -> bool:
         return False
 
 
+def steer_gateway_run(run_id: str, text: str) -> bool:
+    """Forward steer text to the Gateway run; True only when the Gateway accepted it."""
+    run_id = str(run_id or "").strip()
+    text = str(text or "").strip()
+    if not run_id or not text:
+        return False
+    base_url, api_key = gateway_run_endpoint(run_id)
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v1/runs/{urllib.parse.quote(run_id, safe='')}/steer",
+        data=json.dumps({"input": text}).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    try:
+        opener = urllib.request.build_opener(_NoRedirect)
+        with opener.open(req, timeout=10) as response:
+            final_url = str(getattr(response, "geturl", lambda: req.full_url)() or "")
+            status = int(getattr(response, "status", getattr(response, "code", 0)) or 0)
+            if not (200 <= status < 300 and final_url == req.full_url):
+                return False
+            payload = json.loads(response.read() or b"{}")
+            return bool(isinstance(payload, dict) and payload.get("accepted") is True)
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
+        logger.debug("Gateway steer failed for run %s", run_id, exc_info=True)
+        return False
+
+
 _GATEWAY_RUN_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
 GATEWAY_REATTACH_POLL_INTERVAL = 2.0
 # Consecutive unreachable polls tolerated before the reattached turn is failed (~5 min at 2s).
