@@ -670,7 +670,7 @@ def _apply_profile_home_context_to_streaming_model(
         return model, provider_context, False
 
     try:
-        import yaml as _yaml_pp
+        from api import yaml_compat as _yaml_pp
 
         _pp_cfg_path = Path(profile_home) / "config.yaml"
         if not _pp_cfg_path.is_file():

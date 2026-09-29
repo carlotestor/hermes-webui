@@ -7714,7 +7714,7 @@ def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None
                 if _current_content == cached_content:
                     return cached_dict
                 # Content changed while key collided — fall through to re-parse
-    import yaml
+    from api import yaml_compat as yaml
     try:
         with open(cfg_path, encoding="utf-8") as _f:
             content = _f.read()
@@ -7747,7 +7747,7 @@ def _load_profile_config_dict(session) -> dict | None:
         )
         if not os.path.isfile(_profile_cfg_path):
             return None
-        import yaml
+        from api import yaml_compat as yaml
 
         with open(_profile_cfg_path, encoding="utf-8") as _f:
             _pcfg = yaml.safe_load(_f) or {}
