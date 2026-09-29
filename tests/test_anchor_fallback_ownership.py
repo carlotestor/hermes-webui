@@ -408,8 +408,8 @@ def test_transparent_raw_content_fallback_exits_for_anchor_owned_messages():
     }
 
 
-def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds():
-    """Drive the real renderMessages() gate, not only source-order assertions."""
+def _render_messages_harness() -> str:
+    """Node prelude that evaluates the real renderMessages() over a minimal fake DOM."""
 
     render_source = _function_source(_ui_js(), "renderMessages")
     transparent_source = _function_source(_ui_js(), "_transparentStreamOrderedParts")
@@ -421,8 +421,10 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
     # helper takes its insertAdjacentHTML fallback here, exactly as before.
     insert_block_source = _function_source(_ui_js(), "_insertSegmentBlock")
     awaiting_answer_source = _function_source(_ui_js(), "_settledTurnAwaitingAnswer")
-    script = textwrap.dedent(
-        f"""
+    sessions_js = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    child_session_source = _function_source(sessions_js, "_isChildSession")
+    delegated_row_source = _function_source(sessions_js, "_isDelegatedSubagentRow")
+    return f"""
         class FakeClassList {{
           constructor(el) {{ this.el = el; }}
           _set() {{ return new Set(String(this.el.className || '').split(/\\s+/).filter(Boolean)); }}
@@ -657,6 +659,7 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
           const group = new FakeElement('div');
           group.className = 'tool-worklog-group tool-call-group agent-activity-group';
           group.setAttribute('data-legacy-fallback-owner', '1');
+          group.setAttribute('data-collapsed', String(!!(opts && opts.collapsed)));
           const anchor = opts && opts.anchor;
           if (parent && anchor && anchor.parentElement === parent) parent.insertBefore(group, anchor);
           else if (parent) parent.appendChild(group);
@@ -710,7 +713,18 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
         eval({json.dumps(legacy_metadata_source)});
         eval({json.dumps(insert_block_source)});
         eval({json.dumps(awaiting_answer_source)});
+        eval({json.dumps(child_session_source)});
+        eval({json.dumps(delegated_row_source)});
         eval({json.dumps(render_source)});
+"""
+
+
+def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds():
+    """Drive the real renderMessages() gate, not only source-order assertions."""
+
+    script = textwrap.dedent(
+        _render_messages_harness()
+        + f"""
 
         const toolResult = {{ role: 'tool', tool_call_id: 'toolu_1', content: 'tool result' }};
         const selectorSanityElement = new FakeElement('div');

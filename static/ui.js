@@ -11932,11 +11932,12 @@ function _worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, visi
   const visibleTexts=Array.isArray(turnVisibleContents)?turnVisibleContents:[];
   return _stripVisibleAssistantEchoFromThinking(thinkingText, visibleContent, turnFinalVisibleContent, ...visibleTexts);
 }
-// A transcript read without a live stream (e.g. a still-running delegated subagent
-// loaded from state.db) whose last turn ends in tool activity has no answer yet;
-// collapsing its worklog would leave only an empty "Processed" chip.
+// A delegated subagent that state.db reports as still running has no WebUI stream;
+// its last tool-ending turn stays open instead of showing an empty "Processed" chip.
 function _settledTurnAwaitingAnswer(inner, anchorTurn){
   if(!inner||!anchorTurn||S.busy) return false;
+  const session=S.session;
+  if(!session||session.active!==true||!_isDelegatedSubagentRow(session)) return false;
   const turns=inner.querySelectorAll('.assistant-turn');
   if(!turns.length||turns[turns.length-1]!==anchorTurn) return false;
   const last=(S.messages||[])[(S.messages||[]).length-1];
