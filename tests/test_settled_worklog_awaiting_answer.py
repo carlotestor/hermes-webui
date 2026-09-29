@@ -17,11 +17,11 @@ import textwrap
 import pytest
 
 from tests.test_anchor_fallback_ownership import _render_messages_harness, _run_node_script
-from tests.test_5307_subagent_child_transcript import (  # noqa: F401  (fixtures)
-    _make_state_db,
-    isolated_state_db,
-    routes_module,
-)
+from tests import test_5307_subagent_child_transcript as _t5307
+
+_make_state_db = _t5307._make_state_db
+routes_module = _t5307.routes_module
+isolated_state_db = _t5307.isolated_state_db
 
 USER = {"role": "user", "content": "go"}
 CALL = {
@@ -60,8 +60,7 @@ TWO_TURNS_RUNNING = [USER, CALL, RESULT, ANSWER, USER, CALL, RESULT]
 def _collapsed_flags(session, messages, *, busy=False):
     """Render through the real renderMessages() and return each worklog's collapsed flag."""
     script = textwrap.dedent(
-        _render_messages_harness()
-        + f"""
+        f"""{_render_messages_harness()}
         S = {{
           session: {json.dumps(session)},
           messages: {json.dumps(messages)},
@@ -109,8 +108,7 @@ def test_answered_running_subagent_still_collapses():
 
 def test_live_stream_path_is_untouched():
     script = textwrap.dedent(
-        _render_messages_harness()
-        + f"""
+        f"""{_render_messages_harness()}
         S = {{ session: {json.dumps(RUNNING_SUBAGENT)}, messages: {json.dumps(TWO_TURNS_RUNNING)},
               toolCalls: [], busy: false }};
         renderMessages();

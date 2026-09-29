@@ -723,8 +723,7 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
     """Drive the real renderMessages() gate, not only source-order assertions."""
 
     script = textwrap.dedent(
-        _render_messages_harness()
-        + f"""
+        f"""{_render_messages_harness()}
 
         const toolResult = {{ role: 'tool', tool_call_id: 'toolu_1', content: 'tool result' }};
         const selectorSanityElement = new FakeElement('div');
