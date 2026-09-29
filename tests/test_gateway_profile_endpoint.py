@@ -1,6 +1,10 @@
 """A named-profile session must reach its own profile on a shared Gateway listener, never the root's."""
 from collections import OrderedDict
+from email.message import Message
 import io
+import json
+import threading
+import urllib.error
 
 import pytest
 
@@ -118,3 +122,91 @@ def test_live_turn_of_named_profile_session_goes_to_its_profile(homes, tmp_path,
 
     assert seen and all(url.startswith(f"{SHARED}/p/work/v1/runs") for _, url, _ in seen), seen
     assert {auth for _, _, auth in seen} == {"Bearer work-key-0123456789"}
+
+
+def _orphaned_named_turn(tmp_path, monkeypatch, gateway_run):
+    """A work-profile sidecar as a killed WebUI process leaves it."""
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_USE_RUNS_API", "1")
+    monkeypatch.setattr(gateway_chat, "GATEWAY_REATTACH_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(gateway_chat, "_gateway_reasoning_effort_for_request", lambda *a, **k: None)
+    s = new_session()
+    s.profile = "work"
+    s.active_stream_id = gateway_run["stream_id"]
+    s.pending_user_message = "long task"
+    s.pending_attachments = []
+    s.pending_started_at = 1.0
+    s.gateway_run = gateway_run
+    s.save()
+    models.SESSIONS.clear()
+    with STREAMS_LOCK:
+        STREAMS.pop(gateway_run["stream_id"], None)
+    return s.session_id
+
+
+def _join_reattach():
+    for thread in threading.enumerate():
+        if thread.name.startswith("gateway-reattach-"):
+            thread.join(10)
+            assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("admitted", [True, False])
+def test_pre_upgrade_named_run_reattaches_on_the_unprefixed_root_endpoint(homes, tmp_path, monkeypatch, admitted):
+    _, work = homes
+    (work / ".env").write_text("API_SERVER_KEY=work-key-0123456789\n")
+    run = {"run_id": "run_old" if admitted else "", "stream_id": "stream-old", "regeneration": False, "goal_related": False}
+    if not admitted:
+        run["request"] = {"input": "long task"}
+    sid = _orphaned_named_turn(tmp_path, monkeypatch, run)
+    admits, polls = [], []
+    monkeypatch.setattr(gateway_chat, "_admit_gateway_run", lambda url, headers, *a: admits.append(
+        (url, headers.get("Authorization"))) or "run_old")
+    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: polls.append((b, k, r)) or {
+        "run_id": r, "status": "completed", "output": "answer from before the upgrade"})
+
+    assert gateway_chat.resume_gateway_runs_after_restart() == [sid]
+    _join_reattach()
+
+    assert polls and set(polls) == {(SHARED, "root-key-0123456789", "run_old")}
+    assert admits == ([] if admitted else [(f"{SHARED}/v1/runs", "Bearer root-key-0123456789")])
+    saved = json.loads((models.SESSION_DIR / f"{sid}.json").read_text())
+    assert saved["messages"][-1]["content"] == "answer from before the upgrade"
+    assert saved["gateway_run"] is None and saved["active_stream_id"] is None
+
+
+def test_marked_named_run_reattaches_on_its_recorded_profile_endpoint(homes, tmp_path, monkeypatch):
+    _, work = homes
+    (work / ".env").write_text("API_SERVER_KEY=work-key-0123456789\n")
+    sid = _orphaned_named_turn(tmp_path, monkeypatch, {
+        "run_id": "run_new", "stream_id": "stream-new", "regeneration": False, "goal_related": False,
+        "endpoint_routing": "profile-v1", "base_url": f"{SHARED}/p/work",
+    })
+    polls = []
+    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: polls.append((b, k)) or {
+        "run_id": r, "status": "completed", "output": "ok"})
+
+    assert gateway_chat.resume_gateway_runs_after_restart() == [sid]
+    _join_reattach()
+
+    assert set(polls) == {(f"{SHARED}/p/work", "work-key-0123456789")}
+
+
+@pytest.mark.parametrize("code", [401, 404])
+def test_named_profile_refusal_names_the_routing_fix(code):
+    exc = urllib.error.HTTPError(f"{SHARED}/p/work/v1/runs", code, "x", hdrs=Message(), fp=None)
+
+    event = gateway_chat._gateway_http_error_event(
+        exc, "", api_key_configured=False,
+        route_hint=gateway_chat._gateway_profile_route_hint(f"{SHARED}/p/work", code),
+    )
+
+    assert "gateway.multiplex_profiles" in event["hint"]
+    assert "HERMES_WEBUI_GATEWAY_BASE_URL" in event["hint"] and "profile's .env" in event["hint"]
+    assert gateway_chat._gateway_profile_route_hint(SHARED, code) == ""
+    assert gateway_chat._gateway_profile_route_hint("http://gw/p/work/x", code) == ""
