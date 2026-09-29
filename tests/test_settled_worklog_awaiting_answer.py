@@ -1,11 +1,10 @@
-"""A running delegated subagent transcript keeps its final worklog open.
+"""A delegated subagent transcript shows its thinking and tool cards between messages.
 
 Delegated subagent sessions are loaded read-only from state.db with no WebUI
-stream attached. While the subagent is still working (state.db ``ended_at`` is
-NULL), its last turn ends in tool activity and has no final answer, so a
-collapsed worklog would hide every thinking and tool card behind a bare
-"Processed" chip. Every other session keeps the collapsed settled worklog, even
-when its transcript ends in the same tool row (cancelled, interrupted, ended).
+stream attached, and the whole task is one long turn. Its settled worklogs are
+therefore open and split at each visible interim text, so thinking stays in place
+between the messages instead of being folded into one "Processed" block. Every
+other session keeps one collapsed worklog per turn.
 """
 
 from __future__ import annotations
@@ -77,46 +76,66 @@ def _collapsed_flags(session, messages, *, busy=False):
     return json.loads(_run_node_script(script))
 
 
-def test_running_subagent_final_worklog_is_open():
-    assert _collapsed_flags(RUNNING_SUBAGENT, TWO_TURNS_RUNNING) == [True, False]
+def _call(i, text=""):
+    return {**CALL, "content": text, "tool_calls": [{**CALL["tool_calls"][0], "id": f"t{i}"}]}
 
 
-def test_running_subagent_ending_in_tool_call_is_open():
-    assert _collapsed_flags(RUNNING_SUBAGENT, [USER, CALL, RESULT, CALL]) == [False]
+def _result(i):
+    return {**RESULT, "tool_call_id": f"t{i}"}
 
 
-def test_webui_session_with_same_messages_stays_collapsed():
+INTERLEAVED = [
+    USER, _call(1), _result(1), _call(2, "Now C#."), _result(2),
+    _call(3), _result(3), _call(4, "Restoring it."), _result(4), _call(5), _result(5),
+]
+
+
+def _last_turn_layout(session, messages, *, busy=False):
+    """Render via renderMessages() and list the last turn's children: G<collapsed> or T<idx>."""
+    script = textwrap.dedent(
+        f"""{_render_messages_harness()}
+        S = {{ session: {json.dumps(session)}, messages: {json.dumps(messages)},
+              toolCalls: [], busy: {json.dumps(busy)} }};
+        renderMessages();
+        const turnEls = elements.msgInner.querySelectorAll('.assistant-turn');
+        const blocks = _assistantTurnBlocks(turnEls[turnEls.length - 1]);
+        console.log(JSON.stringify(blocks.children.map((el) =>
+          el.className.includes('tool-worklog-group')
+            ? 'G' + el.getAttribute('data-collapsed')
+            : 'T' + el.getAttribute('data-msg-idx'))));
+        """
+    )
+    return json.loads(_run_node_script(script))
+
+
+@pytest.mark.parametrize("session", [RUNNING_SUBAGENT, ENDED_SUBAGENT])
+def test_subagent_worklogs_are_open(session):
+    assert _collapsed_flags(session, TWO_TURNS_RUNNING) == [False, False]
+
+
+def test_subagent_worklog_splits_at_each_interim_text():
+    assert _last_turn_layout(RUNNING_SUBAGENT, INTERLEAVED) == [
+        "Gfalse", "T1", "Gfalse", "T3", "Gfalse", "T5", "Gfalse", "T7", "Gfalse", "T9",
+    ]
+
+
+def test_webui_session_keeps_one_collapsed_worklog_per_turn():
     assert _collapsed_flags(WEBUI_SESSION, TWO_TURNS_RUNNING) == [True, True]
+    assert _last_turn_layout(WEBUI_SESSION, INTERLEAVED)[0] == "Gtrue"
+    assert _last_turn_layout(WEBUI_SESSION, INTERLEAVED).count("Gtrue") == 1
 
 
-def test_ended_foreign_session_with_same_messages_stays_collapsed():
+def test_foreign_cli_session_stays_collapsed():
     assert _collapsed_flags(ENDED_FOREIGN_CLI, TWO_TURNS_RUNNING) == [True, True]
-
-
-def test_ended_subagent_with_same_messages_stays_collapsed():
-    assert _collapsed_flags(ENDED_SUBAGENT, TWO_TURNS_RUNNING) == [True, True]
-
-
-def test_subagent_without_lifecycle_marker_stays_collapsed():
-    unknown = {k: v for k, v in RUNNING_SUBAGENT.items() if k != "active"}
-    assert _collapsed_flags(unknown, TWO_TURNS_RUNNING) == [True, True]
-
-
-def test_answered_running_subagent_still_collapses():
-    assert _collapsed_flags(RUNNING_SUBAGENT, [USER, CALL, RESULT, ANSWER]) == [True]
 
 
 def test_live_stream_path_is_untouched():
     script = textwrap.dedent(
         f"""{_render_messages_harness()}
-        S = {{ session: {json.dumps(RUNNING_SUBAGENT)}, messages: {json.dumps(TWO_TURNS_RUNNING)},
-              toolCalls: [], busy: false }};
-        renderMessages();
-        const turns = elements.msgInner.querySelectorAll('.assistant-turn');
-        const idle = _settledTurnAwaitingAnswer(elements.msgInner, turns[turns.length - 1]);
+        S = {{ session: {json.dumps(RUNNING_SUBAGENT)}, messages: [], toolCalls: [], busy: false }};
+        const idle = _isDelegatedSubagentTranscript();
         S.busy = true;
-        const busy = _settledTurnAwaitingAnswer(elements.msgInner, turns[turns.length - 1]);
-        console.log(JSON.stringify([idle, busy]));
+        console.log(JSON.stringify([idle, _isDelegatedSubagentTranscript()]));
         """
     )
     assert json.loads(_run_node_script(script)) == [True, False]

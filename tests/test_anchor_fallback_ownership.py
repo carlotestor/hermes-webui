@@ -420,7 +420,8 @@ def _render_messages_harness() -> str:
     # evaluated with it. The shim's createElement() returns no template `content`, so the
     # helper takes its insertAdjacentHTML fallback here, exactly as before.
     insert_block_source = _function_source(_ui_js(), "_insertSegmentBlock")
-    awaiting_answer_source = _function_source(_ui_js(), "_settledTurnAwaitingAnswer")
+    subagent_transcript_source = _function_source(_ui_js(), "_isDelegatedSubagentTranscript")
+    worklog_group_key_source = _function_source(_ui_js(), "_worklogGroupKey")
     sessions_js = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
     child_session_source = _function_source(sessions_js, "_isChildSession")
     delegated_row_source = _function_source(sessions_js, "_isDelegatedSubagentRow")
@@ -465,6 +466,11 @@ def _render_messages_harness() -> str:
             if (idx < 0) this.children.push(child);
             else this.children.splice(idx, 0, child);
             return child;
+          }}
+          get previousElementSibling() {{
+            const sibs = this.parentElement ? this.parentElement.children : [];
+            const idx = sibs.indexOf(this);
+            return idx > 0 ? sibs[idx - 1] : null;
           }}
           remove() {{
             if (!this.parentElement) return;
@@ -712,7 +718,8 @@ def _render_messages_harness() -> str:
         eval({json.dumps(transparent_source)});
         eval({json.dumps(legacy_metadata_source)});
         eval({json.dumps(insert_block_source)});
-        eval({json.dumps(awaiting_answer_source)});
+        eval({json.dumps(subagent_transcript_source)});
+        eval({json.dumps(worklog_group_key_source)});
         eval({json.dumps(child_session_source)});
         eval({json.dumps(delegated_row_source)});
         eval({json.dumps(render_source)});

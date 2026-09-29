@@ -11932,18 +11932,18 @@ function _worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, visi
   const visibleTexts=Array.isArray(turnVisibleContents)?turnVisibleContents:[];
   return _stripVisibleAssistantEchoFromThinking(thinkingText, visibleContent, turnFinalVisibleContent, ...visibleTexts);
 }
-// A delegated subagent that state.db reports as still running has no WebUI stream;
-// its last tool-ending turn stays open instead of showing an empty "Processed" chip.
-function _settledTurnAwaitingAnswer(inner, anchorTurn){
-  if(!inner||!anchorTurn||S.busy) return false;
-  const session=S.session;
-  if(!session||session.active!==true||!_isDelegatedSubagentRow(session)) return false;
-  const turns=inner.querySelectorAll('.assistant-turn');
-  if(!turns.length||turns[turns.length-1]!==anchorTurn) return false;
-  const last=(S.messages||[])[(S.messages||[]).length-1];
-  if(!last) return false;
-  if(last.role==='tool') return true;
-  return last.role==='assistant'&&Array.isArray(last.tool_calls)&&last.tool_calls.length>0;
+// A delegated subagent's whole task is one turn with no WebUI stream, so its settled
+// worklog opens and splits at each visible interim text instead of one block per turn.
+function _isDelegatedSubagentTranscript(){
+  return !S.busy&&!!S.session&&_isDelegatedSubagentRow(S.session);
+}
+function _worklogGroupKey(anchorRow, anchorTurn, placedAfterAnchor){
+  if(!_isDelegatedSubagentTranscript()) return anchorTurn;
+  if(placedAfterAnchor) return anchorRow;
+  for(let el=anchorRow.previousElementSibling;el;el=el.previousElementSibling){
+    if(el.classList&&el.classList.contains('assistant-segment')&&!el.classList.contains('assistant-segment-worklog-source')) return el;
+  }
+  return anchorTurn;
 }
 function _worklogDetailsExpandedDefault(){
   return window._worklogDetailsExpandedByDefault===true;
@@ -18577,13 +18577,14 @@ function renderMessages(options){
         // value) so the append path can use the ownership fact the group
         // construction already uses.
         const anchorIsWorklogSource=anchorRow.classList&&anchorRow.classList.contains('assistant-segment-worklog-source');
-        let state=activityByTurn.get(anchorTurn);
+        const groupKey=_worklogGroupKey(anchorRow,anchorTurn,!anchorIsWorklogSource&&!thinkingText);
+        let state=activityByTurn.get(groupKey);
         if(!state){
           const includeTurnDuration=!durationAssignedTurns.has(anchorTurn);
           if(includeTurnDuration) durationAssignedTurns.add(anchorTurn);
           const activityKey=`assistant:${aIdx}`;
           const group=ensureActivityGroup(anchorParent,{
-            collapsed:!_settledTurnAwaitingAnswer(inner,anchorTurn),
+            collapsed:!_isDelegatedSubagentTranscript(),
             anchor:anchorRow,
             beforeAnchor:!!thinkingText&&!anchorIsWorklogSource,
             syncAnchorReason:anchorIsWorklogSource,
@@ -18596,7 +18597,7 @@ function renderMessages(options){
           if(!list) continue;
           list.innerHTML='';
           state={group,cards:[],seenReasons:new Set(),seenTools:new Set()};
-          activityByTurn.set(anchorTurn,state);
+          activityByTurn.set(groupKey,state);
         }
         state.cards.push(...cards);
         _appendWorklogStep(state.group, anchorRow, cards, thinkingText, {
