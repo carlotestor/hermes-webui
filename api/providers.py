@@ -3010,7 +3010,7 @@ def _clean_provider_key_from_config(provider_id: str) -> None:
         return
 
     try:
-        import yaml as _yaml
+        from api import yaml_compat as _yaml
 
         changed = False
 
