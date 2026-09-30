@@ -188,3 +188,33 @@ def test_real_command_keeps_shell_label_over_display_command(driver_path):
     out = _run(driver_path, {"args": {"command": "git status"}, "display_command": "git status"})
     assert out["label"] == "Shell"
     assert out["lead"] == "$ git status"
+
+
+@pytest.mark.parametrize("cmd,kept", [
+    ("curl -u alice:s3cretPW https://x", "curl -u alice:[redacted] https://x"),
+    ("curl --user alice:s3cretPW https://x", "curl --user alice:[redacted] https://x"),
+    ("curl --user=alice:s3cretPW https://x", "curl --user=alice:[redacted] https://x"),
+    ("curl -u 'alice:pa ss' https://x", "curl -u 'alice:[redacted]' https://x"),
+    ("curl -ualice:s3cretPW https://x", "curl -ualice:[redacted] https://x"),
+])
+def test_curl_basic_auth_password_redacted_username_kept(driver_path, cmd, kept):
+    out = _run(driver_path, {"args": {"command": cmd}})
+    assert out["lead"] == "$ " + kept
+    assert "s3cretPW" not in out["header"] and "pa ss" not in out["header"]
+
+
+@pytest.mark.parametrize("cmd", ["curl -u alice https://x", "sort -u file", "curl --username alice:bob"])
+def test_curl_basic_auth_redaction_leaves_non_credentials(driver_path, cmd):
+    assert _run(driver_path, {"args": {"command": cmd}})["lead"] == "$ " + cmd
+
+
+def test_gateway_tool_started_curl_password_never_reaches_card(driver_path):
+    from api.gateway_chat import _gateway_tool_progress_event
+
+    _, started = _gateway_tool_progress_event(
+        {"event": "tool.started", "tool": "terminal", "preview": "curl -u alice:s3cretPW https://x"}
+    )
+    tc = {k: started[k] for k in ("name", "args", "display_command")}
+    out = _run(driver_path, tc)
+    for text in (out["header"], out["lead"]):
+        assert "s3cretPW" not in text and "alice:[redacted]" in text

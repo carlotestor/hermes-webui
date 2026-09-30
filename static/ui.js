@@ -19124,6 +19124,9 @@ function _redactToolTargetLabel(value){
     .replace(/\bsshpass\s+-p\s+(?:"[^"]*"|'[^']*'|\S+)/gi,'sshpass -p "[redacted]"')
     .replace(/(--password(?:=|\s+))(?:"[^"]*"|'[^']*'|\S+)/gi,'$1[redacted]')
     .replace(/(password(?:=|\s+))(?:"[^"]*"|'[^']*'|\S+)/gi,'$1[redacted]')
+    // curl basic auth `-u user:pass` / `--user[=]user:pass`: keep the user, mask the password.
+    .replace(/(^|[\s;|(])(-u\s*|--user(?:=|\s+))(["'])([^"'\n:]*):[^\n]*?\3/g,'$1$2$3$4:[redacted]$3')
+    .replace(/(^|[\s;|(])(-u\s*|--user(?:=|\s+))([^\s"':]*):\S+/g,'$1$2$3:[redacted]')
     // Env-assignment / flag secrets, masked across the full (multi-line) text so
     // the expanded shell card can't leak a key on a non-first line (#4926). Keys
     // matched case-insensitively: *(TOKEN|API_KEY|APIKEY|SECRET|PASSWD|PASSWORD|
