@@ -14,8 +14,9 @@ import api.background_process as bp
 import api.gateway_delegation_wakeup as gdw
 
 
-def _deliver(db, sid, deleg_id):
-    db.append_delegation_delivery(sid, f"[ASYNC DELEGATION COMPLETE — {deleg_id}]\nresult", {"delegation_id": deleg_id})
+def _deliver(db, sid, deleg_id, **meta):
+    db.append_delegation_delivery(sid, f"[ASYNC DELEGATION COMPLETE — {deleg_id}]\nresult",
+                                  {"delegation_id": deleg_id, **meta})
 
 
 @pytest.fixture
@@ -52,6 +53,20 @@ def test_delivery_row_starts_wakeup_turn_once(env):
     assert calls[0][2] == "process_wakeup"
     # Claimed exactly once: the next poll (and the Gateway's next-run fold) see nothing.
     assert gdw.poll_once(time.time() - 60) == 0
+    assert db.claim_caller_history_deliveries("sid1") == []
+
+
+def test_hidden_delivery_row_wakes_once_and_is_claimed_once(env, tmp_path):
+    import sqlite3
+    db, calls, _ = env
+    _deliver(db, "sid1", "deleg_h", presentation_suppressed=True, delivery_notice="task_failure:0")
+    with sqlite3.connect(tmp_path / "home" / "state.db") as conn:
+        kinds = [r[0] for r in conn.execute("SELECT display_kind FROM messages WHERE session_id = 'sid1'")]
+    assert kinds == ["hidden"]
+    assert gdw.poll_once(time.time() - 60) == 1
+    assert len(calls) == 1 and "deleg_h" in calls[0][1]
+    assert gdw.poll_once(time.time() - 60) == 0
+    assert len(calls) == 1
     assert db.claim_caller_history_deliveries("sid1") == []
 
 
@@ -96,6 +111,17 @@ def test_sidecar_of_another_profile_is_not_woken(env, tmp_path):
     assert gdw.poll_once(time.time() - 60) == 0
     assert calls == []
     assert len(db.claim_caller_history_deliveries("sid1")) == 1
+
+
+def test_sidecar_of_same_named_profile_is_woken(env, tmp_path, monkeypatch):
+    db, calls, _ = env
+    db_path = tmp_path / "home" / "state.db"
+    monkeypatch.setattr(gdw, "_profile_state_dbs", lambda: [("work", db_path)])
+    (tmp_path / "sessions" / "sid1.json").write_text(json.dumps({"session_id": "sid1", "profile": "work"}))
+    _deliver(db, "sid1", "deleg_g")
+    assert gdw.poll_once(time.time() - 60) == 1
+    assert calls[0][0] == "sid1" and "deleg_g" in calls[0][1]
+    assert db.claim_caller_history_deliveries("sid1") == []
 
 
 def test_poller_inert_without_agent_claim_api(monkeypatch):

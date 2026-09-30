@@ -4,8 +4,8 @@ With the Gateway chat backend the agent runs in the Gateway process, so its
 ``async_delegation`` completions never reach this process's
 ``process_registry.completion_queue`` (``api.background_process`` drain).
 For api_server sessions the Gateway instead persists each completion as a
-``display_kind='async_delegation_complete'`` delivery row in the profile's
-state.db and deliberately starts no turn: the client owns the next turn
+delivery row in the profile's state.db (``display_kind`` ``async_delegation_complete``,
+or ``hidden`` for presentation-suppressed notices) and deliberately starts no turn: the client owns the next turn
 (``gateway.wake.persist_delegation_delivery``). Without a consumer here the
 parent agent only sees the result when the user next types.
 
@@ -13,8 +13,11 @@ This poller claims those rows with the Agent's own exactly-once primitive
 (``SessionDB.claim_caller_history_deliveries``, the same claim the Gateway's
 next run uses to fold them) and starts a wakeup turn for idle sessions. A turn
 that is not accepted hands its rows back (``release_caller_history_deliveries``),
-so a failure or a restart never strands a completion: the next poll, or the
-Gateway's next-run fold, claims it again. Without both methods it stays inert.
+so a failed or refused start never strands a completion: the next poll, or the
+Gateway's next-run fold, claims it again. Not covered: a WebUI process exit
+between the claim commit and the release/accepted start leaves those rows
+claimed; closing that window needs an expiring reservation in the Agent API.
+Without both methods it stays inert.
 """
 from __future__ import annotations
 
@@ -35,8 +38,8 @@ _LOCK = threading.Lock()
 
 _PENDING_SQL = (
     "SELECT DISTINCT session_id FROM messages WHERE role = 'user'"
-    " AND display_kind = 'async_delegation_complete'"
-    " AND json_extract(display_metadata, '$.delegation_id') IS NOT NULL"
+    " AND display_kind IN ('async_delegation_complete', 'hidden')"
+    " AND coalesce(json_extract(display_metadata, '$.delegation_id'), '') != ''"
     " AND json_extract(display_metadata, '$.caller_history_consumed') IS NULL"
     " AND timestamp >= ?"
 )
