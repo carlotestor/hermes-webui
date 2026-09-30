@@ -8664,7 +8664,8 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             with closing(_sqlite.connect(str(db_path))) as _conn:
                 _conn.row_factory = _sqlite.Row
                 _row = _conn.execute(
-                    "SELECT * FROM sessions WHERE id = ?", (sid,)
+                    "SELECT source, title, model, cwd, started_at, ended_at, "
+                    "parent_session_id FROM sessions WHERE id = ?", (sid,)
                 ).fetchone()
                 if _row is not None:
                     state_db_row = dict(_row)

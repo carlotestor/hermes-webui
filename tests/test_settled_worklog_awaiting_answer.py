@@ -2,9 +2,9 @@
 
 Delegated subagent sessions are loaded read-only from state.db with no WebUI
 stream attached, and the whole task is one long turn. Its settled worklogs are
-therefore open and split at each visible interim text, so thinking stays in place
-between the messages instead of being folded into one "Processed" block. Every
-other session keeps one collapsed worklog per turn.
+split at each visible interim text and open while the child runs (unless the user
+collapsed one), so thinking stays in place between the messages instead of being
+folded into one "Processed" block. Every other session keeps one collapsed worklog per turn.
 """
 
 from __future__ import annotations
@@ -108,9 +108,111 @@ def _last_turn_layout(session, messages, *, busy=False):
     return json.loads(_run_node_script(script))
 
 
-@pytest.mark.parametrize("session", [RUNNING_SUBAGENT, ENDED_SUBAGENT])
-def test_subagent_worklogs_are_open(session):
-    assert _collapsed_flags(session, TWO_TURNS_RUNNING) == [False, False]
+def test_running_subagent_worklogs_are_open_and_ended_ones_collapse():
+    assert _collapsed_flags(RUNNING_SUBAGENT, TWO_TURNS_RUNNING) == [False, False]
+    assert _collapsed_flags(ENDED_SUBAGENT, TWO_TURNS_RUNNING) == [True, True]
+
+
+def _real_disclosure_harness():
+    """Real ensureActivityGroup()/_toggleActivityGroup() over a fake DOM and localStorage."""
+    from tests.test_anchor_fallback_ownership import _function_source, _ui_js
+
+    src = _ui_js()
+    names = [
+        "_activityDisclosureStorageKey", "_readActivityDisclosureState",
+        "_writeActivityDisclosureState", "ensureActivityGroup", "_toggleActivityGroup",
+        "_messageRenderCacheSignature",
+    ]
+    evals = "\n".join(f"eval({json.dumps(_function_source(src, n))});" for n in names)
+    return f"""
+        const _store = {{}};
+        const localStorage = {{ getItem: (k) => (k in _store ? _store[k] : null),
+                               setItem: (k, v) => {{ _store[k] = String(v); }} }};
+        const window = {{}};
+        const _activityDisclosureStoragePrefix = 'p:';
+        let _liveActivityUserExpanded = null;
+        const _sessionHtmlCache = new Map();
+        function _addBoundedHash(add, v) {{ add(JSON.stringify(v)); }}
+        function msgContent(m) {{ return String(m.content || ''); }}
+        function _messageHasReasoningPayload() {{ return false; }}
+        function li() {{ return ''; }}
+        function _activityKeyForLiveTurn() {{ return null; }}
+        function _syncToolCallGroupSummary() {{}}
+        function _materializeDeferredWorklogRows() {{}}
+        function _onLiveActivityToggle() {{}}
+        function mkEl() {{
+          const cls = new Set();
+          const el = {{ attrs: {{}}, children: [], parentElement: null, innerHTML: '',
+            classList: {{ contains: (c) => cls.has(c),
+              toggle: (c, on) => {{ const v = on === undefined ? !cls.has(c) : !!on;
+                                   v ? cls.add(c) : cls.delete(c); return v; }} }},
+            setAttribute(k, v) {{ this.attrs[k] = String(v); }},
+            getAttribute(k) {{ return k in this.attrs ? this.attrs[k] : null; }},
+            removeAttribute(k) {{ delete this.attrs[k]; }},
+            querySelector() {{ return null; }}, querySelectorAll() {{ return []; }},
+            appendChild(c) {{ c.parentElement = this; this.children.push(c); }},
+            closest() {{ return el; }} }};
+          Object.defineProperty(el, 'className', {{ set(v) {{ cls.clear();
+            String(v).split(/\\s+/).filter(Boolean).forEach((c) => cls.add(c)); }} }});
+          return el;
+        }}
+        const document = {{ createElement: mkEl }};
+        const CSS = {{ escape: (v) => String(v) }};
+        let S = {{ session: {json.dumps(RUNNING_SUBAGENT)}, messages: [], toolCalls: [] }};
+        {evals}
+        const build = (opts) => ensureActivityGroup(mkEl(),
+          {{ collapsed: false, activityKey: 'assistant:1', ...opts }})
+          .classList.contains('tool-call-group-collapsed');
+    """
+
+
+def _run_disclosure(body):
+    return json.loads(_run_node_script(_real_disclosure_harness() + textwrap.dedent(body)))
+
+
+def test_saved_closed_state_wins_for_open_subagent_worklog():
+    assert _run_disclosure("""
+        const before = build({ honourSavedDisclosure: true });
+        _writeActivityDisclosureState('assistant:1', false);
+        console.log(JSON.stringify([before, build({ honourSavedDisclosure: true }),
+                                    build({})]));
+    """) == [False, True, False]
+
+
+def test_toggling_worklog_saves_state_and_drops_cached_render():
+    assert _run_disclosure("""
+        _sessionHtmlCache.set('child-1', { html: 'stale' });
+        const group = mkEl();
+        group.setAttribute('data-activity-disclosure-key', 'assistant:1');
+        _toggleActivityGroup({ closest: () => group, setAttribute() {} });
+        console.log(JSON.stringify([_readActivityDisclosureState('assistant:1'),
+                                    _sessionHtmlCache.has('child-1')]));
+    """) == ["closed", False]
+
+
+def test_render_signature_changes_when_subagent_ends():
+    assert _run_disclosure("""
+        const running = _messageRenderCacheSignature();
+        S.session = { ...S.session, active: false };
+        console.log(JSON.stringify(running !== _messageRenderCacheSignature()));
+    """) is True
+
+
+def test_subagent_ending_with_same_messages_renders_collapsed():
+    script = textwrap.dedent(
+        f"""{_render_messages_harness()}
+        S = {{ session: {json.dumps(RUNNING_SUBAGENT)}, messages: {json.dumps(TWO_TURNS_RUNNING)},
+              toolCalls: [], busy: false }};
+        const flags = () => elements.msgInner.querySelectorAll('.tool-worklog-group')
+          .map((g) => g.getAttribute('data-collapsed') === 'true');
+        renderMessages();
+        const running = flags();
+        S.session = {{ ...S.session, active: false }};
+        renderMessages();
+        console.log(JSON.stringify([running, flags()]));
+        """
+    )
+    assert json.loads(_run_node_script(script)) == [[False, False], [True, True]]
 
 
 def test_subagent_worklog_splits_at_each_interim_text():
