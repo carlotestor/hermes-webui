@@ -551,6 +551,10 @@ def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
     ):
         # Runs API tool.started carries only {tool, preview}; keep it labelled as a preview.
         event_payload["display_command"] = bound_run_journal_snapshot_args({"c": preview})["c"]
+    if is_complete and payload.get("result") is not None:
+        # Full result when the Gateway sends one; preview stays the bounded fallback.
+        from api.streaming import _tool_result_snippet
+        event_payload["snippet"] = _tool_result_snippet(payload.get("result"))
     if tid:
         event_payload["tid"] = str(tid)
     return ("tool_complete" if is_complete else "tool"), event_payload
@@ -1498,6 +1502,8 @@ def _run_gateway_chat_streaming(
                                         ) or shared_tc.get("name") == event_payload.get("name"):
                                             shared_tc["done"] = True
                                             shared_tc["is_error"] = bool(event_payload.get("is_error"))
+                                            if event_payload.get("snippet"):
+                                                shared_tc["snippet"] = event_payload["snippet"]
                                             break
                             put_gateway_event(event_name, event_payload)
                             if event_name != "reasoning":
