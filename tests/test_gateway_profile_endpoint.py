@@ -66,6 +66,28 @@ def test_named_profile_with_own_url_is_used_verbatim(homes, source):
     assert gateway_chat._gateway_endpoint_for_profile("work") == ("http://work-gw:9000", "work-key-0123456789")
 
 
+def test_profile_owned_gateway_uses_its_api_server_key_over_the_process_key(homes):
+    _, work = homes
+    (work / ".env").write_text("HERMES_WEBUI_GATEWAY_BASE_URL=http://work-gw:9000\nAPI_SERVER_KEY=work-key-0123456789\n")
+
+    assert gateway_chat._gateway_endpoint_for_profile("work") == ("http://work-gw:9000", "work-key-0123456789")
+
+
+def test_profile_owned_gateway_without_key_falls_back_to_the_process_key(homes):
+    _, work = homes
+    (work / ".env").write_text("HERMES_WEBUI_GATEWAY_BASE_URL=http://work-gw:9000\n")
+
+    assert gateway_chat._gateway_endpoint_for_profile("work") == ("http://work-gw:9000", "root-key-0123456789")
+
+
+def test_process_shared_url_beats_a_stale_root_env_url(homes):
+    root, work = homes
+    (root / ".env").write_text("HERMES_WEBUI_GATEWAY_BASE_URL=http://stale-gw:7000\nAPI_SERVER_KEY=root-key-0123456789\n")
+    (work / ".env").write_text("API_SERVER_KEY=work-key-0123456789\n")
+
+    assert gateway_chat._gateway_endpoint_for_profile("work") == (f"{SHARED}/p/work", "work-key-0123456789")
+
+
 @pytest.mark.parametrize("name", [None, "", "default"])
 def test_root_profile_stays_unprefixed(homes, name):
     assert gateway_chat._gateway_endpoint_for_profile(name) == (SHARED, "root-key-0123456789")
