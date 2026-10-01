@@ -140,3 +140,39 @@ def test_stale_sidecar_pin_does_not_bypass_quota(tmp_path, monkeypatch):
     post = patch_pin_endpoint(monkeypatch, {"stale": sess})
     assert post("stale")[0] == 400
     assert writes == []
+
+
+def test_unmigrated_legacy_sidecar_pins_count_toward_quota(tmp_path, monkeypatch):
+    from api import models, routes
+
+    db = tmp_path / "state.db"
+    # Pre-upgrade: three pins live only in sidecars; state.db still says pinned=0.
+    _state_db(db, [(sid, None, None, None, 0) for sid in ("l0", "l1", "l2", "new_pin")])
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: db)
+    monkeypatch.setattr(routes, "_resolve_state_db_path", lambda profile=None: db, raising=False)
+    monkeypatch.setattr("api.state_sync._resolve_state_db_path", lambda profile=None: db)
+    monkeypatch.setattr(routes, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}])
+    writes = []
+    monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: writes.append(p) or True)
+    sess = PinSess("new_pin")
+    persisted = [{"session_id": f"l{i}", "pinned": True, "profile": "default"} for i in range(3)]
+    post = patch_pin_endpoint(monkeypatch, {"new_pin": sess}, persisted=persisted + [sess.compact()])
+    # No sidebar build (so no migration) has run yet.
+    assert post("new_pin")[0] == 400
+    assert writes == [] and sess.pinned is False
+
+
+def test_failed_repeat_pin_keeps_session_pinned(monkeypatch):
+    from api import routes
+
+    sess = PinSess("already")
+    sess.pinned = True
+    post = patch_pin_endpoint(monkeypatch, {"already": sess}, persisted=[sess.compact()])
+    monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}])
+    monkeypatch.setattr(routes, "agent_session_pinned_ids", lambda profile=None: {"already"})
+    monkeypatch.setattr(routes, "agent_session_pinned_flags", lambda ids, profile=None: {i: i == "already" for i in ids})
+    monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: False)
+    assert post("already")[0] == 503
+    assert sess.pinned is True
+    assert routes._PIN_QUOTA_RESERVATIONS == {}

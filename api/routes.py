@@ -505,7 +505,12 @@ def _pin_quota_rows_from_state_db(rows) -> list[dict] | None:
         for row in profile_rows:
             sid = str(row.get("session_id") or "").strip()
             seen.add(sid)
-            if sid in known:
+            # An unmigrated sidecar pin still counts until state.db's value is confirmed.
+            if sid in known and (
+                sid in pinned_ids
+                or row.get("pinned") is not True
+                or _state_db_pin_confirmed(sid, profile)
+            ):
                 row["pinned"] = sid in pinned_ids
             out.append(row)
         lineage_rows = agent_session_pin_lineage_rows(pinned_ids - seen, profile=profile)
@@ -17963,6 +17968,7 @@ def handle_post(handler, parsed) -> bool:
             except KeyError:
                 pass
             reserved_quota = False
+            prior_pinned = bool(getattr(s, "pinned", False))
             reservation_key = (_pin_profile(getattr(s, "profile", None)), s.session_id)
             # The cached sidecar pin may be stale, so every pin request is checked against state.db.
             if pin_requested:
@@ -18012,7 +18018,7 @@ def handle_post(handler, parsed) -> bool:
                 if not _write_pin_to_state_db(s, pin_requested):
                     if reserved_quota:
                         with LOCK:
-                            s.pinned = False
+                            s.pinned = prior_pinned
                     return bad(handler, "Could not record the pin in state.db", 503)
                 committed = True
                 s.pinned = pin_requested
