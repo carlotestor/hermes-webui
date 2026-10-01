@@ -44,6 +44,99 @@
 
 ### Fixed
 
+- **Replayed copies of a saved message no longer pile up in the session file.** When a stream reconnect or
+  re-persist wrote the same stored message again (same `id`, same `timestamp`, identical content), each save
+  appended another copy, so a session could grow without bound (#6568). Saving now drops only those exact
+  duplicates. A row whose content changed, rows without a stable `id`/`timestamp`, and repeated turns with
+  the same text but different ids are all kept. The message count, `.bak` backup and sidebar index row are
+  computed from the same cleaned copy, and a same-session save publishes the file and its sidebar row
+  together so an older overlapping save can't overwrite a newer one. If the duplicate check fails while
+  restoring from a backup, the restore stops and leaves the live file untouched. Thanks @stefanpieter, with
+  a fix from @pxxD1998. (#6569)
+- **Pinned title language is honoured.** `auxiliary.title_generation.language` now pins the language of
+  WebUI-generated titles, as it already does in Hermes Agent. The title prompt asks for that language,
+  and the drift check that rejects a title in the wrong language (#3293) is retargeted to the pin, so
+  it no longer throws away the title the pin asked for. Both title routes (the auxiliary client and the
+  active agent) honour it. Leaving it unset keeps the old behaviour of matching the user's language.
+  `docs/advanced-chat-setup.md` describes how pins map to scripts. Thanks @djennewe. (#6566)
+- **Turns adopted by a deferred save keep their provenance.** When a turn row was adopted on the
+  deferred-save path rather than by an eager checkpoint, its `_source` stamp was never written, so a
+  process-wakeup or delegation turn could later render as an ordinary user message. The stamp now
+  happens on both paths. Thanks @happy5318. (#7828)
+
+- **Background subagent results that were pending at a restart are delivered again.** Current Hermes
+  Agent no longer reloads undelivered async-delegation completions from its durable ledger when it is
+  imported; it waits for the first consumer to ask. The WebUI reads the completion queue directly
+  rather than through the Agent's own drain, so it never asked, and a subagent result that finished
+  while the WebUI was restarting stayed in the ledger without reaching the parent chat. Both WebUI
+  drain paths now ask the Agent to restore the ledger first. Older Agent builds, which restore on
+  import, are unaffected. Thanks @franksong2702. (#7927)
+
+- **The clarify tool works again with current Hermes Agent.** Hermes Agent changed its clarify
+  callback to pass one list of questions and expect the answers back as a structured reply. The WebUI
+  still registered the older two-argument callback, so every clarify call in a WebUI chat failed with
+  "missing 1 required positional argument: 'choices'" before the card could appear. The bridge now
+  accepts both shapes. With current Agent builds it shows the questions one card at a time and returns
+  each answer keyed by question; a timeout, a Stop, or a missing clarify surface ends the batch and is
+  reported as such, so the agent can tell an unanswered question from a cancelled one. Older Agent
+  builds keep the previous behaviour. Thanks @shentonyan. (#7923, closes #7922)
+- **The Nix package starts again.** Since `managed_agent_startup.py` was added, `server.py` imports it
+  at startup, but the Nix derivation didn't copy it into the package, so the packaged binary exited
+  with `ModuleNotFoundError` and crash-looped under a supervisor. It is now packaged with the other
+  startup modules. Thanks @erikcw. (#7928, closes #7929)
+- **A phone that drops off the network no longer turns a live stream into a server error.** When a
+  client vanished at the network layer (left the Wi-Fi, a Tailscale peer dropped), the next write on
+  a long-lived stream (chat, gateway events, terminal output, approvals, clarify) failed with a
+  routing error such as "No route to host". That wasn't recognised as a disconnect, so it ended as a
+  500 with a traceback in the log instead of a quiet disconnect. Those routing errors are now treated
+  like any other disconnect at the stream's single write point; real server errors such as a full
+  disk still surface. Thanks @fedebyes. (#7857)
+
+- **Delegated subagent rows under a chat no longer repeat "Subagent: ".** Under a parent's "N
+  children" badge, each delegated child read `-> Subagent: Audit the retry path…`, which spent the
+  narrowest rows in the sidebar on a word the badge and indent already say. Those nested rows now
+  show the task itself. The stored title, rename, search, flat rows and the opened child's title
+  bar keep the full `Subagent: …` title, and fork children are unchanged. Thanks @carlotestor.
+  (#7884)
+- **On phones, the closed workspace drawer no longer traps keyboard focus.** The drawer only slid
+  off-screen when closed, so tabbing from the composer walked into its invisible buttons and could
+  open the hidden file picker. The closed drawer is now out of the tab order and ignores taps; the
+  slide animation and the open drawer are unchanged. Thanks @happy5318. (#7866, closes #7713)
+
+- **The conversation-lifecycle browser check no longer flakes at a minute boundary.** It compared a
+  settled terminal row's text with the same row after a reload, and the trailing rendered clock
+  (`12:34 PM` → `12:35 PM`) made them differ whenever the reload crossed a minute. It now strips only
+  a trailing clock line before comparing; real content differences still fail. Test-only. Thanks
+  @webtecnica. (#7911, closes #7792)
+
+- **The Codex model picker no longer offers retired models when live discovery is unavailable.**
+  When the WebUI couldn't reach Codex's account-aware catalog, the `openai-codex` picker fell back to
+  a static list that still carried retired models (`gpt-5.3-codex`, `gpt-5.2-codex`,
+  `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`, `codex-mini-latest`) and a nonexistent `gpt-5.5-mini`,
+  and generic Agent-core seeding could add entitlement-dependent Codex IDs back. The fallback now
+  lists the current subscription models, Codex is excluded from core seeding (its live/cache path
+  owns freshness), `gpt-5.5-mini` is gone from the OpenAI fallbacks, and a Codex model is always
+  sent with its provider so an overlapping configured provider can't claim the bare ID.
+  Thanks @starship-s. (#6817)
+
+- **A brief server error while reloading no longer forgets which conversation you had open.** If
+  the session's metadata request failed with a transient error (a 500, a timeout, a dropped
+  connection) during a page reload, the WebUI treated that as proof the saved session no longer
+  existed: it cleared the saved session id and the `/session/<id>` address, so the next reload
+  opened a blank new chat instead of your conversation. It now keeps both on any non-404 failure
+  and shows the usual "Failed to load session" message, so reloading once the server recovers
+  brings the conversation back. A real 404 (the session was deleted) still clears them as before.
+  Thanks @starship-s. (#7071)
+
+- **Adding, toggling or deleting an MCP server no longer writes expanded secrets or half-applied
+  changes.** MCP writes edited the same cached, environment-expanded config the runtime reads, so a
+  save could write resolved `${VAR}` values into `config.yaml`, leave the runtime changed after the
+  save itself failed, or persist another request's in-flight edit. Each MCP write now pins the
+  active profile's config path under the config lock, edits a private copy of the raw file
+  (placeholders, masked values and unrelated sections preserved), refuses to save when the existing
+  file can't be read as a mapping, and reloads the runtime only after the atomic save succeeds.
+  Thanks @franksong2702. (#7822)
+
 - **WebUI starts again after `hermes update` moves the Agent onto its managed runtime.** Current
   Hermes Agent source installs relaunch any process that isn't on the Agent's managed interpreter,
   and that managed environment ships `ruamel.yaml` but not necessarily PyYAML. WebUI then never
