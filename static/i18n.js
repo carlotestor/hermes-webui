@@ -319,6 +319,7 @@ const LOCALES = {
     steer_fail_stream_dead: 'The agent stream has ended',
     steer_fail_steer_error: 'Steer delivery failed — the agent may have finished',
     steer_fail_network_error: 'Network error — check your connection',
+    steer_fail_gateway_steer_uncertain: 'Steer may have reached the agent (no reply from Gateway); your text is kept in the composer',
     steer_fail_unknown: 'Steer unavailable',
     steer_recovery_retry: 'Retry',
     steer_recovery_dismiss: 'Dismiss',

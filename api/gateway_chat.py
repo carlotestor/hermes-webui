@@ -1,6 +1,7 @@
 """Default-off Hermes Gateway bridge for browser-originated chat turns."""
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -782,6 +783,7 @@ def _run_gateway_runs_api_streaming(
                 sse_event = "message"
                 continue
             if payload_event == "run.completed":
+                _relay_gateway_pending_steer(session_id, payload, put_gateway_event)
                 from api.route_approvals import settle_gateway_pending_run
                 settle_gateway_pending_run(
                     session_id,
@@ -799,6 +801,7 @@ def _run_gateway_runs_api_streaming(
                 sse_event = "message"
                 continue
             if payload_event == "run.failed":
+                _relay_gateway_pending_steer(session_id, payload, put_gateway_event)
                 from api.route_approvals import settle_gateway_pending_run
                 settle_gateway_pending_run(
                     session_id,
@@ -807,6 +810,7 @@ def _run_gateway_runs_api_streaming(
                 )
                 raise RuntimeError(str(payload.get("error") or "Gateway run failed"))
             if payload_event == "run.cancelled":
+                _relay_gateway_pending_steer(session_id, payload, put_gateway_event)
                 from api.route_approvals import settle_gateway_pending_run
                 settle_gateway_pending_run(
                     session_id,
@@ -860,12 +864,25 @@ def stop_gateway_run(run_id: str) -> bool:
         return False
 
 
-def steer_gateway_run(run_id: str, text: str) -> bool:
-    """Forward steer text to the Gateway run; True only when the Gateway accepted it."""
+GATEWAY_STEER_ACCEPTED = "accepted"
+GATEWAY_STEER_REFUSED = "refused"
+GATEWAY_STEER_UNCERTAIN = "uncertain"
+GATEWAY_STEER_TIMEOUT_SECS = 10
+
+
+def steer_gateway_run(run_id: str, text: str) -> str:
+    """Forward steer text to the Gateway run.
+
+    ``accepted``: 2xx with ``accepted: true``. ``refused``: the Gateway answered
+    otherwise, or the request never fully left (urllib wraps connect/send errors
+    in URLError), so a re-queue cannot double-deliver. ``uncertain``: the request
+    was sent but the answer was lost (timeout, reset, unreadable 2xx body); the
+    Gateway may already hold the text.
+    """
     run_id = str(run_id or "").strip()
     text = str(text or "").strip()
     if not run_id or not text:
-        return False
+        return GATEWAY_STEER_REFUSED
     base_url, api_key = gateway_run_endpoint(run_id)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if api_key:
@@ -883,16 +900,27 @@ def steer_gateway_run(run_id: str, text: str) -> bool:
 
     try:
         opener = urllib.request.build_opener(_NoRedirect)
-        with opener.open(req, timeout=10) as response:
+        with opener.open(req, timeout=GATEWAY_STEER_TIMEOUT_SECS) as response:
             final_url = str(getattr(response, "geturl", lambda: req.full_url)() or "")
             status = int(getattr(response, "status", getattr(response, "code", 0)) or 0)
             if not (200 <= status < 300 and final_url == req.full_url):
-                return False
+                return GATEWAY_STEER_REFUSED
             payload = json.loads(response.read() or b"{}")
-            return bool(isinstance(payload, dict) and payload.get("accepted") is True)
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
-        logger.debug("Gateway steer failed for run %s", run_id, exc_info=True)
-        return False
+            accepted = isinstance(payload, dict) and payload.get("accepted") is True
+            return GATEWAY_STEER_ACCEPTED if accepted else GATEWAY_STEER_REFUSED
+    except urllib.error.URLError:  # includes HTTPError: answered, or never sent
+        logger.debug("Gateway steer refused or not sent for run %s", run_id, exc_info=True)
+        return GATEWAY_STEER_REFUSED
+    except (OSError, ValueError, http.client.HTTPException):
+        logger.debug("Gateway steer outcome unknown for run %s", run_id, exc_info=True)
+        return GATEWAY_STEER_UNCERTAIN
+
+
+def _relay_gateway_pending_steer(session_id, payload, put_gateway_event) -> None:
+    """Replay steer text the Gateway accepted but the run never consumed, like _settle_pending_steer()."""
+    text = payload.get("pending_steer") if isinstance(payload, dict) else None
+    if isinstance(text, str) and text.strip():
+        put_gateway_event("pending_steer_leftover", {"session_id": session_id, "text": text})
 
 
 _GATEWAY_RUN_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
@@ -972,6 +1000,7 @@ def _await_gateway_run_result(
                     session_id, run_id, approval, base_url, api_key, put_gateway_event=put_gateway_event,
                 )
         if state in _GATEWAY_RUN_TERMINAL_STATUSES:
+            _relay_gateway_pending_steer(session_id, status, put_gateway_event)
             settle_gateway_pending_run(session_id, run_id, reason=f"Gateway run {state} before approval resolution")
             if state == "cancelled":
                 put_gateway_event("cancel", {"message": "Cancelled by gateway"})

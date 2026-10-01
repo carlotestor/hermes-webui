@@ -15125,11 +15125,17 @@ def _deliver_gateway_steer(sid: str, result: dict, text: str) -> dict:
         return result
     stream_id = result.get("stream_id")
     try:
-        from api.gateway_chat import steer_gateway_run, wait_for_gateway_run_id
+        from api.gateway_chat import (
+            GATEWAY_STEER_ACCEPTED, GATEWAY_STEER_UNCERTAIN, steer_gateway_run, wait_for_gateway_run_id,
+        )
 
         _, run_id = wait_for_gateway_run_id(str(stream_id or ""), 0)
-        if run_id and steer_gateway_run(run_id, text):
+        outcome = steer_gateway_run(run_id, text) if run_id else None
+        if outcome == GATEWAY_STEER_ACCEPTED:
             return {"accepted": True, "fallback": None, "stream_id": stream_id}
+        if outcome == GATEWAY_STEER_UNCERTAIN:
+            # Sent but unanswered: queueing could deliver it twice; the browser keeps the draft.
+            return {"accepted": False, "fallback": "gateway_steer_uncertain", "stream_id": stream_id}
     except Exception:
         logger.debug("Gateway steer forwarding failed for session %s", sid, exc_info=True)
     return result

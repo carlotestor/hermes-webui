@@ -87,3 +87,69 @@ def test_unknown_run_id_is_not_forwarded(gateway):
     gateway_chat._STREAM_RUN_LIFECYCLE.pop("run", None)
     assert steer() == {"accepted": False, "fallback": "gateway_steer_queued", "stream_id": "run"}
     assert gateway.calls == []
+
+
+def test_accept_that_answers_late_is_uncertain_not_queued(gateway, monkeypatch):
+    """The Gateway took the text but replied after the timeout: re-queueing would deliver it twice."""
+    release = threading.Event()
+    real_post = _GatewayStub.do_POST
+
+    def slow_post(self):
+        release.wait(5)
+        real_post(self)
+
+    monkeypatch.setattr(_GatewayStub, "do_POST", slow_post)
+    monkeypatch.setattr(gateway_chat, "GATEWAY_STEER_TIMEOUT_SECS", 0.3)
+    try:
+        assert steer() == {"accepted": False, "fallback": "gateway_steer_uncertain", "stream_id": "run"}
+    finally:
+        release.set()
+
+
+def test_connect_failure_before_sending_keeps_the_queue_fallback(gateway, monkeypatch):
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()  # nothing listens: refused before any byte is sent
+    monkeypatch.setattr(gateway_chat, "gateway_run_endpoint", lambda run_id: (f"http://127.0.0.1:{port}", ""))
+    assert steer() == {"accepted": False, "fallback": "gateway_steer_queued", "stream_id": "run"}
+
+
+def test_uncertain_steer_keeps_the_draft_in_the_browser():
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    js = (root / "static" / "commands.js").read_text(encoding="utf-8")
+    assert "fallback==='gateway_steer_uncertain'" not in js  # never auto-queued
+    assert "steer_fail_gateway_steer_uncertain:" in (root / "static" / "i18n.js").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("event", ["run.completed", "run.failed", "run.cancelled"])
+def test_live_relay_replays_unconsumed_gateway_steer(event):
+    events = []
+    gateway_chat._relay_gateway_pending_steer(
+        "sid", {"event": event, "pending_steer": "go left"}, lambda e, d: events.append((e, d)))
+    gateway_chat._relay_gateway_pending_steer("sid", {"event": event}, lambda e, d: events.append((e, d)))
+    assert events == [("pending_steer_leftover", {"session_id": "sid", "text": "go left"})]
+    src = __import__("inspect").getsource(gateway_chat._run_gateway_runs_api_streaming)
+    block = src[src.index(f'if payload_event == "{event}":'):]
+    assert block.split("\n")[1].strip() == "_relay_gateway_pending_steer(session_id, payload, put_gateway_event)"
+
+
+@pytest.mark.parametrize("state", ["completed", "failed", "cancelled"])
+def test_reattach_status_replays_unconsumed_gateway_steer(monkeypatch, state):
+    events = []
+    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status",
+                        lambda *a: {"status": state, "output": "ok", "pending_steer": "go left"})
+    monkeypatch.setattr(gateway_chat, "update_active_run", lambda *a, **k: None)
+    monkeypatch.setattr("api.route_approvals.settle_gateway_pending_run", lambda *a, **k: None)
+    try:
+        gateway_chat._await_gateway_run_result(
+            "sid", "rs", "run_9", "http://x", "", put_gateway_event=lambda e, d: events.append((e, d)),
+            cancel_event=threading.Event())
+    except RuntimeError:
+        assert state == "failed"
+    finally:
+        gateway_chat._STREAM_RUN_IDS.pop("rs", None)
+        gateway_chat._STREAM_RUN_LIFECYCLE.pop("rs", None)
+    assert events[0] == ("pending_steer_leftover", {"session_id": "sid", "text": "go left"})
