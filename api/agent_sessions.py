@@ -1112,30 +1112,35 @@ def read_importable_agent_session_rows(
             # A compressed parent is projected under its tip id; a child delegated before the
             # compression names the old segment, so resolve it through the lineage root too.
             by_root = {row['_lineage_root_id']: row for row in projected if row.get('_lineage_root_id')}
+            def _is_subagent(row):
+                return str(row.get('raw_source') or row.get('source') or '').strip().lower() == 'subagent'
+
+            def _parent_of(row):
+                parent_id = row.get('parent_session_id')
+                return by_id.get(parent_id) or by_root.get(row.get('_parent_lineage_root_id') or parent_id)
+
             pending = list(selected)
-            unresolved = []
             while pending:
                 row = pending.pop()
-                if str(row.get('raw_source') or row.get('source') or '').strip().lower() != 'subagent':
+                if not _is_subagent(row) or not row.get('parent_session_id'):
                     continue
-                parent_id = row.get('parent_session_id')
-                if not parent_id:
-                    continue
-                parent = by_id.get(parent_id) or by_root.get(row.get('_parent_lineage_root_id') or parent_id)
-                if parent is not None and parent.get('id') in have:
-                    continue
-                if parent is None or str(parent.get('raw_source') or parent.get('source') or '').strip().lower() != 'subagent':
-                    if parent is None:
-                        unresolved.append(row)
+                parent = _parent_of(row)
+                if parent is None or parent.get('id') in have or not _is_subagent(parent):
                     continue
                 selected.append(parent)
                 have.add(parent.get('id'))
                 pending.append(parent)
-            # The sidebar reads parent_source as "the parent is in this payload"; a subagent parent that
-            # could not be placed here (e.g. projected away) must not claim that, or the child vanishes.
-            for row in unresolved:
-                if str(row.get('parent_source') or '').strip().lower() == 'subagent':
-                    row['parent_source'] = None
+            # The sidebar reads parent_source as "the parent is in this payload". A delegated child whose
+            # parent row is not in it (absent, or a non-subagent parent such as a Desktop/CLI session that
+            # missed the slice) must not claim that, or the child vanishes. WebUI parents are exempt: the
+            # WebUI bucket supplies their row, so the child nests (or follows its filtered-out parent).
+            for row in selected:
+                if not _is_subagent(row) or not row.get('parent_session_id'):
+                    continue
+                parent = _parent_of(row)
+                if parent is not None and (parent.get('id') in have or str(parent.get('source') or '').strip().lower() == 'webui'):
+                    continue
+                row['parent_source'] = None
             return _result(selected, window_exhausted)
 
         cur.execute(

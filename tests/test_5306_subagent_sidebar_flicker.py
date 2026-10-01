@@ -655,3 +655,68 @@ console.log(JSON.stringify({{top, nested}}));
         assert out["nested"] == [["orch_tip", "leaf"]], out
     else:  # parent beyond the limit * 8 oversample: child stays an openable top-level row
         assert "leaf" in out["top"] and out["nested"] == [], out
+
+
+def _desktop_parent_db(path, newer):
+    """A Desktop parent that went quiet, its delegated child, and `newer` hotter unrelated rows."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, model TEXT, message_count INTEGER, "
+        "started_at REAL, source TEXT, parent_session_id TEXT, ended_at REAL, end_reason TEXT)"
+    )
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, timestamp REAL)")
+    rows = [("desk", "Desktop run", 100.0, "desktop", None), ("leaf", "Leaf", 120.0, "subagent", "desk")]
+    rows += [(f"new{i}", f"Newer {i}", 300.0 + i, "subagent", None) for i in range(newer)]
+    for sid, title, started, source, parent in rows:
+        conn.execute(
+            "INSERT INTO sessions (id, title, model, message_count, started_at, source, parent_session_id) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (sid, title, "gpt", 2, started, source, parent),
+        )
+    ts = {"desk": 110.0, "leaf": 9000.0}
+    ts.update({f"new{i}": 400.0 + i for i in range(newer)})
+    for sid, t in ts.items():
+        conn.execute("INSERT INTO messages (session_id, role, timestamp) VALUES (?,?,?)", (sid, "user", t))
+        conn.execute("INSERT INTO messages (session_id, role, timestamp) VALUES (?,?,?)", (sid, "assistant", t + 0.5))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("newer", [19, 25])
+def test_5305_subagent_of_desktop_parent_outside_window_stays_reachable(tmp_path, newer):
+    """Re-gate: the Desktop parent is in the oversample but not the 20-row slice, and the
+    parent-recovery loop only re-adds subagent parents. The child must not keep claiming
+    ``parent_source='desktop'`` (\"parent is in this payload\"), or the all-profiles sidebar
+    drops it from both tabs; it must stay an openable row."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    _desktop_parent_db(db, newer=newer)
+    rows = models._load_cli_sessions_uncached(
+        tmp_path, db, None, visible_session_limit=20, include_claude_code=False
+    )
+    # The all-profiles loader merges these rows as-is (no lineage enrichment, so no cross-surface flag).
+    ids = [r["session_id"] for r in rows]
+    assert "leaf" in ids and "desk" not in ids, ids
+    leaf = next(r for r in rows if r["session_id"] == "leaf")
+    assert leaf["parent_source"] is None
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global._activeProject = null;
+global._showArchived = false;
+global.window = {{ _showCliSessions: true }};
+const allMatched = {json.dumps(rows, default=str)};
+const out = {{}};
+for (const tab of ['webui', 'cli']) {{
+  global._sessionSourceFilter = tab;
+  const part = _partitionSidebarSessionRows(allMatched, null);
+  const ref = tab === 'cli' ? part.cliReferenceRaw : part.webuiReferenceRaw;
+  const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, ref, part.rowsById);
+  out[tab] = rows.filter(r=>r.session_id==='leaf').map(r=>({{orphan:!!r._orphan_child_session}}));
+}}
+console.log(JSON.stringify(out));
+"""
+    out = json.loads(_run_node(source))
+    assert out["webui"] + out["cli"] == [{"orphan": True}], out
