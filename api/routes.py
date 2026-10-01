@@ -8663,9 +8663,16 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             import sqlite3 as _sqlite
             with closing(_sqlite.connect(str(db_path))) as _conn:
                 _conn.row_factory = _sqlite.Row
+                # Older state.db schemas lack parent_session_id; select NULL
+                # so source/title/model classification still works.
+                _cols = {r[1] for r in _conn.execute("PRAGMA table_info(sessions)")}
+                _parent_expr = (
+                    "parent_session_id" if "parent_session_id" in _cols
+                    else "NULL AS parent_session_id"
+                )
                 _row = _conn.execute(
                     "SELECT source, title, model, cwd, started_at, ended_at, "
-                    "parent_session_id FROM sessions WHERE id = ?", (sid,)
+                    f"{_parent_expr} FROM sessions WHERE id = ?", (sid,)
                 ).fetchone()
                 if _row is not None:
                     state_db_row = dict(_row)
