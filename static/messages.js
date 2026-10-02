@@ -6629,6 +6629,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(typeof updateQueueBadge==='function') updateQueueBadge(sid);
           showToast(t('steer_leftover_queued'),3000);
         }
+        if(typeof _steerReconcileLeftover==='function') _steerReconcileLeftover(sid,txt);
       }catch(_){}
     });
 

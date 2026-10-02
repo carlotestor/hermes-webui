@@ -120,7 +120,9 @@ def test_uncertain_steer_keeps_the_draft_in_the_browser():
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent
     js = (root / "static" / "commands.js").read_text(encoding="utf-8")
-    assert "fallback==='gateway_steer_uncertain'" not in js  # never auto-queued
+    fn = js[js.index("async function _trySteer("):js.index("async function cmdTitle(")]
+    queue_guard = fn[:fn.index("queueSessionMessage(ownerSid")].rsplit("if(", 1)[1]
+    assert "gateway_steer_queued" in queue_guard and "uncertain" not in queue_guard  # never auto-queued
     assert "steer_fail_gateway_steer_uncertain:" in (root / "static" / "i18n.js").read_text(encoding="utf-8")
 
 
