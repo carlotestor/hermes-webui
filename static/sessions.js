@@ -7833,13 +7833,18 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // branch above and still orphans as before.
       // A flag-less subagent is suppressed only when its parent shares its (WebUI) sidebar bucket, judged
       // by _isCliSession on the parent's own payload row (the partition's decision); a CLI-bucket parent
-      // never attaches here, so the child stays an orphan. parent_source is the fallback when no row exists.
+      // never attaches here, so the child stays an orphan. Without the row, only the server's
+      // parent_is_cli_session (or an unambiguously non-CLI parent_source) proves a shared bucket.
       // While searching, a matching child stays openable whatever its lineage flags.
       const childParentSource=String(child.parent_source||'').trim().toLowerCase();
+      // Raw sources is_cli_session_row never files as CLI; 'desktop' etc. are ambiguous.
+      const nonCliParentSources=['webui','subagent','cron','webhook','kanban','tool','api','api_server'];
       const parentPayloadRow=(payloadRowsById instanceof Map&&payloadRowsById.get(parentSid))||attachQueueById.get(parentSid)||null;
       const parentSharesBucket=parentPayloadRow
         ? !_isCliSession(parentPayloadRow)
-        : (!!childParentSource&&!_isCliSession({raw_source: childParentSource}));
+        : (typeof child.parent_is_cli_session==='boolean'
+          ? !child.parent_is_cli_session
+          : nonCliParentSources.includes(childParentSource)||(typeof _isMessagingSession==='function'&&_isMessagingSession({raw_source: childParentSource})));
       const subagentParentKnown=childIsDelegatedSubagent&&parentSharesBucket;
       const crossSurfaceChild=!!(child&&child._cross_surface_child_session&&_isChildSession(child));
       if(!searchActive&&(subagentParentKnown||crossSurfaceChild)) continue;

@@ -720,3 +720,71 @@ console.log(JSON.stringify(out));
 """
     out = json.loads(_run_node(source))
     assert out["webui"] + out["cli"] == [{"orphan": True}], out
+
+
+@pytest.mark.parametrize("parent_source", ["desktop", "webui"])
+def test_5305_source_scoped_webui_payload_keeps_subagent_of_cli_tab_parent(monkeypatch, parent_source):
+    """Re-gate: each tab is fetched alone (sidebar_source=webui|cli). An imported Desktop parent is
+    CLI-tab (is_cli_session) so the WebUI payload holds only its child; the server stamps
+    parent_is_cli_session so the child stays openable. A WebUI parent filtered out still suppresses."""
+    import api.routes as routes
+
+    desktop = parent_source == "desktop"
+    parent = {
+        "session_id": "p", "title": f"{parent_source.title()} session", "source": parent_source, "raw_source": parent_source,
+        "source_tag": parent_source, "session_source": "other" if desktop else "webui",
+        "is_cli_session": desktop, "profile": "default", "message_count": 5,
+        "actual_message_count": 5, "actual_user_message_count": 2, "updated_at": 100, "last_message_at": 100,
+    }
+    if not desktop:
+        parent["project_id"] = "elsewhere"
+    child = {
+        "session_id": "sub", "title": "Subagent Session", "parent_session_id": "p",
+        "relationship_type": "child_session", "parent_source": parent_source, "source": "subagent",
+        "raw_source": "subagent", "source_tag": "subagent", "session_source": "other",
+        "profile": "default", "message_count": 3, "updated_at": 101, "last_message_at": 101,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [dict(parent), dict(child)])
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda source_filter=None, all_profiles=False: [])
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _s: False)
+    monkeypatch.setattr(routes, "_prune_orphaned_webui_zero_message_sessions", lambda rows, **_k: rows)
+    payload = routes._build_session_list_cache_payload(
+        active_profile="default", all_profiles=False, show_cli_sessions=True,
+        show_previous_messaging_sessions=False, show_cron_sessions=False, sidebar_source="webui",
+    )
+    rows = routes._session_list_payload_to_response(payload)["sessions"]
+    if desktop:
+        assert [r["session_id"] for r in rows] == ["sub"], rows
+        assert rows[0]["parent_is_cli_session"] is True
+    else:
+        assert rows[next(i for i, r in enumerate(rows) if r["session_id"] == "sub")]["parent_is_cli_session"] is False
+        rows = [r for r in rows if r["session_id"] == "sub"]
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global._activeProject = null;
+global._showArchived = false;
+global.window = {{ _showCliSessions: true }};
+global._sessionSourceFilter = 'webui';
+const allMatched = {json.dumps(rows, default=str)};
+const part = _partitionSidebarSessionRows(allMatched, null);
+const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw, part.rowsById);
+console.log(JSON.stringify(rows.map(r=>({{sid:r.session_id, orphan:!!r._orphan_child_session}}))));
+"""
+    out = json.loads(_run_node(source))
+    assert out == ([{"sid": "sub", "orphan": True}] if desktop else []), out
+
+
+@pytest.mark.parametrize("parent_source,expect", [("desktop", [{"sid": "sub", "orphan": True}]), ("cron", [])])
+def test_5305_unstamped_child_infers_bucket_only_from_unambiguous_parent_source(parent_source, expect):
+    """With no parent row and no parent_is_cli_session, an ambiguous source (desktop) keeps the
+    child openable; only a source the server never files as CLI (cron) suppresses it."""
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global._showArchived = false;
+const raw = [
+  {{ session_id:'sub', title:'Subagent Session', parent_session_id:'p', relationship_type:'child_session', parent_source:'{parent_source}', raw_source:'subagent', source_tag:'subagent', session_source:'other', message_count:3 }},
+];
+const rows = _attachChildSessionsToSidebarRows([], raw);
+console.log(JSON.stringify(rows.map(r=>({{sid:r.session_id, orphan:!!r._orphan_child_session}}))));
+"""
+    assert json.loads(_run_node(source)) == expect
