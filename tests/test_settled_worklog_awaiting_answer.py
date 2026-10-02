@@ -303,3 +303,42 @@ def test_get_session_projects_subagent_lineage_and_lifecycle(
         True,
     )
     assert sess["read_only"] is True and sess["source_tag"] == "subagent"
+
+
+def _refresh_fn_sources():
+    from tests.test_issue6999_session_updated_coalesce import SESSIONS_JS, _function_source
+
+    helpers = [_function_source(SESSIONS_JS, n) for n in ("_isChildSession", "_isDelegatedSubagentRow")]
+    # _function_source starts at "function", so restore the async keyword.
+    return "\n".join([*helpers, "async " + _function_source(SESSIONS_JS, "refreshActiveSessionIfExternallyUpdated")])
+
+
+def test_subagent_finishing_with_unchanged_count_collapses_worklog():
+    remote = {**ENDED_SUBAGENT, "message_count": len(TWO_TURNS_RUNNING)}
+    script = textwrap.dedent(
+        f"""{_render_messages_harness()}
+        let _activeSessionExternalRefreshInFlight = false;
+        const _isMessageReaderUnpinned = () => false, _drainSessionUpdatedPendingCount = () => {{}};
+        const _isExternalSession = () => false;
+        let probes = 0;
+        const api = async () => {{ probes += 1; return {{ session: {json.dumps(remote)} }}; }};
+        const loadSession = async () => {{ throw new Error('no reload expected'); }};
+        {_refresh_fn_sources()}
+        S = {{ session: {{ ...{json.dumps(RUNNING_SUBAGENT)}, message_count: {len(TWO_TURNS_RUNNING)} }},
+              messages: {json.dumps(TWO_TURNS_RUNNING)}, toolCalls: [], busy: false }};
+        const flags = () => elements.msgInner.querySelectorAll('.tool-worklog-group')
+          .map((g) => g.getAttribute('data-collapsed') === 'true');
+        (async () => {{
+          renderMessages();
+          const running = flags();
+          const poll = await refreshActiveSessionIfExternallyUpdated('poll');
+          const ended = flags();
+          const after = await refreshActiveSessionIfExternallyUpdated('poll');
+          console.log(JSON.stringify([running, poll, ended, S.session.active, after, probes]));
+        }})();
+        """
+    )
+    # The running child is polled once; after it ends the poll gate skips again.
+    assert json.loads(_run_node_script(script)) == [
+        [False, False], "unchanged", [True, True], False, "skipped", 1,
+    ]
