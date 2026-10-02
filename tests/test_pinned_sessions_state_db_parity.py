@@ -230,31 +230,21 @@ def test_reconcile_state_db_wins_over_sidecar_after_migration(monkeypatch):
 
 
 def test_state_db_knows_session_reports_lookup_failure(tmp_path, monkeypatch):
-    import sys
-    import types
+    import sqlite3
 
     from api import state_sync
 
-    class _BrokenDB:
-        def __init__(self, *_a, **_kw):
-            pass
-
-        def get_session(self, _sid):
-            raise RuntimeError("database is locked")
-
-        def close(self):
-            pass
-
-    fake_mod = types.ModuleType("hermes_state")
-    fake_mod.SessionDB = _BrokenDB
-    monkeypatch.setitem(sys.modules, "hermes_state", fake_mod)
-    (tmp_path / "state.db").write_bytes(b"")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"not a sqlite database")
     monkeypatch.setattr(
         "api.profiles._resolve_profile_home_for_name", lambda _name: tmp_path, raising=False
     )
     assert state_sync.state_db_knows_session("abc", profile="default") is None
 
-    fake_mod.SessionDB = _FakeSessionDB
+    db.unlink()
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+    conn.commit(); conn.close()
     assert state_sync.state_db_knows_session("missing", profile="default") is False
 
 

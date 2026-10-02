@@ -19,7 +19,9 @@ any double-counting risk.
 import logging
 import ntpath
 import os
+import sqlite3
 import threading
+from contextlib import closing
 from pathlib import Path
 from typing import Optional
 
@@ -392,28 +394,22 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
 
 
 def state_db_knows_session(session_id: str, profile: Optional[str] = None) -> Optional[bool]:
-    """Whether ``session_id`` has a state.db row; no state.db is False, an unreadable one None."""
+    """Whether ``session_id`` has a state.db row; no state.db is False, an unreadable one None.
+
+    Read with sqlite directly so a missing ``hermes_state`` cannot turn an existing row into "absent".
+    """
     db_path = _resolve_state_db_path(profile)
     if db_path is None:
         return False
     try:
-        from hermes_state import SessionDB
-    except ImportError:
-        # A state.db exists but cannot be read here, so the row is unknown.
-        return None
-    db = None
-    try:
-        db = SessionDB(db_path)
-        return bool(db.get_session(session_id))
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").fetchone():
+                return False
+            row = conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        return row is not None
     except Exception:
         logger.debug("state.db lookup failed for %s", session_id, exc_info=True)
         return None
-    finally:
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                logger.debug("Failed to close state.db")
 
 
 def sync_session_pinned(session_id: str, pinned: bool, profile: Optional[str] = None) -> bool:
