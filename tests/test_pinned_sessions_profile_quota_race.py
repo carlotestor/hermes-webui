@@ -147,4 +147,4 @@ def test_another_profiles_sidecar_does_not_change_quota_archive_state(tmp_path, 
     monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}, {"name": "work"}])
 
     rows = routes._pin_quota_rows_from_state_db([])
-    assert routes._visible_pinned_lineage_ids(rows) == {"w0", "w1", "w2"}
+    assert routes._visible_pinned_lineage_ids(rows) == {("work", "w0"), ("work", "w1"), ("work", "w2")}

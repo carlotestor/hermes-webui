@@ -524,19 +524,31 @@ def _pin_quota_rows_from_state_db(rows) -> list[dict] | None:
     return out
 
 
-def _visible_pinned_lineage_ids(session_rows) -> set[str]:
-    sessions_by_id = {}
+def _pin_rows_by_profile(session_rows) -> dict:
+    """``{profile: {session_id: row}}``: session ids are only unique within one profile."""
+    by_profile: dict = {}
     for row in session_rows:
         sid = str(_session_field(row, "session_id", "") or "")
         if sid:
-            sessions_by_id[sid] = row
-    roots: set[str] = set()
+            by_profile.setdefault(_pin_profile(_session_field(row, "profile", None)), {})[sid] = row
+    return by_profile
+
+
+def _pin_lineage_key(row, by_profile) -> tuple[str, str]:
+    profile = _pin_profile(_session_field(row, "profile", None))
+    return profile, _session_row_lineage_root_id(row, by_profile.get(profile, {}))
+
+
+def _visible_pinned_lineage_ids(session_rows) -> set[tuple[str, str]]:
+    """Pinned lineages as ``(profile, lineage_root)`` keys."""
+    by_profile = _pin_rows_by_profile(session_rows)
+    roots: set[tuple[str, str]] = set()
     for row in session_rows:
         if not _session_counts_toward_pin_quota(row):
             continue
-        root = _session_row_lineage_root_id(row, sessions_by_id)
-        if root:
-            roots.add(root)
+        key = _pin_lineage_key(row, by_profile)
+        if key[1]:
+            roots.add(key)
     return roots
 
 
@@ -18313,14 +18325,7 @@ def handle_post(handler, parsed) -> bool:
                     target_row = s.compact()
                     candidate_rows.append(target_row)
                     pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows)
-                    target_lineage = _session_row_lineage_root_id(
-                        target_row,
-                        {
-                            str(_session_field(row, "session_id", "") or ""): row
-                            for row in candidate_rows
-                            if _session_field(row, "session_id", None)
-                        },
-                    )
+                    target_lineage = _pin_lineage_key(target_row, _pin_rows_by_profile(candidate_rows))
                     pinned_lineage_ids.discard(target_lineage)
                     pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
                     if len(pinned_lineage_ids) >= pinned_sessions_limit:

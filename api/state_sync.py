@@ -393,13 +393,14 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
 
 def state_db_knows_session(session_id: str, profile: Optional[str] = None) -> Optional[bool]:
     """Whether ``session_id`` has a state.db row; no state.db is False, an unreadable one None."""
-    try:
-        from hermes_state import SessionDB
-    except ImportError:
-        return False
     db_path = _resolve_state_db_path(profile)
     if db_path is None:
         return False
+    try:
+        from hermes_state import SessionDB
+    except ImportError:
+        # A state.db exists but cannot be read here, so the row is unknown.
+        return None
     db = None
     try:
         db = SessionDB(db_path)

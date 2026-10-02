@@ -173,3 +173,32 @@ def test_carry_fails_closed_when_parent_pin_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(models, "agent_session_pinned_flags", lambda *a, **kw: None)
     assert _carry_pin_to_compression_child("root", "child", "default") is False
     assert pins()["child"] is False
+
+
+def test_pin_fails_closed_when_state_db_exists_but_hermes_state_is_missing(tmp_path, monkeypatch):
+    import builtins
+    import api.state_sync as state_sync
+    from api import routes
+
+    db = tmp_path / "state.db"
+    db.write_bytes(b"")
+    monkeypatch.setattr(state_sync, "_resolve_state_db_path", lambda profile=None: db)
+    real_import = builtins.__import__
+
+    def blocked(name, *a, **kw):
+        if name == "hermes_state":
+            raise ImportError(name)
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    queued = []
+    monkeypatch.setattr(routes, "_queue_pin_for_absent_row", lambda *a: queued.append(a) or True)
+
+    class S:
+        session_id, profile = "sid", "default"
+
+    assert state_sync.state_db_knows_session("sid") is None
+    assert routes._write_pin_to_state_db(S(), True) is False
+    assert queued == []
+    monkeypatch.setattr(state_sync, "_resolve_state_db_path", lambda profile=None: None)
+    assert state_sync.state_db_knows_session("sid") is False

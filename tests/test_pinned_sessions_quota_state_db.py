@@ -28,10 +28,11 @@ def test_state_db_only_compression_segments_share_one_lineage(tmp_path, monkeypa
         ("fork", "tip", None, "fork", 1),
     ])
     monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: db)
+    monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}])
     # WebUI storage holds only the tip; root and mid exist only in state.db.
     webui = [{"session_id": "tip", "pinned": True, "profile": "default", "parent_session_id": "mid"}]
     rows = routes._pin_quota_rows_from_state_db(webui)
-    assert routes._visible_pinned_lineage_ids(rows) == {"root", "fork"}
+    assert routes._visible_pinned_lineage_ids(rows) == {("default", "root"), ("default", "fork")}
 
 
 def test_quota_rows_fail_closed_when_state_db_unreadable(tmp_path, monkeypatch):
@@ -67,7 +68,7 @@ def test_quota_counts_pins_of_a_registered_profile_without_webui_rows(tmp_path, 
     monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}, {"name": "work"}])
     # WebUI holds rows for "default" only; "work" was pinned from Desktop/CLI.
     rows = routes._pin_quota_rows_from_state_db([{"session_id": "a", "pinned": True, "profile": "default"}])
-    assert routes._visible_pinned_lineage_ids(rows) == {"a", "d1", "d2"}
+    assert routes._visible_pinned_lineage_ids(rows) == {("default", "a"), ("work", "d1"), ("work", "d2")}
 
 
 def test_missing_pin_store_counts_as_no_agent_pins(tmp_path, monkeypatch):
@@ -82,7 +83,7 @@ def test_missing_pin_store_counts_as_no_agent_pins(tmp_path, monkeypatch):
     monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: legacy if profile == "default" else None)
     # A state.db without sessions.pinned, and a profile without state.db, hold no agent pins.
     rows = routes._pin_quota_rows_from_state_db([{"session_id": "a", "pinned": True, "profile": "default"}])
-    assert routes._visible_pinned_lineage_ids(rows) == {"a"}
+    assert routes._visible_pinned_lineage_ids(rows) == {("default", "a")}
 
 
 def test_pin_endpoint_counts_state_db_only_pins_of_a_profile_without_webui_rows(tmp_path, monkeypatch):
@@ -176,3 +177,17 @@ def test_failed_repeat_pin_keeps_session_pinned(monkeypatch):
     assert post("already")[0] == 503
     assert sess.pinned is True
     assert routes._PIN_QUOTA_RESERVATIONS == {}
+
+
+def test_same_session_id_in_two_profiles_counts_as_two_lineages(monkeypatch):
+    from api import routes
+
+    writes = []
+    sess = PinSess("same", profile="default")
+    persisted = [{"session_id": "same", "pinned": True, "profile": "work"}, sess.compact()]
+    post = patch_pin_endpoint(monkeypatch, {"same": sess}, limit=1, persisted=persisted)
+    monkeypatch.setattr(routes, "_pin_quota_rows_from_state_db", lambda rows: list(rows))
+    monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: writes.append(p) or True)
+
+    assert post("same")[0] == 400
+    assert writes == [] and sess.pinned is False
