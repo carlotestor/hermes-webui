@@ -5,6 +5,12 @@
 
 ### Added
 
+- **Per-job "Tasks badge" toggle for scheduled jobs.** A new checkbox in the cron edit form (default on) controls
+  whether that job's completions count toward the Tasks unread badge and new-run marker, so a high-frequency
+  silent job (a sync or heartbeat) no longer keeps the badge lit. It mirrors the existing per-job "Completion
+  toasts" flag: the detail view shows it, the cron APIs (`/api/crons`, `/recent`, `/create`, `/update`) carry
+  `badge_notifications`, and jobs saved without the key keep counting. The toast hint no longer claims the badge
+  still updates when toasts are off. Thanks @BruceAi66. (#7375)
 - **The settings file can live outside the state directory.** `HERMES_WEBUI_SETTINGS_FILE` points one
   instance at its own `settings.json`, while sessions, workspaces and projects stay in the state
   directory. It is read once at startup, so restart after changing it. (#6433 by @futureworld678-create)
@@ -20,6 +26,11 @@
 
 ### Performance
 
+- **The all-profiles session list no longer computes every profile's skill counts.** Listing
+  sessions across all profiles (`/api/sessions?all_profiles=1`) called the profile-picker builder
+  only to learn the profile names, which also counted every profile's skills. It now adds the
+  active profile, the root profile and one entry per directory under the profiles root directly.
+  The scanned profiles, their labels and the cache key are unchanged. (#7973 by @ybai08, part of #7940)
 - **Reconnect, settle, cancel and undo no longer re-download the whole transcript.** Six recovery
   paths (offline/bfcache refresh, stream-end settle, cancel sync, `/compress` preflight, `/retry` and
   `/undo`) sent a bare `GET /api/session` that re-walked, re-redacted and re-serialized every row. The
@@ -42,8 +53,106 @@
   budget now resets only when the window reaches a position it hasn't just visited. (#6654, #6717 by
   @webtecnica)
 
+### Security
+
+- **The update check and workspace git no longer open credential prompts or trust checkout-controlled helpers.**
+  Unattended `git fetch`/`pull` from the update check, and the workspace git panel's operations, now run with a
+  scrubbed environment (`clean_git_env`: inherited `GIT_ASKPASS`, `GIT_SSH`, `GIT_CONFIG_*` and similar are removed)
+  and non-interactive argv, so a remote 401 becomes an error instead of a credential dialog nobody asked for.
+  Credential helpers come only from system and user config; a repository's own config can't add one. Proxy and SSH
+  trust checks follow the destination git actually uses: for a push, every URL from `branch.<name>.pushRemote`,
+  `remote.pushDefault`, the branch remote, then `origin` (including `pushurl` and `pushInsteadOf`), and a push is
+  refused before any side effect if any destination would go through a checkout-controlled proxy. Custom SSH commands
+  are probed with Git's own shell. `scripts/diagnose_update_git.py` prints the resolved destinations for a support
+  report. Thanks @snoyberg. (#7583)
+
+- **Only assistant and tool messages can grant access to a file outside the allowed folders.** `/api/media` serves a
+  file outside the allowed roots only when the requested session contains an exact `MEDIA:` reference to it. That
+  check excluded only user messages, so a system message, or a message with no role, also granted access. It is now
+  an allow-list: only `assistant` and `tool` messages can grant, and the hard-deny list still wins. Thanks
+  @laitekin. (#7297, fixes #7294)
+
 ### Fixed
 
+- **Hermes Desktop files WebUI sessions under their workspace instead of "Home".** The Agent creates the
+  `state.db` row for a WebUI turn but only stamps `cwd` for CLI sources. WebUI now writes the session's
+  workspace into `sessions.cwd` through the Agent's `update_session_cwd` when the workspace changes and at
+  the end of every turn. It only updates an existing row whose source is `webui` (never a CLI-owned row),
+  runs off the request path so a busy `state.db` never delays a turn, and is skipped on Agents without
+  `update_session_cwd`. It does not depend on the `sync_to_insights` setting. (#7918 by @AndreaB321)
+- **Foldables, tablets and narrow windows (641-900px) get a usable layout.** In that band the workspace files toggle
+  did nothing (the panel stayed hidden), tapping the toggle while the panel was open could leave it stuck open, and the
+  conversation sidebar squeezed the chat. The files panel now opens as a slide-over from the right (300px, the pattern
+  phones already use) with its own close, the sidebar defaults to the collapsed rail in that band unless you've
+  explicitly opened or collapsed it (that choice is remembered), and the hamburger or "Manage workspaces/profiles"
+  above 640px expands the real sidebar instead of a temporary drawer state that the next resize dropped. A collapsed
+  sidebar and a closed panel are also out of the keyboard Tab order. Phones (640px and below) and desktops above
+  900px keep their layout. Thanks @jatinbharadia, and @lianjun007 for the original #6952 diagnosis. (#7364)
+
+- **CSV, diff/patch and Excalidraw previews open from chat.** These files were served as
+  `application/octet-stream`, which the `MEDIA:` preview path rejects, so their previews failed. They now have their own
+  types (`text/csv`, `text/x-diff`, `application/vnd.excalidraw+json`), still behind the same exact assistant/tool
+  reference. Preview and download URLs also keep the session they were opened from, so switching sessions while a
+  preview loads can't reuse another session's URL. Thanks @laitekin. (#7297)
+
+- **The "Configured" group in the model picker shows model names, not raw ids.** Rows at the top of the picker
+  (composer and Settings → Default model) used the routing id as their title, e.g.
+  `@anthropic:claude-sonnet-4-6`. They now show the catalog name like every other group, with the raw id still
+  on the second line and in the badge. Thanks @webtecnica. (#7796)
+- **Four menus follow the interface language.** The Send key options in Settings, the Insights period picker, the
+  default-voice option in the voice settings and the screen-reader label of the Kanban bulk-status menu had English
+  text hard-coded, so they stayed English on a translated page. They now come from the translation table: Traditional
+  Chinese gets real translations, every other language shows the same English text as before. Thanks @happy5318, and
+  @Yularzhi for the report. (#7650, closes #7582)
+- **Scheduled-job "Next" and "Last" times match the job's own timezone.** The Tasks detail view converted those
+  timestamps to the browser's timezone, so a job scheduled "daily at 09:00" in America/Sao_Paulo could show 12:00 PM
+  and look misconfigured. Timestamps that carry a UTC offset are now shown in that offset, so the clock time matches
+  the schedule; a timestamp without an offset is shown as before. Thanks @happy5318. (#7740, fixes #7140)
+- **A background-process wake-up is no longer lost when its chat turn fails to start.** When a finished process
+  wakes its session, the WebUI consumes the pending completion before starting the turn. If preparing or starting that
+  turn then failed, the completion was gone with nothing left to retry. It is now saved again and retried once, two
+  seconds later, off the request thread; a failure on that retry keeps the prompt queued instead of scheduling more
+  timers. Only the process-completion path re-arms this way: an async-delegation completion keeps its own durable
+  retry, so one failed start can't deliver the same completion twice. Thanks @happy5318. (#7680)
+- **`MEDIA:` links work when the model wraps them in Markdown emphasis or quotes.** A reply like
+  `**MEDIA:/path/chart.png**`, `_MEDIA:/path/chart.png_` or `"MEDIA:/path/chart.png".` used to build a link that
+  included the closing `**`, `_` or quote, so the download 404ed. A closing delimiter or quote is now detached only
+  when it exactly matches the opener in front of `MEDIA:` (same characters, same length); everything else stays part of
+  the path, so filenames ending in `_`, `*`, `!` or `.` and URLs ending in `!` keep those bytes. The chat renderer, media
+  authorization, snapshots and public shares all use the same rule. Reported by @ned-kelly. Thanks @pxxD1998.
+  (#6923, closes #6890)
+- **Model aliases route to the provider they name.** A canonical `model_aliases` entry or a provider-qualified
+  legacy alias (`sol: openai-codex/gpt-5.6-sol`) now selects that provider, even when a same-named model exists
+  on another provider; an unqualified legacy alias keeps the old active-provider-then-fuzzy lookup. Sessions
+  keep the alias's target model. Aliases with their own `base_url`/`api_key`/`key_env` are resolved server-side
+  and never sent to the browser. On Gateway and runner chat, a provider-only alias is sent as its resolved model
+  and provider, and an endpoint/credential alias is refused with HTTP 400
+  (`model_alias_requires_in_process_backend`) before anything is dispatched. Thanks @snoyberg. (#7567)
+
+- **Reloading a session keeps each thinking block's identity, and your formatting.** When a reply had no
+  tool calls (or its tool metadata was missing), reload rebuilt thinking blocks from the transcript and dropped
+  the identity of the saved Thinking event, so a distinct saved thought could be merged away. Saved thinking
+  now keeps its identity on reload. When saved prose matches transcript prose, only the identity is carried
+  over; the transcript's exact Markdown (code blocks, indentation, lists) is what renders. Thanks
+  @franksong2702. (#7825)
+- **A chat start that fails before the agent runs no longer leaves a phantom message behind.** With eager
+  session saving on, the submitted prompt was written to disk before setup finished. If the start was then
+  rejected, that prompt stayed in the transcript as a turn that never ran, and a retry showed it twice. A
+  rejected start now restores the session as it was before the attempt, keeps any recovery backup that
+  already existed, and puts back pending wake-up markers it had consumed. (#7193, #7249 by @rodboev)
+- **Renaming, moving or archiving a session no longer overwrites a newer save.** These three actions looked the
+  session up before taking its lock. If the in-memory cache evicted it in between and something else (a draft
+  autosave, for example) saved a newer copy, the action then saved its stale copy over it, silently undoing the
+  newer change (#7738). The session is now resolved again inside the lock, and the move check runs against that
+  copy. CLI/TUI sessions keep their source identity through the reload, and a WebUI fork stays a fork. Thanks
+  @happy5318. (#7776)
+- **Background workers for the default profile keep their own profile.** A detached worker (a model-catalog
+  rebuild, the process-wakeup credential check) entered for the default/root profile used to skip binding the
+  request profile entirely, so it ran with whatever profile the thread last had or the process default. It now
+  binds the default profile explicitly (without copying a named profile's environment), and on exit restores
+  the exact profile that was active before, rather than clearing it. Nested scopes, exceptions and reused
+  executor threads all end with the outer profile intact. Part of #6326. Thanks @webtecnica for the original
+  diagnosis.
 - **Replayed copies of a saved message no longer pile up in the session file.** When a stream reconnect or
   re-persist wrote the same stored message again (same `id`, same `timestamp`, identical content), each save
   appended another copy, so a session could grow without bound (#6568). Saving now drops only those exact
@@ -102,6 +211,11 @@
   off-screen when closed, so tabbing from the composer walked into its invisible buttons and could
   open the hidden file picker. The closed drawer is now out of the tab order and ignores taps; the
   slide animation and the open drawer are unchanged. Thanks @happy5318. (#7866, closes #7713)
+
+- **The conversation-lifecycle check catches a reload that drops the terminal row's clock again.** The minute-boundary
+  flake fix compared the settled and reloaded terminal rows with the trailing clock stripped, so a reload that lost
+  the clock entirely also passed. The check now compares the row label and requires a clock on both sides, while
+  still allowing the clock value to differ, and it rejects empty row ids. Test-only. Thanks @happy5318. (#7808)
 
 - **The conversation-lifecycle browser check no longer flakes at a minute boundary.** It compared a
   settled terminal row's text with the same row after a reload, and the trailing rendered clock
