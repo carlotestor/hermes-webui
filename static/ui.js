@@ -13631,6 +13631,7 @@ function _anchorSceneToolCallFromRow(row, opts){
     args:(tool.args&&typeof tool.args==='object')?tool.args:((payload.args&&typeof payload.args==='object')?payload.args:{}),
     command:tool.command||payload.command||payload.cmd||'',
     raw_command:tool.raw_command||payload.raw_command||'',
+    display_command:tool.display_command||payload.display_command||'',
     preview:tool.preview||payload.preview||'',
     snippet:tool.snippet||payload.snippet||payload.result||payload.output||(
       row&&row.status!=='running'&&row.status!=='pending'?row.text:''
@@ -19173,9 +19174,13 @@ function _redactToolTargetLabel(value){
     .replace(/\bsshpass\s+-p\s+(?:"[^"]*"|'[^']*'|\S+)/gi,'sshpass -p "[redacted]"')
     .replace(/(--password(?:=|\s+))(?:"[^"]*"|'[^']*'|\S+)/gi,'$1[redacted]')
     .replace(/(password(?:=|\s+))(?:"[^"]*"|'[^']*'|\S+)/gi,'$1[redacted]')
-    // curl basic auth `-u user:pass` / `--user[=]user:pass`: keep the user, mask the password.
-    .replace(/(^|[\s;|(])(-u\s*|--user(?:=|\s+))(["'])([^"'\n:]*):[^\n]*?\3/g,'$1$2$3$4:[redacted]$3')
-    .replace(/(^|[\s;|(])(-u\s*|--user(?:=|\s+))([^\s"':]*):\S+/g,'$1$2$3:[redacted]')
+    // curl basic auth `-u user:pass` / `--user[=]user:pass`, curl only: mask the password
+    // through the end of the whole shell word (quotes, `\ ` escapes), keep the user.
+    .replace(/(\bcurl\b[^\n;|&]*?\s)(-u\s*|--user(?:=|\s+))((?:[^\s"'\\]|\\.|"(?:[^"\\]|\\.)*"|'[^']*')+)/gi,(m,pre,flag,word)=>{
+      const i=word.indexOf(':'); if(i<0) return m;
+      const q=(word[0]==='"'||word[0]==="'")&&word.length>1&&word.endsWith(word[0])?word[0]:'';
+      return pre+flag+word.slice(0,i)+':[redacted]'+q;
+    })
     // Env-assignment / flag secrets, masked across the full (multi-line) text so
     // the expanded shell card can't leak a key on a non-first line (#4926). Keys
     // matched case-insensitively: *(TOKEN|API_KEY|APIKEY|SECRET|PASSWD|PASSWORD|

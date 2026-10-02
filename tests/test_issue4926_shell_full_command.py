@@ -196,6 +196,9 @@ def test_real_command_keeps_shell_label_over_display_command(driver_path):
     ("curl --user=alice:s3cretPW https://x", "curl --user=alice:[redacted] https://x"),
     ("curl -u 'alice:pa ss' https://x", "curl -u 'alice:[redacted]' https://x"),
     ("curl -ualice:s3cretPW https://x", "curl -ualice:[redacted] https://x"),
+    ('curl -u alice:"pa ss" https://x', "curl -u alice:[redacted] https://x"),
+    ("curl -u alice:pa\\ ss https://x", "curl -u alice:[redacted] https://x"),
+    ('curl -sS --user "alice:pa ss" https://x', 'curl -sS --user "alice:[redacted]" https://x'),
 ])
 def test_curl_basic_auth_password_redacted_username_kept(driver_path, cmd, kept):
     out = _run(driver_path, {"args": {"command": cmd}})
@@ -203,7 +206,11 @@ def test_curl_basic_auth_password_redacted_username_kept(driver_path, cmd, kept)
     assert "s3cretPW" not in out["header"] and "pa ss" not in out["header"]
 
 
-@pytest.mark.parametrize("cmd", ["curl -u alice https://x", "sort -u file", "curl --username alice:bob"])
+@pytest.mark.parametrize("cmd", [
+    "curl -u alice https://x", "sort -u file", "curl --username alice:bob",
+    "docker run --user=1000:1000 alpine id", "docker run -u 1000:1000 alpine id",
+    "sudo -u postgres:postgres psql",
+])
 def test_curl_basic_auth_redaction_leaves_non_credentials(driver_path, cmd):
     assert _run(driver_path, {"args": {"command": cmd}})["lead"] == "$ " + cmd
 
