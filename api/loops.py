@@ -49,12 +49,10 @@ def _wakeup_outcome(messages, turn):
     from api.streaming import _session_has_cancel_marker
     msgs = list(messages or [])
     turn = turn or {}
-    token, at, prompt = turn.get("token"), turn.get("started_at"), turn.get("prompt")
+    token, at = turn.get("token"), turn.get("started_at")
 
-    def _is_wakeup(m):  # Stop's recovered row has no token and an int-truncated timestamp
-        return (token and m.get("_active_turn_token") == token) or (at and m.get("timestamp") == at) or (
-            prompt and at and m.get("_source") == "loop_wakeup"
-            and str(m.get("content") or "").strip() == prompt and m.get("timestamp") == int(at))
+    def _is_wakeup(m):  # Stop's recovered row carries the same token
+        return (token and m.get("_active_turn_token") == token) or (at and m.get("timestamp") == at)
     for i, m in enumerate(msgs):
         if m.get("role") == "user" and _is_wakeup(m):
             rows = []

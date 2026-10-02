@@ -202,6 +202,7 @@ def test_stop_on_wakeup_via_real_cancel_pauses_loop(tmp_path, monkeypatch):
     import queue
     from api import config, routes, streaming
     from api.models import Session
+    from api.process_event_utils import build_active_turn_token
     session = Session(session_id="s1", title="loop", messages=[])
     session.save = lambda *a, **kw: None
     agent, loops, started = _setup(tmp_path, monkeypatch, session)
@@ -221,9 +222,52 @@ def test_stop_on_wakeup_via_real_cancel_pauses_loop(tmp_path, monkeypatch):
     loops.run_due_loops()
     assert streaming.cancel_stream("stream1")
     user = [m for m in session.messages if m.get("role") == "user"][-1]
-    assert user["timestamp"] == 1000 and "_active_turn_token" not in user  # the recovered row
+    assert user["timestamp"] == 1000  # the recovered row keeps the turn token
+    assert user["_active_turn_token"] == build_active_turn_token("stream1", 1000.75)
     config.ACTIVE_RUNS.pop("stream1", None)
     loops.run_due_loops()
     with loops._home(None):
         s = agent.load_loop("s1")
     assert s.status == "paused" and s.paused_reason == "user-interrupted (Stop)"
+
+
+@requires_agent_modules
+def test_stop_on_fork_wakeup_pauses_loop_after_reload(tmp_path, monkeypatch):
+    import queue
+    from api import config, models, routes, streaming
+    from api.models import Session
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
+    (tmp_path / "sessions").mkdir()
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda *a: "deferred")
+    holder = {"s": Session(session_id="s1", title="fork", messages=[], session_source="fork")}
+    holder["s"].save()
+    agent, loops, started = _setup(tmp_path, monkeypatch, holder["s"])
+    monkeypatch.setattr(models, "get_session", lambda sid, **kw: holder["s"])
+    monkeypatch.setattr(streaming, "get_session", lambda sid, **kw: holder["s"])
+
+    def start(sid, msg, source):  # production chat-start preparer: fork overrides the wakeup source
+        started.append(msg)
+        routes._prepare_chat_start_session_for_stream(
+            holder["s"], msg=msg, attachments=[], workspace=str(tmp_path), model="m",
+            model_provider=None, stream_id="stream1", started_at=1000.75, source=source)
+        config.STREAMS["stream1"], config.CANCEL_FLAGS["stream1"] = queue.Queue(), threading.Event()
+        config.register_stream_owner("stream1", sid)
+        return {"stream_id": "stream1", "pending_started_at": 1000.75}
+
+    monkeypatch.setattr(routes, "start_session_turn", start)
+    with loops._home(None):
+        _due(agent)
+    loops.run_due_loops()
+    assert holder["s"].pending_user_source == "fork" and holder["s"].messages == []
+    assert streaming.cancel_stream("stream1")
+    config.ACTIVE_RUNS.pop("stream1", None)
+    holder["s"] = Session.load("s1")  # judge the durably settled transcript
+    user = [m for m in holder["s"].messages if m.get("role") == "user"][-1]
+    assert user["_source"] == "fork" and user["timestamp"] == 1000
+    loops.run_due_loops()
+    with loops._home(None):
+        s = agent.load_loop("s1")
+        assert s.status == "paused" and s.paused_reason == "user-interrupted (Stop)"
+        _due(agent)
+    loops.run_due_loops()
+    assert len(started) == 1
