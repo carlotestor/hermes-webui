@@ -1012,12 +1012,15 @@ def _gateway_endpoint_for_profile(profile_name, *, profile_routing: bool = True)
     cfg = get_config_for_profile_home(home)
     if not profile_routing or not name or _profiles._is_root_profile(name) or _profiles._is_isolated_profile_mode():
         return _gateway_base_url(cfg, {**process_env, **profile_env}), _gateway_api_key({**process_env, **profile_env})
-    if profile_env.get(_WEBUI_GATEWAY_BASE_URL_ENV) or cfg.get("webui_gateway_base_url"):
-        return _gateway_base_url(cfg, profile_env), _gateway_api_key(profile_env) or _gateway_api_key(process_env)
-    # No profile-owned URL: the shared listener (root .env/config) serves this profile under /p/<name>, with its own key.
     root_home = _profiles.get_hermes_home_for_profile("default")
-    root_env = _profiles.filter_runtime_env_for_gateway_parity(_profiles.get_profile_runtime_env(root_home))
-    shared_url = _gateway_base_url(get_config_for_profile_home(root_home), {**root_env, **process_env})
+    root_env = {**_profiles.filter_runtime_env_for_gateway_parity(_profiles.get_profile_runtime_env(root_home)), **process_env}
+    shared_url = _gateway_base_url(get_config_for_profile_home(root_home), root_env)
+    if profile_env.get(_WEBUI_GATEWAY_BASE_URL_ENV) or cfg.get("webui_gateway_base_url"):
+        url = _gateway_base_url(cfg, profile_env)
+        key = _gateway_api_key(profile_env) or _gateway_api_key(process_env)
+        # A profile URL naming the root listener may use the root key: same Gateway the key was issued for.
+        return url, key or (_gateway_api_key(root_env) if url == shared_url else "")
+    # No profile-owned URL: the shared listener (root .env/config) serves this profile under /p/<name>, with its own key.
     return f"{shared_url}/p/{urllib.parse.quote(name, safe='')}", _gateway_api_key(profile_env)
 
 

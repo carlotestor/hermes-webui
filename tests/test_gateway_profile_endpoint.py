@@ -80,6 +80,19 @@ def test_profile_owned_gateway_without_key_falls_back_to_the_process_key(homes):
     assert gateway_chat._gateway_endpoint_for_profile("work") == ("http://work-gw:9000", "root-key-0123456789")
 
 
+@pytest.mark.parametrize("profile_url,expected_key", [(SHARED, "root-secret"), ("http://work-gw:9000", "")])
+def test_profile_owned_url_without_key_uses_root_key_only_for_the_root_listener(homes, monkeypatch, profile_url, expected_key):
+    root, work = homes
+    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_BASE_URL")
+    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_API_KEY")
+    (root / ".env").write_text(f"HERMES_WEBUI_GATEWAY_BASE_URL={SHARED}\nHERMES_WEBUI_GATEWAY_API_KEY=root-secret\n")
+    profiles._reload_dotenv(root)
+    (work / "config.yaml").write_text(f"webui_gateway_base_url: {profile_url}\n")
+
+    assert gateway_chat._gateway_api_key() == "root-secret"
+    assert gateway_chat._gateway_endpoint_for_profile("work") == (profile_url, expected_key)
+
+
 def test_process_shared_url_beats_a_stale_root_env_url(homes):
     root, work = homes
     (root / ".env").write_text("HERMES_WEBUI_GATEWAY_BASE_URL=http://stale-gw:7000\nAPI_SERVER_KEY=root-key-0123456789\n")
