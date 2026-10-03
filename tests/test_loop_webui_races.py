@@ -1,3 +1,4 @@
+import pytest
 import threading
 from types import SimpleNamespace as NS
 
@@ -264,6 +265,56 @@ def test_stop_on_fork_wakeup_pauses_loop_after_reload(tmp_path, monkeypatch):
     holder["s"] = Session.load("s1")  # judge the durably settled transcript
     user = [m for m in holder["s"].messages if m.get("role") == "user"][-1]
     assert user["_source"] == "fork" and user["timestamp"] == 1000
+    loops.run_due_loops()
+    with loops._home(None):
+        s = agent.load_loop("s1")
+        assert s.status == "paused" and s.paused_reason == "user-interrupted (Stop)"
+        _due(agent)
+    loops.run_due_loops()
+    assert len(started) == 1
+
+
+@requires_agent_modules
+@pytest.mark.parametrize("session_source", ["webui", "fork"])
+def test_stop_when_worker_settles_first_pauses_loop_after_reload(tmp_path, monkeypatch, session_source):
+    # Worker-first ordering: the streaming worker's cancel finalizer saves the
+    # pending wakeup before cancel_stream() reaches its own recovery block.
+    import queue
+    from api import config, models, routes, streaming
+    from api.models import Session
+    from api.process_event_utils import build_active_turn_token
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
+    (tmp_path / "sessions").mkdir()
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda *a: "deferred")
+    holder = {"s": Session(session_id="s1", title="loop", messages=[], session_source=session_source)}
+    holder["s"].save()
+    agent, loops, started = _setup(tmp_path, monkeypatch, holder["s"])
+    monkeypatch.setattr(models, "get_session", lambda sid, **kw: holder["s"])
+    monkeypatch.setattr(streaming, "get_session", lambda sid, **kw: holder["s"])
+
+    def start(sid, msg, source):  # production chat-start preparer, worker owns the writeback
+        started.append(msg)
+        routes._prepare_chat_start_session_for_stream(
+            holder["s"], msg=msg, attachments=[], workspace=str(tmp_path), model="m",
+            model_provider=None, stream_id="stream1", started_at=1000.75, source=source)
+        config.STREAMS["stream1"], config.CANCEL_FLAGS["stream1"] = queue.Queue(), threading.Event()
+        config.register_stream_owner("stream1", sid)
+        config.register_session_writeback_owner(sid, "stream1")
+        return {"stream_id": "stream1", "pending_started_at": 1000.75}
+
+    monkeypatch.setattr(routes, "start_session_turn", start)
+    with loops._home(None):
+        _due(agent)
+    loops.run_due_loops()
+    config.CANCEL_FLAGS["stream1"].set()
+    streaming._finalize_cancelled_turn(holder["s"], stream_id="stream1")  # worker wins the race
+    assert holder["s"].pending_user_message is None and holder["s"].active_stream_id is None
+    streaming.cancel_stream("stream1")  # caller finds no active owner left
+    config.ACTIVE_RUNS.pop("stream1", None)
+    holder["s"] = Session.load("s1")
+    users = [m for m in holder["s"].messages if m.get("role") == "user"]
+    assert len(users) == 1
+    assert users[0]["_active_turn_token"] == build_active_turn_token("stream1", 1000.75)
     loops.run_due_loops()
     with loops._home(None):
         s = agent.load_loop("s1")
