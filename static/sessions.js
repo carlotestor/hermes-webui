@@ -2128,7 +2128,12 @@ async function newSession(flash, options={}){
       if(_dirP&&typeof _dirP.catch==='function') _dirP.catch(()=>{});
     }
     // Refresh sidebar to include the newly created session (#3874).
-    if(typeof refreshSessionList==='function'){Promise.resolve(refreshSessionList('new-session')).catch(()=>{})}
+    // force:true -> deferWhileInteracting:false so the new row paints and the
+    // active highlight moves even while the pointer hovers #sessionList. The
+    // handlers used to guarantee this with their own awaited render (#7936);
+    // now that newSession() owns the sole refresh it must force the paint,
+    // matching the project "+" path (#5002: "newSession doesn't render; callers must").
+    if(typeof refreshSessionList==='function'){Promise.resolve(refreshSessionList('new-session',{force:true})).catch(()=>{})}
   })();
   try{
     return await _newSessionInFlight;
@@ -7252,6 +7257,62 @@ function _formatInServerTz(date, options) {
   const sign = m[1] === '+' ? 1 : -1;
   const offsetMin = sign * (parseInt(m[2]) * 60 + parseInt(m[3]));
   const adjusted = new Date(date.getTime() + offsetMin * 60 * 1000);
+  return adjusted.toLocaleString(undefined, { ...options, timeZone: 'UTC' });
+}
+
+function _isoOffsetMinutes(iso) {
+  // Extract the ±HH:MM / ±HHMM / ±HH offset (in minutes, signed) embedded in
+  // an ISO 8601 timestamp string, e.g. "2026-09-24T09:00:00-07:00" → -420.
+  //
+  // Returns 0 for a trailing "Z" (explicit UTC — the wall clock needs no
+  // shift) and null for a naive string (no offset at all: the zone is
+  // unknown, so the caller must fall back to its own resolver rather than
+  // silently render it as one zone or another).
+  // Also returns null when the string is not a parseable timestamp.
+  if (typeof iso !== 'string' || !iso.trim()) return null;
+  const trimmed = iso.trim();
+  const m = trimmed.match(/([+-])(\d{2}):?(\d{2})(?::?\d{2}(?:\.\d+)?)?$/);
+  if (!m) {
+    if (/Z$/i.test(trimmed)) return 0;
+    return null;
+  }
+  const sign = m[1] === '+' ? 1 : -1;
+  const min = sign * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10));
+  if (!Number.isFinite(min) || Math.abs(min) > 14 * 60) return null;  // no real zone
+  return min;
+}
+
+function _formatInIsoTz(date, options) {
+  // Format `date` in the wall-clock zone its own ISO string carries.
+  //
+  // The agent serialises cron `next_run_at` / `last_run_at` with the
+  // offset of the zone the job was scheduled in (per-profile:
+  // hermes_time._resolve_timezone_name() → the active profile's
+  // config.yaml timezone), e.g. "2026-09-24T09:00:00-07:00" for a job
+  // whose container runs UTC but whose operator configured
+  // America/Los_Angeles. Formatting from the string's own offset is the
+  // only source that is correct for that job — no process-level inference
+  // (HERMES_TIMEZONE / TZ / strftime) and no per-browser guess can know
+  // which profile's zone a given job used.
+  //
+  // Strategy mirrors _formatInServerTz: shift the instant by the string's
+  // offset, then format with timeZone:'UTC' so no further conversion is
+  // applied — the output reads as the wall-clock time in the timestamp's
+  // own zone, including fractional-hour zones (Sao Paulo is whole-hour
+  // but India/Newfoundland are not).
+  //
+  // Returns null when the input carries no usable offset (naive string,
+  // non-string, unparseable), so the caller can fall back to its own
+  // resolver instead of silently rendering the wrong zone.
+  const iso = typeof date === 'string' ? date
+    : (date && typeof date === 'object' && typeof date.iso === 'string') ? date.iso
+    : null;
+  const offsetMin = iso ? _isoOffsetMinutes(iso) : null;
+  if (offsetMin === null || !Number.isFinite(offsetMin)) return null;
+  const instant = new Date(iso.trim());
+  if (Number.isNaN(instant.getTime())) return null;
+  if (offsetMin === 0) return instant.toLocaleString(undefined, { ...options, timeZone: 'UTC' });
+  const adjusted = new Date(instant.getTime() + offsetMin * 60 * 1000);
   return adjusted.toLocaleString(undefined, { ...options, timeZone: 'UTC' });
 }
 
