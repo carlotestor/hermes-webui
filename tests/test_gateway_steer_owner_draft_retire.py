@@ -10,7 +10,6 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-import pytest
 
 ROOT = Path(__file__).parents[1]
 
