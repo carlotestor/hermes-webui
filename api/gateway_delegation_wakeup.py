@@ -9,15 +9,16 @@ or ``hidden`` for presentation-suppressed notices) and deliberately starts no tu
 (``gateway.wake.persist_delegation_delivery``). Without a consumer here the
 parent agent only sees the result when the user next types.
 
-This poller claims those rows with the Agent's own exactly-once primitive
-(``SessionDB.claim_caller_history_deliveries``, the same claim the Gateway's
-next run uses to fold them) and starts a wakeup turn for idle sessions. A turn
-that is not accepted hands its rows back (``release_caller_history_deliveries``),
-so a failed or refused start never strands a completion: the next poll, or the
-Gateway's next-run fold, claims it again. Not covered: a WebUI process exit
-between the claim commit and the release/accepted start leaves those rows
-claimed; closing that window needs an expiring reservation in the Agent API.
-Without both methods it stays inert.
+This poller leases those rows with the Agent's reservation API
+(``SessionDB.reserve_caller_history_deliveries``), copies each result once into
+the session's model-facing ``context_messages`` (keyed by row id, so a retry
+never duplicates it), and starts a wakeup turn whose prompt is a FIXED nudge:
+the stored copy is the only one the model sees (the legacy Gateway path reads
+the state.db row instead; the runs-API fold skips content the caller already
+carries). Rows are committed only once the wake turn is persisted, and released
+otherwise; a WebUI crash in between just lets the lease expire and the next
+poll retries. Without reserve+commit the poller stays inert: the old final
+claim could lose a result, so there is no fallback to it.
 """
 from __future__ import annotations
 
@@ -29,6 +30,12 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 5.0
+RESERVATION_OWNER = "hermes-webui"
+RESERVATION_TTL_S = 120.0
+WAKE_PROMPT = ("[IMPORTANT: A delegated subagent finished. Its result is already in your "
+               "conversation history above; review it and continue the task.]")
+_REQUIRED_API = ("reserve_caller_history_deliveries", "commit_caller_history_deliveries",
+                 "release_caller_history_deliveries")
 # Rows older than this at first sight are left for the next user turn to fold.
 MAX_ROW_AGE_S = 6 * 3600
 
@@ -66,11 +73,18 @@ def _pending_session_ids(db_path: Path, since: float) -> list[str]:
         conn.close()
 
 
-def _claim_api_available() -> bool:
+def _session_db_cls():
     from hermes_state import SessionDB
 
-    return all(callable(getattr(SessionDB, name, None))
-               for name in ("claim_caller_history_deliveries", "release_caller_history_deliveries"))
+    return SessionDB
+
+
+def _claim_api_available() -> bool:
+    try:
+        cls = _session_db_cls()
+    except Exception:
+        return False
+    return all(callable(getattr(cls, name, None)) for name in _REQUIRED_API)
 
 
 def _sidecar_profile_matches(sidecar: Path, profile: str) -> bool:
@@ -106,36 +120,64 @@ def _webui_session_id(db_path: Path, session_id: str, profile: str) -> str | Non
         conn.close()
 
 
-def _start_wakeup(webui_sid: str, prompt: str) -> bool:
-    """True once the turn is accepted; any other outcome leaves the rows to be released."""
+def _start_wakeup(webui_sid: str) -> bool:
+    """True once the wake turn is persisted as the session's pending turn."""
     from api.routes import start_session_turn
 
     try:
-        resp = start_session_turn(webui_sid, prompt, source="process_wakeup") or {}
+        resp = start_session_turn(webui_sid, WAKE_PROMPT, source="process_wakeup") or {}
     except Exception:
         logger.warning("gateway delegation wakeup raised for %s", webui_sid, exc_info=True)
         return False
     status = int(resp.get("_status", 200) or 200)
     if status >= 400 and status != 409:
         logger.warning("gateway delegation wakeup failed for %s: %s %r", webui_sid, status, resp.get("error"))
-    return status < 400
+    return status < 400 and bool(resp.get("stream_id"))
+
+
+def _store_results_in_context(webui_sid: str, rows: list[dict]) -> None:
+    """Append each reserved result once to the sidecar's model-facing context; raises on failure."""
+    from api.config import _get_session_agent_lock
+    from api.models import get_session
+    from api.routes import _ensure_full_session_before_mutation
+
+    with _get_session_agent_lock(webui_sid):
+        s = _ensure_full_session_before_mutation(webui_sid, get_session(webui_sid))
+        context = list(getattr(s, "context_messages", None) or [])
+        if not context:
+            context = [m for m in (getattr(s, "messages", None) or []) if isinstance(m, dict)
+                       and m.get("role") in ("user", "assistant") and not m.get("_error")]
+        have = {m.get("_delegation_delivery_id") for m in context if isinstance(m, dict)}
+        added = [{"role": "user", "content": r["content"], "_delegation_delivery_id": r["id"],
+                  "timestamp": time.time()} for r in rows if r["id"] not in have]
+        if added:
+            s.context_messages = context + added
+            s.save(touch_updated_at=False)
 
 
 def _claim_and_wake(db_path: Path, state_sid: str, webui_sid: str) -> int:
-    """Claim the session's unconsumed delivery rows and start one wakeup turn, or hand them back."""
+    """Reserve the session's pending rows, store them once, wake with a fixed prompt, then commit."""
     from api.background_process import _session_has_active_turn
-    from hermes_state import SessionDB
 
     if _session_has_active_turn(webui_sid):
-        return 0  # rows stay unclaimed: the running turn's successor folds them, or the next poll
-    db = SessionDB(db_path)
+        return 0  # rows stay pending: the running turn's successor folds them, or the next poll
+    db = _session_db_cls()(db_path)
     try:
-        rows = db.claim_caller_history_deliveries(state_sid)
-        texts = [r["content"] for r in rows if isinstance(r.get("content"), str) and r["content"].strip()]
-        if texts and _start_wakeup(webui_sid, "\n\n".join(texts)):
+        rows = db.reserve_caller_history_deliveries(state_sid, RESERVATION_OWNER, RESERVATION_TTL_S)
+        rows = [r for r in rows if isinstance(r.get("content"), str) and r["content"].strip()]
+        if not rows:
+            return 0
+        token = rows[0]["reservation_token"]
+        try:
+            _store_results_in_context(webui_sid, rows)
+            woke = _start_wakeup(webui_sid)
+        except Exception:
+            logger.warning("gateway delegation wakeup failed for %s", webui_sid, exc_info=True)
+            woke = False
+        if woke:
+            db.commit_caller_history_deliveries(token, RESERVATION_OWNER)
             return 1
-        if texts:
-            db.release_caller_history_deliveries(state_sid, [r["id"] for r in rows])
+        db.release_caller_history_deliveries(reservation_token=token, owner=RESERVATION_OWNER)
         return 0
     finally:
         db.close()
@@ -175,7 +217,7 @@ def start_gateway_delegation_poller() -> bool:
         if not webui_gateway_chat_enabled(get_config()):
             return False
         if not _claim_api_available():
-            logger.info("gateway delegation poller inactive: installed Hermes Agent lacks the delivery claim API")
+            logger.info("gateway delegation poller inactive: installed Hermes Agent lacks the delivery reserve/commit API")
             return False
         with _LOCK:
             if _THREAD is not None and _THREAD.is_alive():
