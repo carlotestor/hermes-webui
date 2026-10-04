@@ -53,6 +53,7 @@ async function api(path,opts){
   await null;
   if(path==='/api/session/new'){const sid='B'+(++nextSid);sessions[sid]={session_id:sid,messages:[],composer_draft:{}};return {session:{...sessions[sid]}};}
   if(path==='/api/session/draft'){  // same contract as api/routes.py
+    if(typeof body.if_text==='string')await casGate;
     const cur=drafts[body.session_id]||{text:'',files:[]};
     if(typeof body.if_text==='string'&&((cur.text||'')!==body.if_text||(Array.isArray(body.if_files)&&JSON.stringify(cur.files||[])!==JSON.stringify(body.if_files))))
       return {ok:true,draft:cur,unchanged:true,mismatch:true};
@@ -63,6 +64,7 @@ async function api(path,opts){
   throw new Error('unexpected '+path);
 }
 let releaseSteer;const steerGate=new Promise(r=>releaseSteer=r);
+let casGate=Promise.resolve();let _loadingSessionId=null;
 const noop=()=>{};
 const updateQueueBadge=noop,clearLiveToolCards=noop,updateSendBtn=noop,setStatus=noop,setComposerStatus=noop,syncTopbar=noop,renderMessages=noop,
   _setActiveSessionUrl=noop,_setSessionViewedCount=noop,_steerTextWithPendingFiles=async x=>x,_steerFailureMessageKey=x=>x,_showSteerRecovery=noop,
@@ -191,3 +193,54 @@ def test_draft_compare_and_clear_route():
     assert r.get('mismatch') is True and r['draft']['text'] == 'newer'
     r = post('/api/session/draft', {'session_id': sid, 'text': '', 'files': [], 'if_text': 'newer', 'if_files': []})
     assert not r.get('mismatch') and r['draft']['text'] == ''
+
+
+def test_return_to_owner_during_delayed_compare_and_clear_does_not_restore():
+    _run(r'''
+const p=submitSteer();await tick();
+await newSession();releaseSteer();assert.equal(await p,false);
+assert.equal(drafts.A.text,'guidance');
+let releaseCas;casGate=new Promise(r=>releaseCas=r);
+emitLeftover('guidance');await tick();
+S.session={session_id:'A',active_stream_id:null,composer_draft:{...drafts.A}};
+_restoreComposerDraft(drafts.A,'A');
+assert.equal(inp.value,'','retiring draft not restored while compare-and-clear is pending');
+releaseCas();await tick();await tick();await tick();
+assert.equal(drafts.A.text,'');assert.equal(inp.value,'');
+assert.equal(_steerRetiringBySid.size,0);
+finalChecks();
+''')
+
+
+def test_newer_text_typed_during_uncertain_request_is_kept():
+    _run(r'''
+const p=submitSteer();await tick();
+inp.value='newer';
+releaseSteer();assert.equal(await p,false);
+assert.equal(inp.value,'newer','newer composer text not overwritten');
+emitLeftover('guidance');await tick();await tick();
+assert.equal(inp.value,'newer');
+finalChecks();
+''')
+
+
+def test_offscreen_uncertain_restore_keeps_newer_saved_draft():
+    _run(r'''
+const p=submitSteer();await tick();
+_saveComposerDraftNow('A','newer',[]);await tick();
+await newSession();
+releaseSteer();assert.equal(await p,false);
+assert.equal(drafts.A.text,'newer','newer saved owner draft not overwritten');
+emitLeftover('guidance');await tick();await tick();
+assert.equal(drafts.A.text,'newer');
+finalChecks();
+''')
+
+
+def test_clear_owner_draft_keeps_other_sessions_debounced_save():
+    _run(r'''
+_saveComposerDraft('B9','b draft',[]);
+_clearComposerDraft('A','guidance',[]);
+await sleep(450);
+assert.equal(drafts.B9.text,'b draft');
+''')

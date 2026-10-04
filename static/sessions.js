@@ -36,6 +36,7 @@ let _pendingCarryForwardSnapshot = null;
 
 // Debounced save — prevents hammering the server on every keystroke.
 let _draftSaveTimer = null;
+let _draftSaveTimerSid = null;
 const _DRAFT_SAVE_DELAY_MS = 400;
 const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
 const _composerDraftKnownPayloadSessions = new Set();
@@ -232,6 +233,7 @@ function _saveComposerDraft(sid, text, files) {
     _composerDraftKnownPayloadSessions.add(sid);
     _bumpComposerDraftRevision(sid);
   }
+  _draftSaveTimerSid = sid;
   _draftSaveTimer = setTimeout(() => {
     api('/api/session/draft', {
       method: 'POST',
@@ -309,6 +311,8 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
   const hasServerDraftPayload = _composerDraftHasPayload(text, files);
 
   if (restoreSid && hasServerDraftPayload && _isComposerDraftRestoreSuppressed(restoreSid, text, files)) return;
+  // A delivered steer's draft is being compare-and-cleared: show it as empty.
+  if (restoreSid && typeof _steerDraftIsRetiring === 'function' && _steerDraftIsRetiring(restoreSid, text)) return _restoreComposerDraft(null, targetSid, opts);
   if (restoreSid && !hasServerDraftPayload) _clearComposerDraftRestoreSuppression(restoreSid);
 
   // Same-session force refreshes are driven by external state changes and may
@@ -340,7 +344,8 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
 // Clear the saved draft for a session (called when message is sent).
 function _clearComposerDraft(sid, text, files) {
   if (!sid) return;
-  clearTimeout(_draftSaveTimer);
+  // The pending debounced save may belong to another session (e.g. after New Chat).
+  if (_draftSaveTimerSid === sid) clearTimeout(_draftSaveTimer);
   _clearRememberedNewChatDraftSession(sid);
   if (arguments.length >= 2) _suppressComposerDraftRestoreAfterSubmit(sid, text, files);
   else _suppressComposerDraftRestoreAfterSubmit(sid);

@@ -1703,6 +1703,24 @@ let _steerUploadCache = null; // { sid, sig, paths }
 // pending_steer_leftover with the same text can mark them delivered.
 // owned = the exact draft {text, files} this steer restored for its owner.
 const _steerUncertainBySid = new Map(); // sid -> { text, delivered, settled, ended, owned, rev }
+// Owned drafts whose compare-and-clear is still in flight; never restore them.
+const _steerRetiringBySid = new Map(); // sid -> { text, files }
+
+function _steerDraftIsRetiring(sid, text){
+  const owned=_steerRetiringBySid.get(sid);
+  return !!owned&&String(text||'')===owned.text;
+}
+
+// The Agent joins several pending steers with "\n"; text matches when its lines
+// appear as a contiguous run of the leftover's lines.
+function _steerLeftoverContains(leftover, text){
+  const lines=String(leftover||'').split('\n').map(x=>x.trim());
+  const want=String(text||'').trim().split('\n').map(x=>x.trim());
+  for(let i=0;i+want.length<=lines.length;i++){
+    if(want.every((w,j)=>lines[i+j]===w))return true;
+  }
+  return false;
+}
 
 function _steerDraftRevision(sid){
   return typeof _composerDraftRevision==='function'?_composerDraftRevision(sid):0;
@@ -1720,19 +1738,29 @@ function _steerSettleTerminal(sid){
 // Retire only the draft this steer restored: the visible composer when it still
 // shows that text, and the owner's saved draft via compare-and-clear. Newer
 // text/files and other sessions' composers are left alone.
-function _steerRetireOwnedDraft(sid, owned){
-  if(!owned)return;
-  if(_steerOwnerIsCurrent(sid)){
-    const inp=$('msg');
-    if(inp&&inp.value===owned.text){
-      inp.value='';
-      if(typeof autoResize==='function')autoResize();
-    }
-    const bar=document.getElementById('msgInner');
-    const rec=bar&&bar.querySelector('.steer-recovery');
-    if(rec)rec.remove();
+function _steerClearVisibleOwned(sid, owned){
+  if(!_steerOwnerIsCurrent(sid))return;
+  const inp=$('msg');
+  if(inp&&inp.value===owned.text){
+    inp.value='';
+    if(typeof autoResize==='function')autoResize();
   }
-  if(typeof _clearComposerDraftIfUnchanged==='function')_clearComposerDraftIfUnchanged(sid,owned.text,owned.files);
+  const bar=document.getElementById('msgInner');
+  const rec=bar&&bar.querySelector('.steer-recovery');
+  if(rec)rec.remove();
+}
+
+function _steerRetireOwnedDraft(sid, owned){
+  if(!owned)return Promise.resolve();
+  _steerRetiringBySid.set(sid,owned);
+  _steerClearVisibleOwned(sid,owned);
+  const settle=()=>{
+    if(_steerRetiringBySid.get(sid)!==owned)return;
+    _steerRetiringBySid.delete(sid);
+    _steerClearVisibleOwned(sid,owned);
+  };
+  const clear=typeof _clearComposerDraftIfUnchanged==='function'?_clearComposerDraftIfUnchanged(sid,owned.text,owned.files):null;
+  return Promise.resolve(clear).then(settle,settle);
 }
 
 // Called by the pending_steer_leftover handler. A leftover matching an in-flight
@@ -1740,7 +1768,7 @@ function _steerRetireOwnedDraft(sid, owned){
 // response settles. After the response: retire the restored draft and settle.
 function _steerReconcileLeftover(sid, text){
   const entry=_steerUncertainBySid.get(sid);
-  if(!entry||String(entry.text||'').trim()!==String(text||'').trim())return false;
+  if(!entry||!_steerLeftoverContains(text,entry.text))return false;
   entry.delivered=true;
   if(!entry.settled)return true;
   _steerUncertainBySid.delete(sid);
@@ -1902,18 +1930,22 @@ async function _trySteer(msg, explicitSteer){
   const fallbackCode = result && result.fallback;
   const deadRunFallback = _steerFallbackIsDeadRun(fallbackCode);
   const applyCurrentFailure = !deadRunFallback||_steerOwnerStreamIsCurrent(ownerSid,ownerStreamId);
+  const restoreText=_steerRestoreText(originalMsg,explicitSteer);
+  // A draft saved or typed during the request is newer than the steer: keep it.
+  let restored=_steerDraftRevision(ownerSid)===inflight.rev;
   if(_steerOwnerIsCurrent(ownerSid)&&applyCurrentFailure){
     const inp=$('msg');
-    if(inp){
-      inp.value=_steerRestoreText(originalMsg,explicitSteer);
+    if(inp&&inp.value&&inp.value!==restoreText)restored=false;
+    if(inp&&restored){
+      inp.value=restoreText;
       if(typeof autoResize==='function')autoResize();
     }
     if(typeof renderTray==='function')renderTray();
-  }else{
+  }else if(restored){
     await _steerPersistDraftForOwner(ownerSid,originalMsg,explicitSteer,pendingFilesSnapshot);
   }
   if(uncertain){
-    inflight.owned={text:_steerRestoreText(originalMsg,explicitSteer),files:pendingFilesSnapshot};
+    inflight.owned=restored?{text:restoreText,files:pendingFilesSnapshot}:null;
     inflight.settled=true;
     // A leftover or run end may have arrived during the draft persist above.
     if((inflight.delivered||inflight.ended)&&_steerUncertainBySid.get(ownerSid)===inflight){

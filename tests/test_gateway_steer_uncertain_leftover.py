@@ -71,3 +71,13 @@ def test_leftover_handler_reconciles_uncertain_steer():
     block = js[js.index("addEventListener('pending_steer_leftover'"):]
     block = block[:block.index("addEventListener('compressing'")]
     assert '_steerReconcileLeftover(sid,txt)' in block
+
+
+def test_joined_multi_steer_leftover_reconciles_each_steer():
+    _run(r'''(async()=>{
+const p=_trySteer('guidance',true);releaseApi();
+assert.equal(await p,false);
+assert.equal(_steerReconcileLeftover('s','first\nguidance'),true);
+assert.equal(inp.value,'');assert.equal(visible(),false);
+assert.equal(_steerLeftoverContains('first\nguidance','guid'),false);
+})().catch(e=>{console.error(e);process.exit(1)});''')
