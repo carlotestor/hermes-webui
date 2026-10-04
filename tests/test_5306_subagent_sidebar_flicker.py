@@ -788,3 +788,78 @@ const rows = _attachChildSessionsToSidebarRows([], raw);
 console.log(JSON.stringify(rows.map(r=>({{sid:r.session_id, orphan:!!r._orphan_child_session}}))));
 """
     assert json.loads(_run_node(source)) == expect
+
+
+def _render_tabs(rows_js, project=None):
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global._activeProject = {json.dumps(project)};
+global._showArchived = false;
+global.window = {{ _showCliSessions: true }};
+global._sessionDisplayTitle = (s) => (s && s.title) || '';
+const allMatched = {rows_js};
+const out = {{}};
+for (const tab of ['webui', 'cli']) {{
+  global._sessionSourceFilter = tab;
+  const part = _partitionSidebarSessionRows(allMatched, null);
+  const ref = tab === 'cli' ? part.cliReferenceRaw : part.webuiReferenceRaw;
+  const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, ref, part.rowsById);
+  const flat = [];
+  const walk = (r, orphan) => {{ flat.push({{sid:r.session_id, orphan}}); (r._child_sessions||[]).forEach(c=>walk(c, false)); }};
+  rows.forEach(r=>walk(r, !!r._orphan_child_session));
+  out[tab] = flat;
+}}
+console.log(JSON.stringify(out));
+"""
+    return json.loads(_run_node(source))
+
+
+def _sub(sid, parent, parent_source, **extra):
+    row = {"session_id": sid, "title": "Subagent Session", "parent_session_id": parent,
+           "relationship_type": "child_session", "parent_source": parent_source, "raw_source": "subagent",
+           "source_tag": "subagent", "session_source": "other", "profile": "a", "message_count": 3,
+           "updated_at": 101, "last_message_at": 101}
+    row.update(extra)
+    return row
+
+
+def _sids(tab):
+    return [r["sid"] for r in tab]
+
+
+def test_5305_nested_leaf_under_orphaned_subagent_of_cli_parent_stays_reachable():
+    """D(CLI) -> O -> L: O orphans in the WebUI tab, so L must not be suppressed on the
+    strength of O sharing its bucket; L is reachable in exactly one tab."""
+    rows = [
+        {"session_id": "D", "title": "CLI run", "session_source": "cli", "raw_source": "cli", "source_tag": "cli",
+         "is_cli_session": True, "profile": "a", "message_count": 5, "updated_at": 100, "last_message_at": 100},
+        _sub("O", "D", "cli"),
+        _sub("L", "O", "subagent", updated_at=102),
+    ]
+    out = _render_tabs(json.dumps(rows))
+    assert _sids(out["webui"]).count("L") + _sids(out["cli"]).count("L") == 1, out
+    assert {"sid": "L", "orphan": True} in out["webui"], out
+
+
+def test_5305_nested_chain_under_project_filtered_webui_parent_follows_parent():
+    """W(project p, filtered out) -> O -> L: the whole chain follows W's scope (hidden in
+    another project's view) and nests under W once W's project is shown."""
+    w = {"session_id": "W", "title": "Parent", "session_source": "webui", "raw_source": "webui", "source_tag": "webui",
+         "project_id": "p", "profile": "a", "message_count": 5, "updated_at": 100, "last_message_at": 100}
+    rows = json.dumps([w, _sub("O", "W", "webui"), _sub("L", "O", "subagent", updated_at=102)])
+    other = _render_tabs(rows, project="q")
+    assert "L" not in _sids(other["webui"]) + _sids(other["cli"]), other
+    own = _render_tabs(rows, project="p")
+    assert own["webui"] == [{"sid": "W", "orphan": False}, {"sid": "O", "orphan": False}, {"sid": "L", "orphan": False}], own
+
+
+def test_5305_leaf_of_compressed_subagent_under_visible_webui_parent_nests():
+    """L names O's pre-compression segment (absent from the payload); it resolves through
+    _parent_lineage_tip_id and nests under the visible chain instead of being hidden."""
+    w = {"session_id": "W", "title": "Parent", "session_source": "webui", "raw_source": "webui", "source_tag": "webui",
+         "profile": "a", "message_count": 5, "updated_at": 100, "last_message_at": 100}
+    rows = [w, _sub("O_tip", "W", "webui"),
+            _sub("L", "O_old", "subagent", updated_at=102, _parent_lineage_root_id="O_old", _parent_lineage_tip_id="O_tip")]
+    out = _render_tabs(json.dumps(rows))
+    assert _sids(out["webui"]).count("L") == 1 and "L" not in _sids(out["cli"]), out
+    assert {"sid": "L", "orphan": False} in out["webui"], out

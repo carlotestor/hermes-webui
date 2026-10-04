@@ -7713,7 +7713,8 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     if(attachDepthCache.has(session.session_id)) return attachDepthCache.get(session.session_id);
     if(seen.has(session.session_id)) return 0;
     seen.add(session.session_id);
-    const parent=session.parent_session_id&&rawSessionsById.get(session.parent_session_id);
+    // A child of a compressed parent may name its pre-compression segment; order it by the tip.
+    const parent=session.parent_session_id&&(rawSessionsById.get(session.parent_session_id)||rawSessionsById.get(session._parent_lineage_tip_id));
     let depth=0;
     if(parent&&(_isChildSession(session)||(_isForkWithResolvableParent(session, sessionIdsInList)&&!(session&&session.pinned)))){
       depth=1+attachDepthFor(parent, seen);
@@ -7754,6 +7755,29 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
   for(const candidate of [...(rawSessions||[]),...(referenceSessions||[])]){
     if(candidate&&candidate.session_id&&!attachQueueById.has(candidate.session_id)) attachQueueById.set(candidate.session_id,candidate);
   }
+  const payloadRowFor=(sid)=>(sid&&((payloadRowsById instanceof Map&&payloadRowsById.get(sid))||attachQueueById.get(sid)))||null;
+  // Raw sources is_cli_session_row never files as CLI; 'desktop' etc. are ambiguous.
+  const nonCliParentSources=['webui','subagent','cron','webhook','kanban','tool','api','api_server'];
+  const subagentHostHiddenByScope=(leaf)=>{
+    const seen=new Set();
+    let cur=leaf;
+    while(cur&&!seen.has(cur.session_id)){
+      seen.add(cur.session_id);
+      const pid=cur.parent_session_id;
+      // Resolve a compressed parent through its lineage tip/root.
+      const parent=payloadRowFor(pid)||payloadRowFor(cur._parent_lineage_tip_id)||payloadRowFor(cur._parent_lineage_root_id);
+      if(!parent){
+        if(typeof cur.parent_is_cli_session==='boolean') return !cur.parent_is_cli_session;
+        const ps=String(cur.parent_source||'').trim().toLowerCase();
+        return nonCliParentSources.includes(ps)||(typeof _isMessagingSession==='function'&&_isMessagingSession({raw_source: ps}));
+      }
+      if(_isCliSession(parent)) return false;
+      if(cur!==leaf&&(visibleBySid.has(parent.session_id)||visibleBySegmentSid.has(parent.session_id))) return false;
+      if(!_isDelegatedSubagentRow(parent)) return !visibleBySid.has(parent.session_id);
+      cur=parent;
+    }
+    return false;
+  };
   const attachQueue=[...attachQueueById.values()].sort((a,b)=>attachDepthFor(a)-attachDepthFor(b));
   for(const child of attachQueue){
     const childRenderable=!!(child&&child.session_id&&renderableChildIds.has(child.session_id));
@@ -7777,7 +7801,10 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       parentSegment=resolved.seg;
     }
     if(!parentRow&&child._parent_lineage_tip_id){
-      parentRow=visibleBySid.get(child._parent_lineage_tip_id)||null;
+      const tipSid=child._parent_lineage_tip_id;
+      const tipSeg=!visibleBySid.has(tipSid)&&visibleBySegmentSid.get(tipSid);
+      parentRow=visibleBySid.get(tipSid)||(tipSeg&&tipSeg.row)||null;
+      if(tipSeg) parentSegment=tipSeg.seg;
     }
     if(!parentRow&&child._parent_lineage_root_id){
       parentRow=visibleByLineageKey.get(child._parent_lineage_root_id)||null;
@@ -7836,21 +7863,10 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // trigger from archived to filtered-out. A cross-surface WebUI child of a
       // genuinely external (messaging/CLI) parent is handled by the parentIsExternal
       // branch above and still orphans as before.
-      // A flag-less subagent is suppressed only when its parent shares its (WebUI) sidebar bucket, judged
-      // by _isCliSession on the parent's own payload row (the partition's decision); a CLI-bucket parent
-      // never attaches here, so the child stays an orphan. Without the row, only the server's
-      // parent_is_cli_session (or an unambiguously non-CLI parent_source) proves a shared bucket.
-      // While searching, a matching child stays openable whatever its lineage flags.
-      const childParentSource=String(child.parent_source||'').trim().toLowerCase();
-      // Raw sources is_cli_session_row never files as CLI; 'desktop' etc. are ambiguous.
-      const nonCliParentSources=['webui','subagent','cron','webhook','kanban','tool','api','api_server'];
-      const parentPayloadRow=(payloadRowsById instanceof Map&&payloadRowsById.get(parentSid))||attachQueueById.get(parentSid)||null;
-      const parentSharesBucket=parentPayloadRow
-        ? !_isCliSession(parentPayloadRow)
-        : (typeof child.parent_is_cli_session==='boolean'
-          ? !child.parent_is_cli_session
-          : nonCliParentSources.includes(childParentSource)||(typeof _isMessagingSession==='function'&&_isMessagingSession({raw_source: childParentSource})));
-      const subagentParentKnown=childIsDelegatedSubagent&&parentSharesBucket;
+      // A flag-less subagent is suppressed only when its ancestor chain ends at a hidden, non-CLI
+      // top-level host (the partition's _isCliSession bucket). A CLI ancestor, a visible ancestor
+      // (the chain renders as an orphan) or an unresolvable link keeps the child an orphan.
+      const subagentParentKnown=childIsDelegatedSubagent&&subagentHostHiddenByScope(child);
       const crossSurfaceChild=!!(child&&child._cross_surface_child_session&&_isChildSession(child));
       if(!searchActive&&(subagentParentKnown||crossSurfaceChild)) continue;
       orphans.push({...child,_orphan_child_session:true});
