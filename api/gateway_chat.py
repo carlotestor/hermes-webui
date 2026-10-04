@@ -1153,6 +1153,13 @@ def _sidecars_with_active_stream(session_dir) -> list[str]:
     return ids
 
 
+def _is_named_profile(profile_name) -> bool:
+    from api import profiles as _profiles
+
+    name = str(profile_name or "").strip()
+    return bool(name) and not _profiles._is_root_profile(name) and not _profiles._is_isolated_profile_mode()
+
+
 def _gateway_endpoint_for_profile(profile_name, *, profile_routing: bool = True) -> tuple[str, str]:
     """URL and key of the session's own profile, root included, never the process-active profile."""
     from api import profiles as _profiles
@@ -1163,7 +1170,7 @@ def _gateway_endpoint_for_profile(profile_name, *, profile_routing: bool = True)
     process_env = {k: v for k, v in os.environ.items() if k not in _profiles._loaded_profile_env_keys}
     profile_env = _profiles.filter_runtime_env_for_gateway_parity(_profiles.get_profile_runtime_env(home))
     cfg = get_config_for_profile_home(home)
-    if not profile_routing or not name or _profiles._is_root_profile(name) or _profiles._is_isolated_profile_mode():
+    if not profile_routing or not _is_named_profile(name):
         return _gateway_base_url(cfg, {**process_env, **profile_env}), _gateway_api_key({**process_env, **profile_env})
     root_home = _profiles.get_hermes_home_for_profile("default")
     root_env = {**_profiles.filter_runtime_env_for_gateway_parity(_profiles.get_profile_runtime_env(root_home)), **process_env}
@@ -1174,23 +1181,32 @@ def _gateway_endpoint_for_profile(profile_name, *, profile_routing: bool = True)
         # A profile URL naming the root listener may use the root key: same Gateway the key was issued for.
         return url, key or (_gateway_api_key(root_env) if url == shared_url else "")
     # No profile-owned URL: the shared listener (root .env/config) serves this profile under /p/<name>, with its own key.
-    return f"{shared_url}/p/{urllib.parse.quote(name, safe='')}", _gateway_api_key(profile_env)
+    # The Gateway checks /p/<name> against the profile's API_SERVER_KEY only, never a WebUI key.
+    return f"{shared_url}/p/{urllib.parse.quote(name, safe='')}", str(profile_env.get("API_SERVER_KEY") or "").strip()
 
 
 # Marks run records admitted on the per-profile endpoint, so reattach knows where the run lives.
 _GATEWAY_ENDPOINT_ROUTING = "profile-v1"
 
 
-def _gateway_reattach_endpoint(session, run) -> tuple[str, str]:
-    """Endpoint a persisted run was admitted on; unmarked records predate profile routing."""
+def _gateway_reattach_endpoint(session, run) -> tuple[str, str | None]:
+    """Endpoint a persisted run was admitted on; unmarked records predate profile routing.
+
+    The key is None when the profile's endpoint moved since admission: the current key belongs to the new URL."""
     if run.get("endpoint_routing") != _GATEWAY_ENDPOINT_ROUTING:
         return _gateway_endpoint_for_profile(session.profile, profile_routing=False)
     base_url, api_key = _gateway_endpoint_for_profile(session.profile)
-    return str(run.get("base_url") or base_url), api_key
+    saved = str(run.get("base_url") or base_url)
+    return saved, (api_key if saved == base_url else None)
 
 
-def _gateway_profile_route_hint(base_url: str, code) -> str:
+def _gateway_profile_route_hint(base_url: str, code, keyless_profile: bool = False) -> str:
     """Tell a named-profile user how to route the profile when its /p/<name> endpoint refuses."""
+    if code == 401 and keyless_profile and not re.search(r"/p/[^/]+$", str(base_url or "")):
+        return (
+            "No Gateway API key was sent: set API_SERVER_KEY in the profile's .env. The root key is reused "
+            "only when the profile's Gateway URL is exactly the root Gateway URL."
+        )
     if code not in (401, 404) or not re.search(r"/p/[^/]+$", str(base_url or "")):
         return ""
     return (
@@ -1447,6 +1463,7 @@ def _run_gateway_chat_streaming(
 
     s = None
     base_url = api_key = ""
+    keyless_profile = False
     final_text = ""
     terminal_error = ""
     usage = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0}
@@ -1461,6 +1478,9 @@ def _run_gateway_chat_streaming(
             model_provider=model_provider,
         )
         base_url, api_key = reattach_endpoint or _gateway_endpoint_for_profile(getattr(s, "profile", None))
+        # None: the profile's Gateway moved since admission, so no credential is bound to the saved URL.
+        endpoint_moved, api_key = api_key is None, api_key or ""
+        keyless_profile = not api_key and _is_named_profile(getattr(s, "profile", None))
         with _STREAM_RUN_STARTING_CONDITION:
             _STREAM_ENDPOINTS[stream_id] = (base_url, api_key)
         try:
@@ -1533,6 +1553,11 @@ def _run_gateway_chat_streaming(
             )
             try:
                 if reattach_run:
+                    if endpoint_moved:
+                        raise RuntimeError(
+                            "This profile's Gateway URL changed after the run started, so the WebUI cannot "
+                            "authenticate to the Gateway that holds it; its result could not be recovered."
+                        )
                     run_id = str(reattach_run.get("run_id") or "").strip()
                     if not run_id:
                         # Crashed between admission and saving the id: the same key returns the original run.
@@ -1561,7 +1586,7 @@ def _run_gateway_chat_streaming(
                     )
             except Exception as exc:
                 code = getattr(exc, "code", None) or getattr(exc.__cause__, "code", None)
-                hint = "" if reattach_run else _gateway_profile_route_hint(base_url, code)
+                hint = "" if reattach_run else _gateway_profile_route_hint(base_url, code, keyless_profile)
                 error_payload = _settle_gateway_terminal_error(
                     session_id,
                     stream_id,
@@ -1983,7 +2008,7 @@ def _run_gateway_chat_streaming(
             "apperror",
             _gateway_http_error_event(
                 exc, err_body, api_key_configured=bool(api_key),
-                route_hint=_gateway_profile_route_hint(base_url, exc.code),
+                route_hint=_gateway_profile_route_hint(base_url, exc.code, keyless_profile),
             ),
         )
     except Exception as exc:

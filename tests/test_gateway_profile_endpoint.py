@@ -245,3 +245,47 @@ def test_named_profile_refusal_names_the_routing_fix(code):
     assert "HERMES_WEBUI_GATEWAY_BASE_URL" in event["hint"] and "profile's .env" in event["hint"]
     assert gateway_chat._gateway_profile_route_hint(SHARED, code) == ""
     assert gateway_chat._gateway_profile_route_hint("http://gw/p/work/x", code) == ""
+
+
+def test_profile_route_sends_api_server_key_not_a_cloned_webui_key(homes):
+    _, work = homes
+    (work / ".env").write_text("HERMES_WEBUI_GATEWAY_API_KEY=root-key-0123456789\nAPI_SERVER_KEY=work-key-0123456789\n")
+
+    assert gateway_chat._gateway_endpoint_for_profile("work") == (f"{SHARED}/p/work", "work-key-0123456789")
+
+
+@pytest.mark.parametrize("saved,expected_key", [(f"{SHARED}/p/work", "work-key-0123456789"), ("http://old-gw:7000", None)])
+def test_reattach_key_is_bound_to_the_url_it_was_resolved_for(homes, saved, expected_key):
+    _, work = homes
+    (work / ".env").write_text("API_SERVER_KEY=work-key-0123456789\n")
+    session = type("S", (), {"profile": "work"})()
+    run = {"endpoint_routing": "profile-v1", "base_url": saved}
+
+    assert gateway_chat._gateway_reattach_endpoint(session, run) == (saved, expected_key)
+
+
+def test_moved_profile_endpoint_fails_reattach_without_sending_the_new_key(homes, tmp_path, monkeypatch):
+    _, work = homes
+    (work / ".env").write_text("API_SERVER_KEY=work-key-0123456789\n")
+    sid = _orphaned_named_turn(tmp_path, monkeypatch, {
+        "run_id": "run_old", "stream_id": "stream-moved", "regeneration": False, "goal_related": False,
+        "endpoint_routing": "profile-v1", "base_url": "http://old-gw:7000",
+    })
+    polls = []
+    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: polls.append((b, k)) or {})
+
+    assert gateway_chat.resume_gateway_runs_after_restart() == [sid]
+    _join_reattach()
+
+    assert polls == []
+    saved = json.loads((models.SESSION_DIR / f"{sid}.json").read_text())
+    assert saved["active_stream_id"] is None
+    assert "Gateway URL changed" in json.dumps(saved["messages"])
+
+
+def test_keyless_profile_owned_url_401_names_the_key_fix():
+    hint = gateway_chat._gateway_profile_route_hint("http://localhost:8642", 401, keyless_profile=True)
+
+    assert "API_SERVER_KEY" in hint and "profile's .env" in hint
+    assert gateway_chat._gateway_profile_route_hint("http://localhost:8642", 401) == ""
+    assert gateway_chat._gateway_profile_route_hint("http://localhost:8642", 404, keyless_profile=True) == ""
