@@ -128,9 +128,10 @@ real model (it verifies the app *loads and initializes* cleanly — the brick cl
 that breaks the page for everyone).
 
 The same job then runs `tests/browser_new_chat_focus.py`, on the same agent-free
-setup: with every `/api/sessions` response held, New Chat and Cmd/Ctrl+K must
-focus the composer, read the session list once, and show the new row once the
-list is released (#7936). Run it locally with `python tests/browser_new_chat_focus.py`.
+setup: with every `/api/sessions` response held, New Chat, Cmd/Ctrl+K and the
+typed `/new` command must focus the composer (and `/new` show its toast), read
+the session list once, and show the new row once the list is released (#7936,
+#7996). Run it locally with `python tests/browser_new_chat_focus.py`.
 
 ## Public conversation lifecycle gate
 
