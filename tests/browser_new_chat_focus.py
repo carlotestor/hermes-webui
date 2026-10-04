@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Headless browser gate: a fresh chat focuses the composer without waiting for the
-session list (#7936).
+session list (#7936, and /new in #7996).
 
 WHY THIS EXISTS
   `newSession()` already schedules the sidebar refresh in the background. The
@@ -10,9 +10,9 @@ WHY THIS EXISTS
   only after the first one's `/api/sessions` and `/api/projects` reads finish.
   On a long session list that held the composer for seconds.
 
-WHAT IT CHECKS, for the button and for Cmd/Ctrl+K
-  - with every `/api/sessions` response held, the composer is focused and the
-    new blank conversation is current;
+WHAT IT CHECKS, for the button, Cmd/Ctrl+K and the /new command
+  - with every `/api/sessions` response held, the composer is focused (and for
+    /new, its toast is shown) and the new blank conversation is current;
   - one fresh-chat action issues one session-list read;
   - once the held reads are released, the new conversation's sidebar row appears.
 
@@ -27,7 +27,7 @@ USAGE
   (Requires: playwright + chromium.)
 
 EXIT CODES
-  0 — both paths passed
+  0 — every path passed
   1 — a check failed (regression)
   2 — environment/setup failure (server didn't boot, playwright missing, etc.)
 """
@@ -75,11 +75,40 @@ def _wait_until(page, expression, timeout_ms):
 
 
 def _start_fresh_chat(page, trigger):
+    """Start a fresh chat via ``trigger``; return failure lines for the driver itself."""
     if trigger == "button":
         page.click("#btnNewChat")
+    elif trigger == "slash":
+        # The first slash command after page load starts the skill, bundle and agent
+        # metadata loaders; each one re-opens the autocomplete when it lands, which can
+        # swallow the second Enter. Warm them first so the typed sequence is
+        # deterministic (the race is in this driver, not in /new).
+        page.evaluate(
+            "() => Promise.all([loadSkillCommands(), loadBundleCommands(),"
+            " loadAgentCommandMetadata()])"
+        )
+        # As typed: the first Enter takes the open autocomplete, the second sends.
+        page.click("#msg")
+        page.keyboard.type("/new")
+        if not _wait_until(page, "!!document.querySelector('.cmd-dropdown.open')", FOCUS_TIMEOUT_MS):
+            return ["  [slash] the /new autocomplete never opened"]
+        page.keyboard.press("Enter")
+        if not _wait_until(page, "!document.querySelector('.cmd-dropdown.open')", FOCUS_TIMEOUT_MS):
+            return ["  [slash] the autocomplete did not close after taking /new"]
+        page.keyboard.press("Enter")
     else:
         page.evaluate("document.activeElement && document.activeElement.blur()")
         page.keyboard.press("Meta+k" if sys.platform == "darwin" else "Control+k")
+    return []
+
+
+def _done(trigger):
+    """What the trigger shows once it has finished. /new is typed in the composer,
+    so focus alone proves nothing there: its toast comes after the same await."""
+    focused = "!!(document.activeElement && document.activeElement.id === 'msg')"
+    if trigger == "slash":
+        return focused + " && $('toast').dataset.toastMessage === t('new_session')"
+    return focused
 
 
 def _check(browser, trigger):
@@ -109,11 +138,13 @@ def _check(browser, trigger):
     page.route("**/api/sessions*", lambda route: held.append(route)
                if _is_session_list(route.request.url) else route.continue_())
 
-    _start_fresh_chat(page, trigger)
-    focused = "!!(document.activeElement && document.activeElement.id === 'msg')"
-    if not _wait_until(page, focused, FOCUS_TIMEOUT_MS):
+    driver_failures = _start_fresh_chat(page, trigger)
+    if driver_failures:
+        failures.extend(driver_failures)
+    elif not _wait_until(page, _done(trigger), FOCUS_TIMEOUT_MS):
         failures.append(
-            f"  [{trigger}] composer not focused within {FOCUS_TIMEOUT_MS} ms "
+            f"  [{trigger}] not finished (composer focused"
+            f"{', toast shown' if trigger == 'slash' else ''}) within {FOCUS_TIMEOUT_MS} ms "
             f"while the session list was held ({len(held)} list read(s) held)"
         )
     after = page.evaluate("S.session && S.session.session_id")
@@ -189,7 +220,7 @@ def main():
             browser = pw.chromium.launch(
                 headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
             )
-            for trigger in ("button", "shortcut"):
+            for trigger in ("button", "shortcut", "slash"):
                 failures.extend(_check(browser, trigger))
             browser.close()
 
