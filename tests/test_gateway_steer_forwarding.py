@@ -133,7 +133,7 @@ def test_live_relay_replays_unconsumed_gateway_steer(event):
         "sid", {"event": event, "pending_steer": "go left"}, lambda e, d: events.append((e, d)))
     gateway_chat._relay_gateway_pending_steer("sid", {"event": event}, lambda e, d: events.append((e, d)))
     assert events == [("pending_steer_leftover", {"session_id": "sid", "text": "go left"})]
-    src = __import__("inspect").getsource(gateway_chat._run_gateway_runs_api_streaming)
+    src = __import__("inspect").getsource(gateway_chat._relay_gateway_run_events)
     block = src[src.index(f'if payload_event == "{event}":'):]
     assert block.split("\n")[1].strip() == "_relay_gateway_pending_steer(session_id, payload, put_gateway_event)"
 
