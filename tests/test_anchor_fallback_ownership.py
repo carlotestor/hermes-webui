@@ -422,6 +422,7 @@ def _render_messages_harness() -> str:
     insert_block_source = _function_source(_ui_js(), "_insertSegmentBlock")
     subagent_transcript_source = _function_source(_ui_js(), "_isDelegatedSubagentTranscript")
     worklog_group_key_source = _function_source(_ui_js(), "_worklogGroupKey")
+    subagent_open_turn_source = _function_source(_ui_js(), "_subagentOpenWorklogTurn")
     sessions_js = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
     child_session_source = _function_source(sessions_js, "_isChildSession")
     delegated_row_source = _function_source(sessions_js, "_isDelegatedSubagentRow")
@@ -720,6 +721,7 @@ def _render_messages_harness() -> str:
         eval({json.dumps(insert_block_source)});
         eval({json.dumps(subagent_transcript_source)});
         eval({json.dumps(worklog_group_key_source)});
+        eval({json.dumps(subagent_open_turn_source)});
         eval({json.dumps(child_session_source)});
         eval({json.dumps(delegated_row_source)});
         eval({json.dumps(render_source)});

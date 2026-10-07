@@ -12395,6 +12395,17 @@ function _worklogGroupKey(anchorRow, anchorTurn, placedAfterAnchor){
   }
   return anchorTurn;
 }
+// Only the subagent's last turn opens: while it runs, or after it ended with no answer.
+function _subagentOpenWorklogTurn(inner){
+  if(!_isDelegatedSubagentTranscript()) return null;
+  const turns=inner.querySelectorAll('.assistant-turn');
+  const lastTurn=turns[turns.length-1]||null;
+  if(!lastTurn||S.session.active===true) return lastTurn;
+  const msgs=Array.isArray(S.messages)?S.messages:[];
+  const last=msgs.filter(m=>m&&m.role!=='tool').pop();
+  const answered=!!last&&last.role==='assistant'&&!(Array.isArray(last.tool_calls)&&last.tool_calls.length)&&!!String(msgContent(last)||'').trim();
+  return answered?null:lastTurn;
+}
 function _worklogDetailsExpandedDefault(){
   return window._worklogDetailsExpandedByDefault===true;
 }
@@ -19075,6 +19086,7 @@ function renderMessages(options){
     };
     const durationAssignedTurns = new Set();
     const activityByTurn = new Map();
+    let subagentOpenTurn;
     const activityOrder = [];
     const ensureActivityBucket=(key,aIdx,segmentSeq,burstId)=>{
       if(!byActivity.has(key)){
@@ -19158,12 +19170,13 @@ function renderMessages(options){
         const anchorIsWorklogSource=anchorRow.classList&&anchorRow.classList.contains('assistant-segment-worklog-source');
         const groupKey=_worklogGroupKey(anchorRow,anchorTurn,!anchorIsWorklogSource&&!thinkingText);
         let state=activityByTurn.get(groupKey);
+        if(subagentOpenTurn===undefined) subagentOpenTurn=_subagentOpenWorklogTurn(inner);
         if(!state){
           const includeTurnDuration=!durationAssignedTurns.has(anchorTurn);
           if(includeTurnDuration) durationAssignedTurns.add(anchorTurn);
           const activityKey=`assistant:${aIdx}`;
           const group=ensureActivityGroup(anchorParent,{
-            collapsed:!(_isDelegatedSubagentTranscript()&&S.session.active===true),
+            collapsed:!subagentOpenTurn||anchorTurn!==subagentOpenTurn,
             honourSavedDisclosure:_isDelegatedSubagentTranscript(),
             anchor:anchorRow,
             beforeAnchor:!!thinkingText&&!anchorIsWorklogSource,
@@ -19196,7 +19209,14 @@ function renderMessages(options){
           seenTools:state.seenTools,
         });
       }
+      // The running subagent's newest worklog is live work: label it Running, not Processed.
+      let runningGroup=null;
+      if(subagentOpenTurn&&S.session.active===true){
+        activityByTurn.forEach(state=>{ if(state.group.closest('.assistant-turn')===subagentOpenTurn) runningGroup=state.group; });
+      }
       activityByTurn.forEach(state=>{
+        if(state.group===runningGroup) state.group.setAttribute('data-subagent-running','1');
+        else state.group.removeAttribute('data-subagent-running');
         _syncToolCallGroupSummary(state.group);
       });
     }else{
@@ -20327,6 +20347,8 @@ function _syncToolCallGroupSummary(group){
         ? _activityProcessedElapsedLabel(group)
         : _activitySettledProcessedLabel(group);
       label.textContent=processedLabel||t('processed_elapsed','');
+      // A running subagent's open worklog is live work, not processed work.
+      if(group.getAttribute('data-subagent-running')==='1') label.textContent='Running';
     }else{
       const rows=Array.from(group.querySelectorAll('.tool-card-row'));
       // Prefer the live _tcData classification; fall back to the durable data-*

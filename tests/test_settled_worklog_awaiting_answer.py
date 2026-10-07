@@ -108,9 +108,65 @@ def _last_turn_layout(session, messages, *, busy=False):
     return json.loads(_run_node_script(script))
 
 
-def test_running_subagent_worklogs_are_open_and_ended_ones_collapse():
-    assert _collapsed_flags(RUNNING_SUBAGENT, TWO_TURNS_RUNNING) == [False, False]
-    assert _collapsed_flags(ENDED_SUBAGENT, TWO_TURNS_RUNNING) == [True, True]
+def test_running_subagent_opens_only_its_last_turn():
+    # Earlier, answered turns stay collapsed; only the turn still working opens.
+    assert _collapsed_flags(RUNNING_SUBAGENT, TWO_TURNS_RUNNING) == [True, False]
+
+
+def test_ended_subagent_without_answer_keeps_last_worklog_open():
+    # The run ended after a tool result with no answer: its work stays visible.
+    assert _collapsed_flags(ENDED_SUBAGENT, TWO_TURNS_RUNNING) == [True, False]
+
+
+def test_ended_subagent_with_answer_collapses_every_worklog():
+    assert _collapsed_flags(ENDED_SUBAGENT, [*TWO_TURNS_RUNNING, ANSWER]) == [True, True]
+
+
+def _running_marks(session, messages):
+    script = textwrap.dedent(
+        f"""{_render_messages_harness()}
+        S = {{ session: {json.dumps(session)}, messages: {json.dumps(messages)},
+              toolCalls: [], busy: false }};
+        renderMessages();
+        console.log(JSON.stringify(elements.msgInner.querySelectorAll('.tool-worklog-group')
+          .map((g) => g.getAttribute('data-subagent-running') === '1')));
+        """
+    )
+    return json.loads(_run_node_script(script))
+
+
+def test_only_the_running_subagents_newest_worklog_is_marked_running():
+    assert _running_marks(RUNNING_SUBAGENT, INTERLEAVED) == [False, False, False, False, True]
+    assert _running_marks(ENDED_SUBAGENT, INTERLEAVED) == [False] * 5
+    assert _running_marks(WEBUI_SESSION, TWO_TURNS_RUNNING) == [False, False]
+
+
+def test_running_marked_worklog_is_labelled_running_not_processed():
+    from tests.test_anchor_fallback_ownership import _function_source, _ui_js
+
+    sync = _function_source(_ui_js(), "_syncToolCallGroupSummary")
+    script = textwrap.dedent(
+        f"""
+        const attrs = (o) => ({{ getAttribute: (k) => (k in o ? o[k] : null),
+                                 setAttribute() {{}}, removeAttribute() {{}} }});
+        const label = {{ textContent: '', setAttribute() {{}}, removeAttribute() {{}} }};
+        const mk = (o) => ({{ ...attrs(o), dataset: {{}},
+          querySelector: (sel) => (sel.includes('label') ? label : null),
+          querySelectorAll: () => [] }});
+        const _toolWorklogListEl = () => null, _syncToolWorklogToolGroup = () => {{}};
+        const _activitySettledProcessedLabel = () => 'Processed in 4s';
+        const _activityProcessedElapsedLabel = () => '';
+        const t = (k, v) => 'Processed ' + v;
+        eval({json.dumps(sync)});
+        const out = [];
+        _syncToolCallGroupSummary(mk({{ 'data-tool-worklog-group': '1', 'data-subagent-running': '1' }}));
+        out.push(label.textContent);
+        _syncToolCallGroupSummary(mk({{ 'data-tool-worklog-group': '1' }}));
+        out.push(label.textContent);
+        console.log(JSON.stringify(out));
+        """
+    )
+    assert json.loads(_run_node_script(script)) == ["Running", "Processed in 4s"]
 
 
 def _real_disclosure_harness():
@@ -198,7 +254,7 @@ def test_render_signature_changes_when_subagent_ends():
     """) is True
 
 
-def test_subagent_ending_with_same_messages_renders_collapsed():
+def test_subagent_ending_re_renders_open_state_from_lifecycle():
     script = textwrap.dedent(
         f"""{_render_messages_harness()}
         S = {{ session: {json.dumps(RUNNING_SUBAGENT)}, messages: {json.dumps(TWO_TURNS_RUNNING)},
@@ -209,10 +265,13 @@ def test_subagent_ending_with_same_messages_renders_collapsed():
         const running = flags();
         S.session = {{ ...S.session, active: false }};
         renderMessages();
-        console.log(JSON.stringify([running, flags()]));
+        const endedNoAnswer = flags();
+        S.messages = [...S.messages, {json.dumps(ANSWER)}];
+        renderMessages();
+        console.log(JSON.stringify([running, endedNoAnswer, flags()]));
         """
     )
-    assert json.loads(_run_node_script(script)) == [[False, False], [True, True]]
+    assert json.loads(_run_node_script(script)) == [[True, False], [True, False], [True, True]]
 
 
 def test_subagent_worklog_splits_at_each_interim_text():
@@ -314,7 +373,8 @@ def _refresh_fn_sources():
 
 
 def test_subagent_finishing_with_unchanged_count_collapses_worklog():
-    remote = {**ENDED_SUBAGENT, "message_count": len(TWO_TURNS_RUNNING)}
+    answered = [*TWO_TURNS_RUNNING, ANSWER]
+    remote = {**ENDED_SUBAGENT, "message_count": len(answered)}
     script = textwrap.dedent(
         f"""{_render_messages_harness()}
         let _activeSessionExternalRefreshInFlight = false;
@@ -324,8 +384,8 @@ def test_subagent_finishing_with_unchanged_count_collapses_worklog():
         const api = async () => {{ probes += 1; return {{ session: {json.dumps(remote)} }}; }};
         const loadSession = async () => {{ throw new Error('no reload expected'); }};
         {_refresh_fn_sources()}
-        S = {{ session: {{ ...{json.dumps(RUNNING_SUBAGENT)}, message_count: {len(TWO_TURNS_RUNNING)} }},
-              messages: {json.dumps(TWO_TURNS_RUNNING)}, toolCalls: [], busy: false }};
+        S = {{ session: {{ ...{json.dumps(RUNNING_SUBAGENT)}, message_count: {len(answered)} }},
+              messages: {json.dumps(answered)}, toolCalls: [], busy: false }};
         const flags = () => elements.msgInner.querySelectorAll('.tool-worklog-group')
           .map((g) => g.getAttribute('data-collapsed') === 'true');
         (async () => {{
@@ -340,5 +400,5 @@ def test_subagent_finishing_with_unchanged_count_collapses_worklog():
     )
     # The running child is polled once; after it ends the poll gate skips again.
     assert json.loads(_run_node_script(script)) == [
-        [False, False], "unchanged", [True, True], False, "skipped", 1,
+        [True, False], "unchanged", [True, True], False, "skipped", 1,
     ]
