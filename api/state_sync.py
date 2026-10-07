@@ -402,7 +402,8 @@ def state_db_knows_session(session_id: str, profile: Optional[str] = None) -> Op
     if db_path is None:
         return False
     try:
-        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)) as conn:
+        from api.agent_sessions import open_state_db_readonly
+        with closing(open_state_db_readonly(db_path)) as conn:
             if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").fetchone():
                 return False
             row = conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()

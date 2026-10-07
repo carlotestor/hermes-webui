@@ -148,3 +148,37 @@ def test_another_profiles_sidecar_does_not_change_quota_archive_state(tmp_path, 
 
     rows = routes._pin_quota_rows_from_state_db([])
     assert routes._visible_pinned_lineage_ids(rows) == {("work", "w0"), ("work", "w1"), ("work", "w2")}
+
+
+
+def test_isolated_mode_legacy_row_does_not_double_count_shared_state_db(tmp_path, monkeypatch):
+    """Isolated mode: a profile-less legacy row and the isolated profile resolve to one
+    state.db; the per-owner quota counts its two pins once, not twice."""
+    import sqlite3
+
+    from api import models, routes
+    from tests._pin_helpers import PinSess, patch_pin_endpoint
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT,"
+                 " end_reason TEXT, session_source TEXT, pinned INTEGER NOT NULL DEFAULT 0)")
+    conn.executemany("INSERT INTO sessions VALUES (?, NULL, NULL, NULL, ?)",
+                     [("p1", 1), ("p2", 1), ("new_pin", 0), ("legacy", 0)])
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: db)
+    for owner in ("user1", None):
+        sess = PinSess("new_pin", profile=owner)
+        legacy = {"session_id": "legacy", "pinned": False, "profile": None}
+        post = patch_pin_endpoint(monkeypatch, {"new_pin": sess}, limit=3, persisted=[legacy])
+        monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "user1", "is_default": False}])
+        monkeypatch.setattr(routes, "_get_active_profile_name", lambda: owner or "default")
+        monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: True)
+        assert post("new_pin")[0] == 200, owner
+        assert sess.pinned is True
+        # The two real pins still fill a limit of 2: nothing is under-counted either.
+        sess.pinned = False
+        monkeypatch.setattr(routes, "load_settings", lambda: {"pinned_sessions_limit": 2})
+        assert post("new_pin")[0] == 400, owner
+        assert sess.pinned is False
