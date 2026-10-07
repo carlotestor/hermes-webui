@@ -173,7 +173,7 @@ def test_isolated_mode_legacy_row_does_not_double_count_shared_state_db(tmp_path
         legacy = {"session_id": "legacy", "pinned": False, "profile": None}
         post = patch_pin_endpoint(monkeypatch, {"new_pin": sess}, limit=3, persisted=[legacy])
         monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "user1", "is_default": False}])
-        monkeypatch.setattr(routes, "_get_active_profile_name", lambda: owner or "default")
+        monkeypatch.setattr(routes, "_get_active_profile_name", lambda active=owner or "default": active)
         monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: True)
         assert post("new_pin")[0] == 200, owner
         assert sess.pinned is True

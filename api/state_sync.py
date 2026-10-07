@@ -19,7 +19,6 @@ any double-counting risk.
 import logging
 import ntpath
 import os
-import sqlite3
 import threading
 from contextlib import closing
 from pathlib import Path
