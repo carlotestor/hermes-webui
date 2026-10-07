@@ -340,3 +340,22 @@ def test_stop_when_worker_settles_first_pauses_loop_after_reload(tmp_path, monke
     loops.run_due_loops()
     assert len(started) == 1
 
+
+def test_loop_scheduler_kill_switch(monkeypatch):
+    from api import loops
+    spawned = []
+    monkeypatch.setattr(loops.threading, "Thread", lambda *a, **kw: spawned.append(kw) or NS(start=lambda: None))
+    monkeypatch.setenv("HERMES_WEBUI_LOOP_SCHEDULER", "0")
+    assert loops.start_loop_scheduler() is False and spawned == []
+    monkeypatch.delenv("HERMES_WEBUI_LOOP_SCHEDULER")
+    assert loops.start_loop_scheduler() is True and spawned[0]["name"] == "webui-loop-scheduler"
+
+
+def test_legacy_stop_row_without_token_is_matched():
+    from api import loops
+    turn = {"token": "tok", "started_at": 1000.75, "prompt": "check"}
+    msgs = [{"role": "user", "content": "check", "timestamp": 1000, "_source": "fork"},
+            {"role": "assistant", "content": "*Task cancelled.*", "_error": True, "_cancelled": True}]
+    assert loops._wakeup_outcome(msgs, turn) == (True, "*Task cancelled.*")
+    other = [dict(msgs[0], content="unrelated"), msgs[1]]
+    assert loops._wakeup_outcome(other, turn) == (False, "")

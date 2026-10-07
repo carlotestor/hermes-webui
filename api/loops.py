@@ -49,10 +49,14 @@ def _wakeup_outcome(messages, turn):
     from api.streaming import _session_has_cancel_marker
     msgs = list(messages or [])
     turn = turn or {}
-    token, at = turn.get("token"), turn.get("started_at")
+    token, at, prompt = turn.get("token"), turn.get("started_at"), turn.get("prompt")
 
     def _is_wakeup(m):  # Stop's recovered row carries the same token
-        return (token and m.get("_active_turn_token") == token) or (at and m.get("timestamp") == at)
+        if (token and m.get("_active_turn_token") == token) or (at and m.get("timestamp") == at):
+            return True
+        # Pre-upgrade Stop recovery: no token, timestamp truncated to int(started_at).
+        return bool(prompt and at and "_active_turn_token" not in m and m.get("timestamp") == int(at)
+                    and str(m.get("content") or "").strip() == prompt)
     for i, m in enumerate(msgs):
         if m.get("role") == "user" and _is_wakeup(m):
             rows = []
@@ -214,6 +218,12 @@ def run_due_loops():
 
 
 def start_loop_scheduler():
+    """Rollback: HERMES_WEBUI_LOOP_SCHEDULER=0 never starts the thread; saved loops just stay due."""
+    import os
+    if os.environ.get("HERMES_WEBUI_LOOP_SCHEDULER", "1").strip().lower() in ("0", "false", "off", "no"):
+        logging.getLogger(__name__).info("/loop scheduler disabled by HERMES_WEBUI_LOOP_SCHEDULER")
+        return False
+
     def _run():
         while True:
             _WAKE.wait(15)
@@ -223,3 +233,4 @@ def start_loop_scheduler():
             except Exception:
                 logging.getLogger(__name__).debug("/loop scheduler pass failed", exc_info=True)
     threading.Thread(target=_run, name="webui-loop-scheduler", daemon=True).start()
+    return True
