@@ -82,10 +82,13 @@ from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
 from api.models import (
     StateDBSessionMessagesSnapshot,
+    _cancelled_journal_turn_owner,
     _WEBUI_TRUSTED_AGENT_INPUT_FIELD,
     _is_empty_partial_activity_message,
     _message_exact_timestamp_details,
     _message_private_identity_compatible,
+    _recovered_pending_timestamp,
+    _state_db_row_identity_details,
     _validated_webui_pending_user_timestamp_identity,
     _evict_sessions_over_cap,
     clear_process_wakeup_pause,
@@ -4332,6 +4335,136 @@ def _split_thinking_from_content(raw_content, existing_reasoning=''):
     )
 
 
+def _turn_step_tool_call_ids(messages, prev_asst, started_ids):
+    """Map this turn's assistant step positions to their tool call IDs, in order.
+
+    ``prev_asst`` assistant messages belong to prior turns and are skipped.
+    ``started_ids`` lists every live tool start in order; an ID repeats when two
+    steps reuse it (agents derive IDs deterministically when providers omit them).
+
+    IDs come from the step's ``tool_calls``, else its following tool results.
+    ID-less results are bound by aligning every result slot of the turn with
+    the live starts in order; only when the counts match and each explicit ID
+    sits at its aligned start. Otherwise they stay unbound: misattribution is
+    worse than loss.
+    """
+    step_ids, slots = {}, []
+    positions = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get('role') == 'assistant']
+    for pos in positions[prev_asst:]:
+        msg = messages[pos]
+        ids = [tc.get('id') for tc in msg.get('tool_calls') or [] if isinstance(tc, dict) and tc.get('id')]
+        slots.extend((pos, i) for i in ids)
+        if not ids:
+            for m in messages[pos + 1:]:
+                if not (isinstance(m, dict) and m.get('role') == 'tool'):
+                    break
+                slots.append((pos, m.get('tool_call_id') or None))
+                if m.get('tool_call_id'):
+                    ids.append(m['tool_call_id'])
+        step_ids[pos] = ids
+    started = list(started_ids)
+    if (any(i is None for _, i in slots) and len(slots) == len(started)
+            and all(i is None or i == s for (_, i), s in zip(slots, started, strict=True))):
+        for (pos, call_id), start_id in zip(slots, started, strict=True):
+            if call_id is None:
+                step_ids[pos].append(start_id)
+    return step_ids
+
+
+def _stream_reasoning_owner(msg, is_last, positional_idx, tool_call_segments, open_segment,
+                            interim_segments, call_ids):
+    """Return the stream segment index this assistant step owns, or None.
+
+    ``interim_segments`` is consumed in order: a step whose content holds an
+    interim message's visible text takes the segment bound to it (earlier
+    unmatched interims are dropped). ``tool_call_segments`` maps an ID to its
+    per-start segments; each step consumes the oldest one, so a repeated ID
+    resolves in step order.
+    """
+    bound = [tool_call_segments[i].pop(0) for i in call_ids if tool_call_segments.get(i)]
+    content = msg.get('content')
+    interim = None
+    # Codex Responses keeps a tool round's commentary in codex_message_items, not content
+    from api.media_snapshots import codex_commentary_text
+    match_text = (content if isinstance(content, str) else '') + codex_commentary_text(msg)
+    compact = _compact_for_echo_compare(match_text) if match_text else ''
+    # Exact text first, then the longest contained one, so an omitted interim
+    # that is a prefix of this step's text cannot claim it.
+    hits = [i for i, (text, _) in enumerate(interim_segments) if compact and text and text in compact]
+    hit = max(hits, key=lambda i: (interim_segments[i][0] == compact, len(interim_segments[i][0]), -i),
+              default=None)
+    if hit is not None:
+        interim = interim_segments[hit][1]
+        del interim_segments[:hit + 1]
+    if is_last and not bound and open_segment is not None and positional_idx is None:
+        # The final step's own thinking beats a repeated-commentary hit. Not when a
+        # positional mapping exists (Agents without tool_start_callback): there the
+        # positional index decides, or a silent final step inherits an earlier step's thinking.
+        return open_segment
+    if bound or interim is not None:
+        # parallel calls: only the first-started call carries the segment; a
+        # tool step with commentary had it bound at its interim message
+        return next((idx for idx in bound if idx is not None), interim)
+    if positional_idx is not None:
+        return positional_idx  # caller passes it only when no boundary bindings exist
+    return open_segment if is_last else None
+
+
+def _settle_turn_reasoning(s, _previous_messages, _reasoning_segments,
+                           tool_call_segments=None, open_segment=None, interim_segments=None,
+                           tool_start_order=None):
+    """Persist per-step reasoning on this turn's assistant messages in ``s.messages``.
+
+    Contract (docs/sse-streams.md, "Reasoning settlement"): non-empty agent
+    ``reasoning`` wins; otherwise the stream segment the step owns is used.
+    Ownership comes from ``tool_call_segments`` (tool_call_id -> segment index
+    per start of that ID, in start order), ``interim_segments`` ((compact visible text,
+    segment index) per interim message, bound when it is delivered) and
+    ``open_segment`` (the final step's segment), so a step that streamed no
+    thinking never inherits a neighbour's segment.
+    Inline ``<think>`` blocks are split out of content either way.
+    """
+    # #3587: use per-message segments so each of this turn's assistant messages
+    # gets its own trace; skip prior-turn messages (multi-turn off-by-N).
+    if not s.messages:
+        return
+    tool_call_segments = {k: list(v) for k, v in (tool_call_segments or {}).items()}
+    interim_segments = list(interim_segments or [])
+    _positional = not tool_call_segments and not interim_segments
+    _prev_asst = sum(
+        1 for m in (_previous_messages or [])
+        if isinstance(m, dict) and m.get('role') == 'assistant'
+    )
+    _total_asst = sum(1 for m in s.messages if isinstance(m, dict) and m.get('role') == 'assistant')
+    _asst_count = 0
+    _step_ids = _turn_step_tool_call_ids(s.messages, _prev_asst, list(tool_start_order or []))
+    _pos = -1
+    for _rm in s.messages:
+        _pos += 1
+        if not (isinstance(_rm, dict) and _rm.get('role') == 'assistant'):
+            continue
+        _turn_idx = _asst_count
+        _asst_count += 1
+        if _turn_idx < _prev_asst:
+            continue  # prior-turn message: never touch its reasoning
+        _owner = _stream_reasoning_owner(
+            _rm, _asst_count == _total_asst, (_turn_idx - _prev_asst) if _positional else None,
+            tool_call_segments, open_segment, interim_segments,
+            _step_ids[_pos],
+        )
+        _existing_reasoning = _rm.get('reasoning') or _reasoning_segments.get(_owner, '')
+        _content = _rm.get('content')
+        if isinstance(_content, str) and _content:
+            _new_content, _merged_reasoning = _split_thinking_from_content(
+                _content, _existing_reasoning
+            )
+            _rm['content'] = _new_content
+            if _merged_reasoning:
+                _rm['reasoning'] = _merged_reasoning
+        elif _existing_reasoning:
+            _rm['reasoning'] = _existing_reasoning
+
+
 def _strip_thinking_markup(text: str) -> str:
     """Remove common reasoning/thinking wrappers from model text."""
     if not text:
@@ -6913,6 +7046,48 @@ def _compact_session_image_parts_for_persistence(session) -> int:
     return changed
 
 
+def _is_non_replayable_history_row(msg) -> bool:
+    """Return True for an error marker or an empty partial: rows that are
+    never model-facing history.
+
+    One predicate for the legacy path (``_sanitize_messages_for_api``) and the
+    Gateway runs-API history builder, so both drop these two kinds of row
+    alike (#8034). It is not the whole of the legacy projection: the sanitizer
+    also drops reasoning-only assistant rows and ``_recovered`` user rows,
+    which the Gateway builder still sends.
+    """
+    if not isinstance(msg, dict):
+        return False
+    # Persisted error markers — never send them to the LLM as prior context.
+    if msg.get('_error'):
+        return True
+    # _partial markers with no visible content. Partial messages that carry
+    # actual text (e.g. "Python is a high-level…") are kept so the model can
+    # continue from the cut-off point (#893). But empty partials (reasoning-only
+    # or tool-only cancellations where thinking markup was stripped) have
+    # nothing for the model to continue from and cause API 400 errors on strict
+    # providers (empty assistant content).
+    if msg.get('_partial') and not str(msg.get('content') or '').strip():
+        return True
+    return False
+
+
+def _recovered_user_row_is_kept(prev_role, next_role) -> bool:
+    """Return True when a ``_recovered`` user row must stay in replayed history.
+
+    It stays only where it opens a turn that was answered: ``next_role`` (the
+    next surviving row's role) must be ``assistant``, and ``prev_role`` (the
+    previously kept row's role) must be ``assistant`` or absent. Between two
+    assistant turns dropping it would fuse them; as the first row of the history
+    it is the question its answer replies to (a first turn interrupted by a
+    restart is saved as ``[recovered prompt, journaled answer]``). Anywhere else
+    it is dropped: after a user turn it would sit beside it, and before a user
+    turn (or at the end) it is a stale prompt nobody answered (#4283). One rule
+    for the two legacy projections and the Gateway runs-API history builder (#8038).
+    """
+    return next_role == 'assistant' and prev_role in (None, 'assistant')
+
+
 def _sanitize_messages_for_api(
     messages,
     *,
@@ -6955,6 +7130,11 @@ def _sanitize_messages_for_api(
         allowed_keys = _API_SAFE_MSG_KEYS | {"api_content"}
     # First pass: collect all tool_call_ids declared by assistant messages.
     # Handles both OpenAI ('id') and Anthropic ('call_id') field names.
+    # Late recovery can restore display rows without proving a context owner.
+    # Filter before tool-ID collection and metadata stripping on both paths.
+    messages = [message for message in messages if not (
+        isinstance(message, dict) and message.get('_recovered_display_only') is True
+    )]
     valid_tool_call_ids: set = set()
     for msg in messages:
         if not isinstance(msg, dict):
@@ -6975,16 +7155,8 @@ def _sanitize_messages_for_api(
         # metadata, not provider-facing assistant turns.
         if _is_reasoning_only_assistant_message(msg):
             continue
-        # Skip persisted error markers — never send them to the LLM as prior context.
-        if msg.get('_error'):
-            continue
-        # Skip _partial markers with no visible content. Partial messages that
-        # carry actual text (e.g. "Python is a high-level…") are kept so the
-        # model can continue from the cut-off point (#893). But empty partials
-        # (reasoning-only or tool-only cancellations where thinking markup was
-        # stripped) have nothing for the model to continue from and cause
-        # API 400 errors on strict providers (empty assistant content).
-        if msg.get('_partial') and not str(msg.get('content') or '').strip():
+        # Skip persisted error markers and empty _partial markers.
+        if _is_non_replayable_history_row(msg):
             continue
         # Note: _recovered user messages are NOT skipped here — they may need
         # to be retained to preserve role alternation when a kept assistant
@@ -7082,8 +7254,8 @@ def _sanitize_messages_for_api(
             for j in range(i + 1, len(filtered_clean)):
                 next_role = filtered_clean[j].get('role')
                 break
-            # Keep only if this recovered user actually separates two assistants.
-            if not (prev_role == 'assistant' and next_role == 'assistant'):
+            # Keep only if this recovered user opens an answered turn (see the helper).
+            if not _recovered_user_row_is_kept(prev_role, next_role):
                 continue  # drop — fusing the neighbours is clean, or it's a stale prompt
             # Keep but strip the temporary marker
             msg = {k: v for k, v in msg.items() if k != '_recovered'}
@@ -7122,7 +7294,7 @@ def _api_safe_message_positions(messages):
     """Return [(original_index, sanitized_message)] for API-safe messages."""
     valid_tool_call_ids: set = set()
     for msg in messages:
-        if not isinstance(msg, dict):
+        if not isinstance(msg, dict) or msg.get('_recovered_display_only') is True:
             continue
         if msg.get('role') == 'assistant':
             for tc in msg.get('tool_calls') or []:
@@ -7133,13 +7305,11 @@ def _api_safe_message_positions(messages):
 
     out = []
     for idx, msg in enumerate(messages):
-        if not isinstance(msg, dict):
+        if not isinstance(msg, dict) or msg.get('_recovered_display_only') is True:
             continue
         if _is_reasoning_only_assistant_message(msg):
             continue
-        if msg.get('_error'):
-            continue
-        if msg.get('_partial') and not str(msg.get('content') or '').strip():
+        if _is_non_replayable_history_row(msg):
             continue
         # Note: _recovered user messages are NOT skipped here — deferred to
         # a final pass after orphaned tool_calls stripping (#4283).
@@ -7191,7 +7361,7 @@ def _api_safe_message_positions(messages):
     # Fourth pass: drop _recovered user messages unless removing one would fuse
     # two same-role neighbours — mirrors _sanitize_messages_for_api pass 4 (#4283).
     # Decide on the ACTUAL kept sequence: prev kept role (final_out[-1]) + next
-    # surviving role. Keep ONLY when it separates two assistants; otherwise drop.
+    # surviving role. Keep ONLY when it opens an answered turn (see the helper); otherwise drop.
     final_out = []
     for i, (idx, msg) in enumerate(filtered_out):
         if msg.get('_recovered') and msg.get('role') == 'user':
@@ -7200,7 +7370,7 @@ def _api_safe_message_positions(messages):
             for j in range(i + 1, len(filtered_out)):
                 next_role = filtered_out[j][1].get('role')
                 break
-            if not (prev_role == 'assistant' and next_role == 'assistant'):
+            if not _recovered_user_row_is_kept(prev_role, next_role):
                 continue
             msg = {k: v for k, v in msg.items() if k != '_recovered'}
         final_out.append((idx, msg))
@@ -7559,6 +7729,12 @@ def _restore_reasoning_metadata_before_boundary(
             # with their display counterpart.
             if prev_msg.get('id') is not None and cur_msg.get('id') is None:
                 cur_msg['id'] = prev_msg['id']
+            # SQLite identity is private replay provenance, stripped before
+            # Agent input. Restore it only on this proved historical prefix,
+            # never onto the active turn even when the text is identical.
+            if (prev_msg.get('_state_db_row_id') is not None
+                    and cur_msg.get('_state_db_row_id') is None):
+                cur_msg['_state_db_row_id'] = prev_msg['_state_db_row_id']
             if (
                 prev_msg.get(_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG) is True
                 and cur_msg.get(_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG) is not True
@@ -7730,12 +7906,30 @@ def _strip_replayed_prefix(existing_messages, candidates):
     existing_messages = list(existing_messages or [])
     candidates = list(candidates or [])
     max_overlap = min(len(existing_messages), len(candidates))
-    for overlap in range(max_overlap, 0, -1):
-        left = [_message_replay_key(m) for m in existing_messages[-overlap:]]
-        right = [_message_replay_key(m) for m in candidates[:overlap]]
-        if left == right:
-            return candidates[overlap:]
-    return candidates
+    if not max_overlap:
+        return candidates
+    # KMP matches the longest candidate prefix at the end of the old transcript.
+    # Each payload is keyed once; shrinking slices re-serialized O(n²) rows while
+    # settlement held the session lock. Keep the existing replay-key semantics.
+    keys = [_message_replay_key(m) for m in candidates[:max_overlap]]
+    fallback = [0] * max_overlap
+    matched = 0
+    for idx in range(1, max_overlap):
+        while matched and keys[idx] != keys[matched]:
+            matched = fallback[matched - 1]
+        if keys[idx] == keys[matched]:
+            matched += 1
+        fallback[idx] = matched
+    matched = 0
+    for message in existing_messages[-max_overlap:]:
+        key = _message_replay_key(message)
+        if matched == max_overlap:
+            matched = fallback[matched - 1]
+        while matched and key != keys[matched]:
+            matched = fallback[matched - 1]
+        if key == keys[matched]:
+            matched += 1
+    return candidates[matched:]
 
 
 def _looks_like_replayed_session_arc_summary(previous_msg, candidate_msg):
@@ -9554,7 +9748,12 @@ def _sse_keepalive(handler) -> None:
 def _sse(handler, event, data):
     """Write one SSE event to the response stream."""
     payload = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-    _sse_write(handler, payload.encode('utf-8'))
+    try:
+        encoded = payload.encode('utf-8')
+    except UnicodeEncodeError:
+        payload = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=True)}\n\n"
+        encoded = payload.encode('utf-8')
+    _sse_write(handler, encoded)
 
 
 # ── SSE write deadline (Defect A: per-connection thread exhaustion) ─────────
@@ -10162,6 +10361,118 @@ def _register_pending_user_timestamp_identity(
         save(touch_updated_at=False, skip_index=True)
 
 
+def _preserve_legacy_agent_row_identity(callable_obj, identity):
+    """Keep IDs returned by an older Agent's actual SQLite append calls.
+
+    Some Agents accept user timestamps but still discard returned row IDs.
+    Observe only this flush's calls on its own thread/DB instance, then attach
+    the returned IDs to those exact dicts. This is write provenance, not a
+    content-only guess about an independently read historical transcript.
+    """
+    agent = getattr(callable_obj, '__self__', None)
+    context = getattr(agent, '_webui_legacy_identity_context', None)
+    if not isinstance(identity, dict):
+        if isinstance(context, threading.local):
+            context.owner = None
+        return
+    flush = getattr(agent, '_flush_messages_to_session_db', None)
+    if not callable(flush):
+        return
+    if not isinstance(context, threading.local):
+        context = threading.local()
+        agent._webui_legacy_identity_context = context
+    context.owner = copy.deepcopy(identity)
+    if getattr(agent, '_webui_legacy_identity_adapter', False):
+        return
+
+    def flush_with_identity(messages, conversation_history=None):
+        owner = copy.deepcopy(getattr(context, 'owner', None))
+        if not isinstance(owner, dict):
+            return flush(messages, conversation_history)
+        db = getattr(agent, '_session_db', None)
+        append = getattr(db, 'append_message', None)
+        namespace = getattr(db, '__dict__', None)
+        if not callable(append) or not isinstance(namespace, dict):
+            return flush(messages, conversation_history)
+        lock = namespace.setdefault('_webui_legacy_identity_lock', threading.RLock())
+        with lock:
+            original_override = namespace.get('append_message')
+            had_override = 'append_message' in namespace
+            sid = getattr(agent, 'session_id', None)
+            start = max(len(conversation_history or []), getattr(agent, '_last_flushed_db_idx', 0))
+            rows = list(messages[start:])
+            observed = []
+            owner_thread = threading.get_ident()
+
+            def observed_append(*args, **kwargs):
+                row_id = append(*args, **kwargs)
+                if threading.get_ident() == owner_thread:
+                    observed.append((kwargs, row_id))
+                return row_id
+
+            db.append_message = observed_append
+            try:
+                result = flush(messages, conversation_history)
+            finally:
+                if namespace.get('append_message') is observed_append:
+                    if had_override:
+                        db.append_message = original_override
+                    else:
+                        del db.append_message
+            if (getattr(agent, '_session_db', None) is not db
+                    or getattr(agent, 'session_id', None) != sid
+                    or not rows or len(rows) != len(observed)):
+                return result
+            ids = [row_id for _, row_id in observed]
+            if not all(type(row_id) is int and row_id > 0 for row_id in ids) or len(set(ids)) != len(ids):
+                return result
+            index = getattr(agent, '_persist_user_message_idx', None)
+            for offset, (row, (written, row_id)) in enumerate(zip(rows, observed, strict=True)):
+                known_id, valid = _state_db_row_identity_details(row)
+                # Later legacy flushes apply the clean user override only to
+                # SQLite, leaving the workspace prefix in the live dict.
+                current_user_override = (
+                    type(index) is int and index == start + offset
+                    and owner.get('session_id') == sid and owner.get('token')
+                    and getattr(context, 'owner', None) == owner
+                    and written.get('role') == 'user'
+                    and written.get('content') == getattr(agent, '_persist_user_message_override', None)
+                    and written.get('content') == owner.get('text')
+                    and _active_turn_user_text_matches(row, owner.get('text'))
+                )
+                if (not isinstance(row, dict) or written.get('session_id') != sid
+                        or written.get('role') != row.get('role')
+                        or (written.get('content') != row.get('content') and not current_user_override)
+                        or not valid or known_id not in (None, str(row_id))):
+                    return result
+            # Native producers retain their own provenance and clock contract.
+            # The run signature alone does not establish that capability.
+            if all(_state_db_row_identity_details(row)[0] == str(row_id)
+                   for row, row_id in zip(rows, ids, strict=True)):
+                return result
+            for row, row_id in zip(rows, ids, strict=True):
+                row['_state_db_row_id'] = row_id
+            # The old Agent exports an index but no turn_id. Its own indexed
+            # dict plus this successful append proves the active user; retain
+            # WebUI's run token so shared settlement does not insert it again.
+            if (isinstance(owner, dict) and owner.get('session_id') == sid
+                    and getattr(context, 'owner', None) == owner
+                    and owner.get('token') and type(index) is int
+                    and start <= index < start + len(rows)
+                    and _active_turn_user_text_matches(messages[index], owner.get('text'))):
+                stamp_message_source(messages[index], owner.get('source') or 'webui',
+                                     active_turn_token=owner['token'])
+                row_timestamp, row_clock_valid = _message_exact_timestamp_details(messages[index])
+                owner_timestamp, owner_clock_valid = _message_exact_timestamp_details(
+                    {'timestamp': owner.get('timestamp')})
+                if row_clock_valid and row_timestamp is None and owner_clock_valid and owner_timestamp is not None:
+                    messages[index]['timestamp'] = owner_timestamp
+            return result
+
+    agent._flush_messages_to_session_db = flush_with_identity
+    agent._webui_legacy_identity_adapter = True
+
+
 def _build_run_conversation_kwargs(
     callable_obj,
     *,
@@ -10172,13 +10483,15 @@ def _build_run_conversation_kwargs(
     task_id,
     persist_user_message,
     persist_user_timestamp,
+    legacy_row_identity_owner=None,
 ):
-    """Build one rolling-compatible Agent invocation contract without mutation.
+    """Build one rolling-compatible Agent invocation contract.
 
     ``persist_user_timestamp`` is signature-gated (#6935): an older
     hermes-agent whose ``run_conversation()`` predates the kwarg must not
     receive it, or the call trips a TypeError before the turn starts.
     """
+    _preserve_legacy_agent_row_identity(callable_obj, legacy_row_identity_owner)
     kwargs = {
         "user_message": user_message,
         "system_message": system_message,
@@ -11617,6 +11930,15 @@ def _run_agent_streaming(
             _reasoning_buffer_index = _CompactEchoIndex()
             _current_reasoning_idx = 0
             _tool_boundary_advanced = False
+            # Segment ownership: tool_call_id -> segment streamed before each start
+            # of that ID (None = its step streamed no thinking; IDs can repeat
+            # across steps); interim -> (compact visible
+            # text, segment) per delivered interim message; unbound = the open
+            # step's segment.
+            _tool_call_reasoning_idx: dict = {}
+            _tool_start_order: list = []
+            _interim_reasoning_idx: list = []
+            _unbound_reasoning_idx = [None]
             _live_tool_calls = []  # tool progress fallback when final messages omit tool IDs
 
             # Throttle: emit metering events at most every 100 ms so the per-message
@@ -11778,6 +12100,7 @@ def _run_agent_streaming(
                 _reasoning_segments[_current_reasoning_idx] = (
                     _reasoning_segments.get(_current_reasoning_idx, '') + reasoning_delta
                 )
+                _unbound_reasoning_idx[0] = _current_reasoning_idx
                 # Keep the folded index in step with the segment text.
                 _reasoning_segment_indexes.setdefault(
                     _current_reasoning_idx, _CompactEchoIndex()
@@ -11824,6 +12147,12 @@ def _run_agent_streaming(
                 visible = str(text).strip()
                 if not visible:
                     return
+                # The interim message closes its step: bind the open segment to it
+                # so the next tool call cannot claim it (settlement matches by text).
+                # Agents without tool_start_callback keep positional settlement.
+                if 'tool_start_callback' in _agent_params:
+                    _interim_reasoning_idx.append((_compact_for_echo_compare(visible), _unbound_reasoning_idx[0]))
+                    _unbound_reasoning_idx[0] = None
                 reasoning_echo = _strip_reasoning_output_echo(visible)
                 already_streamed = bool(cb_kwargs.get('already_streamed', False)) or _is_visible_output_echo(visible)
                 payload = {
@@ -11915,6 +12244,7 @@ def _run_agent_streaming(
                         _reasoning_segments[_current_reasoning_idx] = (
                             _reasoning_segments.get(_current_reasoning_idx, '') + reason_delta
                         )
+                        _unbound_reasoning_idx[0] = _current_reasoning_idx
                         _reasoning_segment_indexes.setdefault(
                             _current_reasoning_idx, _CompactEchoIndex()
                         ).append(reason_delta)
@@ -12061,6 +12391,10 @@ def _run_agent_streaming(
                     return
 
             def on_tool_start(tool_call_id, name, args):
+                if tool_call_id:
+                    _tool_call_reasoning_idx.setdefault(tool_call_id, []).append(_unbound_reasoning_idx[0])
+                    _tool_start_order.append(tool_call_id)
+                _unbound_reasoning_idx[0] = None
                 try:
                     _record_live_tool_start(tool_call_id, name, args)
                     if tool_call_id and tool_call_id not in _live_tool_event_start_ids:
@@ -12758,6 +13092,8 @@ def _run_agent_streaming(
                 session_id,
                 profile=getattr(s, 'profile', None),
                 with_revision=True,
+                **({'include_row_identity': True}
+                   if _cancelled_journal_turn_owner(s.messages) else {}),
             )
 
             def _context_and_revision_from_state_snapshot(state_snapshot):
@@ -12785,6 +13121,8 @@ def _run_agent_streaming(
                     session_id,
                     profile=getattr(s, 'profile', None),
                     with_revision=True,
+                    **({'include_row_identity': True}
+                       if _cancelled_journal_turn_owner(s.messages) else {}),
                 )
                 return _context_and_revision_from_state_snapshot(fresh_state_snapshot)
 
@@ -12912,6 +13250,9 @@ def _run_agent_streaming(
                 task_id=session_id,
                 persist_user_message=msg_text,
                 persist_user_timestamp=_persist_user_timestamp,
+                legacy_row_identity_owner=(
+                    _active_turn_identity if _cancelled_journal_turn_owner(s.messages) else None
+                ),
             )
             # Only pass moa_config when a /moa override is actually active, so a
             # normal send never trips a TypeError on an older hermes-agent whose
@@ -13528,6 +13869,9 @@ def _run_agent_streaming(
                                     task_id=session_id,
                                     persist_user_message=msg_text,
                                     persist_user_timestamp=_heal_persist_user_timestamp,
+                                    legacy_row_identity_owner=(
+                                        _active_turn_identity if _cancelled_journal_turn_owner(s.messages) else None
+                                    ),
                                 )
                                 if moa_config is not None:
                                     _heal_kwargs["moa_config"] = moa_config
@@ -13901,37 +14245,12 @@ def _run_agent_streaming(
                 # assistant content into m['reasoning'] (server-side twin of the JS
                 # _splitThinkFromContent). Inline-thinking providers (e.g. MiniMax-M3)
                 # otherwise leave the thinking trace in m['content'], bloating the
-                # persisted session file 30-50% and bypassing the thinking card. The
-                # #3587: use per-message segments so intermediate assistant turns
-                # (before tool calls) each receive their own reasoning trace rather
-                # than all reasoning being written only to the last assistant message.
-                # Scope the walk to this turn's newly-appended assistant messages
-                # to prevent cross-turn reasoning clobber (multi-turn off-by-N).
-                if s.messages:
-                    _prev_asst = sum(
-                        1 for m in (_previous_messages or [])
-                        if isinstance(m, dict) and m.get('role') == 'assistant'
-                    )
-                    _asst_count = 0
-                    for _rm in s.messages:
-                        if not (isinstance(_rm, dict) and _rm.get('role') == 'assistant'):
-                            continue
-                        _turn_idx = _asst_count
-                        _asst_count += 1
-                        if _turn_idx < _prev_asst:
-                            continue  # prior-turn message — never touch its reasoning
-                        _seg_reasoning = _reasoning_segments.get(_turn_idx - _prev_asst, '')
-                        _existing_reasoning = _seg_reasoning or _rm.get('reasoning') or ''
-                        _content = _rm.get('content')
-                        if isinstance(_content, str) and _content:
-                            _new_content, _merged_reasoning = _split_thinking_from_content(
-                                _content, _existing_reasoning
-                            )
-                            _rm['content'] = _new_content
-                            if _merged_reasoning:
-                                _rm['reasoning'] = _merged_reasoning
-                        elif _existing_reasoning:
-                            _rm['reasoning'] = _existing_reasoning
+                # persisted session file 30-50% and bypassing the thinking card.
+                _settle_turn_reasoning(
+                    s, _previous_messages, _reasoning_segments,
+                    _tool_call_reasoning_idx, _unbound_reasoning_idx[0], _interim_reasoning_idx,
+                    _tool_start_order,
+                )
                 try:
                     _turn_duration_seconds = max(0.0, time.time() - float(_turn_started_at))
                 except Exception:
@@ -14913,6 +15232,9 @@ def _run_agent_streaming(
                             task_id=session_id,
                             persist_user_message=msg_text,
                             persist_user_timestamp=_heal_persist_user_timestamp,
+                            legacy_row_identity_owner=(
+                                _active_turn_identity if _cancelled_journal_turn_owner(s.messages) else None
+                            ),
                         )
                         if moa_config is not None:
                             _heal_kwargs2["moa_config"] = moa_config
@@ -15769,6 +16091,12 @@ def cancel_stream(stream_id: str) -> bool:
                     )
                     _emit_cancel_event = False
                     return True
+                # Decide the saved-partial path before creating a provisional
+                # journal-only owner. Existing partials must remain available
+                # to the next-send history through the established projection.
+                _partial_msg = _build_partial_message(
+                    _cancel_partial_text, _cancel_reasoning, _cancel_tool_calls,
+                )
                 # ── Preserve the user's typed message before clearing pending state (#1298) ──
                 # The agent's internal messages list (where the user message was appended at
                 # the start of run_conversation()) may not have been merged back into
@@ -15786,18 +16114,24 @@ def cancel_stream(stream_id: str) -> bool:
                 # Wrapped in its own try/except so an unexpected _cs.messages shape (e.g.
                 # in unit tests using Mock sessions) cannot escape and skip the rest of
                 # the cleanup.
+                _cancel_turn_start = None
+                _cancel_turn_token = None
                 try:
                     _pending_user = getattr(_cs, 'pending_user_message', None)
                     _pending_source = getattr(_cs, 'pending_user_source', None)
                     _pending_atts_raw = getattr(_cs, 'pending_attachments', None)
                     _pending_atts = list(_pending_atts_raw) if isinstance(_pending_atts_raw, (list, tuple)) else []
                     _pending_started = getattr(_cs, 'pending_started_at', None) or 0
+                    _cancel_turn_token = build_active_turn_token(stream_id, _pending_started)
                     _msgs_for_recovery = _cs.messages if isinstance(_cs.messages, list) else None
                     if _pending_user and _msgs_for_recovery is not None:
                         _last_user = None
-                        for _m in reversed(_msgs_for_recovery):
+                        _last_user_idx = None
+                        for _idx in range(len(_msgs_for_recovery) - 1, -1, -1):
+                            _m = _msgs_for_recovery[_idx]
                             if isinstance(_m, dict) and _m.get('role') == 'user':
                                 _last_user = _m
+                                _last_user_idx = _idx
                                 break
                         _already_persisted = False
                         if _last_user is not None:
@@ -15813,19 +16147,109 @@ def cancel_stream(stream_id: str) -> bool:
                                 # Tolerate the workspace prefix the streaming thread prepends.
                                 if _pending_user == _last_content or _pending_user in _last_content:
                                     _already_persisted = True
-                        if not _already_persisted:
-                            _recovered_ts = int(time.time())
-                            if isinstance(_pending_started, (int, float)) and _pending_started > 0:
-                                _recovered_ts = int(_pending_started)
+                        if _already_persisted:
+                            _cancel_turn_start = _last_user_idx
+                        else:
+                            _recovered_ts = _recovered_pending_timestamp(_pending_started)
                             _user_turn: dict = {
                                 'role': 'user',
                                 'content': _pending_user,
                                 'timestamp': _recovered_ts,
                             }
-                            stamp_message_source(_user_turn, _pending_source)
+                            stamp_message_source(
+                                _user_turn,
+                                _pending_source,
+                                active_turn_token=_cancel_turn_token,
+                            )
                             if _pending_atts:
                                 _user_turn['attachments'] = _pending_atts
                             _msgs_for_recovery.append(_user_turn)
+                            _cancel_turn_start = len(_msgs_for_recovery) - 1
+
+                        if isinstance(_cancel_turn_start, int):
+                            # Bind the durable cancel hook to the same exact turn
+                            # identity used by normal settlement. A display ordinal
+                            # cannot be translated into provider context after
+                            # compression because the two lists may have different
+                            # user-row counts.
+                            _cancel_owner = _msgs_for_recovery[_cancel_turn_start]
+                            if _cancel_turn_token:
+                                stamp_message_source(
+                                    _cancel_owner,
+                                    _pending_source,
+                                    active_turn_token=_cancel_turn_token,
+                                )
+
+                            if _partial_msg is None:
+                                # Provisional recovery boundary, not a queued
+                                # request. Only journal-only Stop needs an owner
+                                # awaiting durable model-visible output.
+                                _cancel_owner['_recovered'] = True
+                                # Keep the cancelled user boundary in provider context
+                                # so a later exact-stream recovery can be inserted before
+                                # a successor instead of becoming orphaned display state.
+                                from api.models import (
+                                    _append_recovered_turn_to_context,
+                                    _message_matches_pending_checkpoint,
+                                )
+
+                                _context_messages = getattr(_cs, 'context_messages', None)
+                                if not _cancel_turn_token:
+                                    _append_recovered_turn_to_context(_cs, _cancel_owner)
+                                elif not isinstance(_context_messages, list):
+                                    # Let the existing helper initialize context from
+                                    # the now-token-bearing display history.
+                                    _append_recovered_turn_to_context(_cs, _cancel_owner)
+                                else:
+                                    _token_matches = [
+                                        _row
+                                        for _row in _context_messages
+                                        if (
+                                            isinstance(_row, dict)
+                                            and _row.get('role') == 'user'
+                                            and _row.get('_active_turn_token') == _cancel_turn_token
+                                        )
+                                    ]
+                                    for _context_owner in _token_matches:
+                                        _context_owner['_recovered'] = True
+                                    if not _token_matches:
+                                        _strict_matches = [
+                                            _row
+                                            for _row in _context_messages
+                                            if _message_matches_pending_checkpoint(
+                                                _row,
+                                                _pending_user,
+                                                _pending_started,
+                                                _pending_source,
+                                                _pending_atts,
+                                            )
+                                        ]
+                                        _tail = _context_messages[-1] if _context_messages else None
+                                        if (
+                                            len(_strict_matches) == 1
+                                            and _strict_matches[0] is _tail
+                                            and isinstance(_tail, dict)
+                                            and not _tail.get('_active_turn_token')
+                                        ):
+                                            # Only a unique tokenless checkpoint at
+                                            # the exact context tail may be upgraded.
+                                            # Repeated equal prompts or a row already
+                                            # owned by another token are ambiguous and
+                                            # must remain untouched.
+                                            stamp_message_source(
+                                                _tail,
+                                                _pending_source,
+                                                active_turn_token=_cancel_turn_token,
+                                            )
+                                            _tail['_recovered'] = True
+                                        elif not _strict_matches:
+                                            # The current pending user is absent from
+                                            # provider context. Append the exact
+                                            # token-bearing owner rather than binding
+                                            # an older content-equal row.
+                                            _append_recovered_turn_to_context(
+                                                _cs, _cancel_owner
+                                            )
                 except Exception:
                     logger.debug(
                         "Failed to recover pending user message on cancel for %s",
@@ -15856,9 +16280,6 @@ def cancel_stream(stream_id: str) -> bool:
                 # call and strict providers would 400 on the malformed entries.
                 # The underscore-prefixed key is not in the whitelist, so sanitize
                 # strips it. The UI reads it via static/messages.js. (v0.50.251.)
-                _partial_msg = _build_partial_message(
-                    _cancel_partial_text, _cancel_reasoning, _cancel_tool_calls,
-                )
                 _cancel_marker_exists = _session_has_cancel_marker(_cs)
                 _cancel_marker_idx = len(_cs.messages)
                 if _cancel_marker_exists:
@@ -15896,6 +16317,42 @@ def cancel_stream(stream_id: str) -> bool:
                         'provider_details_label': 'Cancellation details',
                         'timestamp': int(time.time()),
                     })
+
+                # A journal-only turn has no in-memory partial to carry into the
+                # cancel save. Persist an exact-stream recovery capability on
+                # its marker before returning success. If this process exits
+                # while the old worker is unwinding, a later ordinary session
+                # read can recover already-emitted journal output without
+                # replaying provider execution. Live-buffer partials keep their
+                # existing path and deliberately do not opt into this slice.
+                if (
+                    _partial_msg is None
+                    and isinstance(_cancel_turn_start, int)
+                    and _cancel_turn_token
+                ):
+                    _cancel_retry_marker = None
+                    for _candidate in reversed(_cs.messages):
+                        if not isinstance(_candidate, dict) or _candidate.get('role') != 'assistant':
+                            continue
+                        _candidate_content = str(_candidate.get('content') or '').strip().lower()
+                        if (
+                            _candidate.get('_error') is True
+                            and any(pattern in _candidate_content for pattern in _CANCEL_MARKER_PATTERNS)
+                        ):
+                            _cancel_retry_marker = _candidate
+                            break
+                    if _cancel_retry_marker is not None:
+                        _cancel_retry_marker['_pending_journal_recovery'] = True
+                        _cancel_retry_marker['_journal_retry_kind'] = 'cancelled'
+                        _cancel_retry_marker['_journal_retry_stream_id'] = str(stream_id)
+                        _cancel_retry_marker['_journal_retry_attempts'] = 0
+                        _cancel_retry_marker['_journal_retry_first_seen_ts'] = int(time.time())
+                        from api.models import _JOURNAL_RECOVERY_PROCESS_TOKEN
+
+                        _cancel_retry_marker['_journal_retry_process_token'] = (
+                            _JOURNAL_RECOVERY_PROCESS_TOKEN
+                        )
+                        _cancel_retry_marker['_journal_retry_owner_token'] = _cancel_turn_token
                 _cs.save()
                 _cancel_session_payload = _redacted_session_payload_with_full_messages(_cs)
             except Exception:

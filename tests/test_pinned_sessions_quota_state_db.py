@@ -92,11 +92,14 @@ def test_pin_endpoint_counts_state_db_only_pins_of_a_profile_without_webui_rows(
     work_db = tmp_path / "work.db"
     _state_db(work_db, [(f"w{i}", None, None, None, 1) for i in range(3)])
     monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: work_db if profile == "work" else None)
-    monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default"}, {"name": "work"}])
+    monkeypatch.setattr(routes, "list_profiles_api", lambda: [
+        {"name": "default", "is_default": True}, {"name": "work", "is_default": False}])
     writes = []
     monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: writes.append(p) or True)
-    sess = PinSess("new_pin")
+    # The limit is per owning profile: work's three state.db-only pins fill work's quota.
+    sess = PinSess("new_pin", profile="work")
     post = patch_pin_endpoint(monkeypatch, {"new_pin": sess})
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "work")
     assert post("new_pin")[0] == 400
     assert writes == [] and sess.pinned is False
 
@@ -188,6 +191,16 @@ def test_same_session_id_in_two_profiles_counts_as_two_lineages(monkeypatch):
     post = patch_pin_endpoint(monkeypatch, {"same": sess}, limit=1, persisted=persisted)
     monkeypatch.setattr(routes, "_pin_quota_rows_from_state_db", lambda rows: list(rows))
     monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: writes.append(p) or True)
+    monkeypatch.setattr(routes, "list_profiles_api", lambda: [
+        {"name": "default", "is_default": True}, {"name": "work", "is_default": False}])
 
-    assert post("same")[0] == 400
-    assert writes == [] and sess.pinned is False
+    # work's "same" is a different lineage in a different profile's quota.
+    assert post("same")[0] == 200
+    assert writes == [True] and sess.pinned is True
+    # A second default pin is refused by default's own limit of 1.
+    other = PinSess("other", profile="default")
+    post = patch_pin_endpoint(monkeypatch, {"other": other}, limit=1, persisted=persisted + [sess.compact()])
+    monkeypatch.setattr(routes, "_pin_quota_rows_from_state_db", lambda rows: list(rows))
+    monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: writes.append(p) or True)
+    assert post("other")[0] == 400
+    assert writes == [True] and other.pinned is False
