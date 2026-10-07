@@ -646,7 +646,46 @@ def _note_live_gateway_event(stream_id: str, event_name: str, event_payload: dic
                 ) or shared_tc.get("name") == event_payload.get("name"):
                     shared_tc["done"] = True
                     shared_tc["is_error"] = bool(event_payload.get("is_error"))
+                    if event_payload.get("snippet"):
+                        shared_tc["snippet"] = event_payload["snippet"]
                     break
+
+
+def _persist_gateway_turn_tool_calls(session, assistant_msg, live_tool_calls) -> None:
+    """Save this turn's display-only tool records (preview, result snippet) with the settled answer.
+
+    Gateway transcripts carry no tool rows, so session.tool_calls is the only durable source for reload.
+    """
+    live = [tc for tc in (live_tool_calls or []) if isinstance(tc, dict) and tc.get("name")]
+    if not live:
+        return
+    messages = getattr(session, "messages", None) or []
+    # The display merge may copy rows, so match the settled answer by value, newest first.
+    idx = next((
+        i for i in range(len(messages) - 1, -1, -1)
+        if isinstance(messages[i], dict) and messages[i].get("role") == "assistant"
+        and messages[i].get("timestamp") == assistant_msg.get("timestamp")
+        and messages[i].get("content") == assistant_msg.get("content")
+    ), -1)
+    if idx < 0:
+        return
+    from api.streaming import _truncate_tool_args
+
+    kept = [tc for tc in (getattr(session, "tool_calls", None) or []) if tc.get("assistant_msg_idx") != idx]
+    for tc in live:
+        record = {
+            "name": tc.get("name"),
+            "args": _truncate_tool_args(tc.get("args") or {}, limit=4),
+            "snippet": tc.get("snippet") or "",
+            "tid": tc.get("tid") or "",
+            "assistant_msg_idx": idx,
+            "done": True,
+            "is_error": bool(tc.get("is_error")),
+        }
+        if tc.get("display_command"):
+            record["display_command"] = tc["display_command"]
+        kept.append(record)
+    session.tool_calls = kept
 
 
 def _open_gateway_run_events(base_url, headers, run_id, last_seq: int = -1):
@@ -1855,6 +1894,8 @@ def _run_gateway_chat_streaming(
                 ]
                 if len(current_display_rows) == 1:
                     current_display_rows[0]["timestamp"] = user_msg["timestamp"]
+            previous_tool_calls = list(getattr(s, "tool_calls", None) or [])
+            _persist_gateway_turn_tool_calls(s, assistant_msg, STREAM_LIVE_TOOL_CALLS.get(stream_id))
             s.active_stream_id = None
             s.gateway_run = None
             s.pending_user_message = None
@@ -1870,6 +1911,7 @@ def _run_gateway_chat_streaming(
             )
 
             def _restore_cancelled_success_writeback():
+                s.tool_calls = previous_tool_calls
                 if pending_source == "process_wakeup":
                     s.context_messages = previous_context
                     s.messages = previous_messages
@@ -1960,7 +2002,7 @@ def _run_gateway_chat_streaming(
                 goal_exc,
             )
         from api.streaming import _session_payload_with_full_messages
-        gateway_session_payload = _session_payload_with_full_messages(s, tool_calls=[])
+        gateway_session_payload = _session_payload_with_full_messages(s, tool_calls=list(getattr(s, "tool_calls", None) or []))
         put_gateway_event("done", {"session": redact_session_data(gateway_session_payload), "usage": usage})
         put_gateway_event("stream_end", {"session_id": session_id})
     except urllib.error.HTTPError as exc:

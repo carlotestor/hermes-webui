@@ -12,7 +12,7 @@ import pytest
 import api.gateway_chat as gateway_chat
 import api.models as models
 import api.streaming as streaming
-from api.config import PENDING_GOAL_CONTINUATION, STREAMS, create_stream_channel
+from api.config import PENDING_GOAL_CONTINUATION, STREAM_LIVE_TOOL_CALLS, STREAMS, create_stream_channel
 from api.models import new_session
 from api.gateway_chat import (
     _gateway_http_error_event,
@@ -422,6 +422,9 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
     assert isinstance(saved.messages[0]["timestamp"], float)
     assert isinstance(saved.messages[1]["timestamp"], float)
     assert saved.messages[0]["timestamp"] < saved.messages[1]["timestamp"]
+    # The live command preview is saved with the settled turn so reload keeps it.
+    assert [(tc["name"], tc["tid"], tc["assistant_msg_idx"], tc.get("display_command"), tc["done"])
+            for tc in saved.tool_calls] == [("terminal", "call-1", 1, "terminal: pytest", True)]
     assert saved.active_stream_id is None
     assert saved.model == "alias-target-model"
     assert saved.model_provider == "model-alias-profile-bound-lane"
@@ -1871,3 +1874,21 @@ def test_gateway_tool_completed_without_result_keeps_preview_only():
         {"event": "tool.completed", "tool": "terminal", "preview": "short"}
     )
     assert "snippet" not in completed and completed["preview"] == "short"
+
+
+def test_runs_api_live_snapshot_keeps_completed_result_snippet():
+    stream_id = "snap-snippet"
+    STREAM_LIVE_TOOL_CALLS[stream_id] = []
+    try:
+        name, started = _gateway_tool_progress_event(
+            {"event": "tool.started", "tool": "terminal", "preview": "pytest", "tool_call_id": "c1"})
+        gateway_chat._note_live_gateway_event(stream_id, name, started)
+        name, completed = _gateway_tool_progress_event(
+            {"event": "tool.completed", "tool": "terminal", "tool_call_id": "c1", "error": True,
+             "result": {"output": "boom " * 200, "exit_code": 1}})
+        gateway_chat._note_live_gateway_event(stream_id, name, completed)
+        [tc] = STREAM_LIVE_TOOL_CALLS[stream_id]
+        assert tc["done"] and tc["is_error"] and tc["display_command"] == "pytest"
+        assert tc["snippet"] == completed["snippet"] and "boom" in tc["snippet"]
+    finally:
+        STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)

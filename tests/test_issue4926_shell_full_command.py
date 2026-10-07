@@ -199,6 +199,8 @@ def test_real_command_keeps_shell_label_over_display_command(driver_path):
     ('curl -u alice:"pa ss" https://x', "curl -u alice:[redacted] https://x"),
     ("curl -u alice:pa\\ ss https://x", "curl -u alice:[redacted] https://x"),
     ('curl -sS --user "alice:pa ss" https://x', 'curl -sS --user "alice:[redacted]" https://x'),
+    ("curl \\\n  -u alice:s3cretPW https://x", "curl \\\n  -u alice:[redacted] https://x"),
+    ("curl -sS \\\n  --user alice:s3cretPW \\\n  https://x", "curl -sS \\\n  --user alice:[redacted] \\\n  https://x"),
 ])
 def test_curl_basic_auth_password_redacted_username_kept(driver_path, cmd, kept):
     out = _run(driver_path, {"args": {"command": cmd}})
@@ -225,3 +227,20 @@ def test_gateway_tool_started_curl_password_never_reaches_card(driver_path):
     out = _run(driver_path, tc)
     for text in (out["header"], out["lead"]):
         assert "s3cretPW" not in text and "alice:[redacted]" in text
+
+
+def test_curl_continuation_password_redacted_in_display_command_preview(driver_path):
+    out = _run(driver_path, {"name": "terminal", "args": {}, "display_command": "curl \\\n  -u alice:s3cretPW https://x"})
+    assert "s3cretPW" not in out["lead"] and "alice:[redacted]" in out["lead"]
+
+
+def test_continuation_does_not_extend_curl_past_line_end(driver_path):
+    out = _run(driver_path, {"args": {"command": "curl https://x\nsort -u a:b"}})
+    assert "sort -u a:b" in out["lead"]
+
+
+def test_command_preview_label_is_localized():
+    src = (REPO_ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
+    assert src.count("tool_detail_command_preview:") == 15
+    ui = UI_JS_PATH.read_text(encoding="utf-8")
+    assert "t('tool_detail_command_preview')" in ui
