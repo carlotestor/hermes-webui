@@ -863,3 +863,79 @@ def test_5305_leaf_of_compressed_subagent_under_visible_webui_parent_nests():
     out = _render_tabs(json.dumps(rows))
     assert _sids(out["webui"]).count("L") == 1 and "L" not in _sids(out["cli"]), out
     assert {"sid": "L", "orphan": False} in out["webui"], out
+
+
+def _web(sid, **extra):
+    row = {"session_id": sid, "title": sid, "session_source": "webui", "raw_source": "webui", "source_tag": "webui",
+           "profile": "a", "message_count": 5, "updated_at": 100, "last_message_at": 100}
+    row.update(extra)
+    return row
+
+
+def test_5305_leaf_of_missing_subagent_parent_orphans():
+    """Re-gate #1: O (a subagent) is absent from the payload (e.g. zero-message, dropped by the
+    route). A subagent parent is a child row, never a scope-hidden top-level host, so L orphans."""
+    out = _render_tabs(json.dumps([_web("W"), _sub("L", "O", "subagent", updated_at=102)]))
+    assert {"sid": "L", "orphan": True} in out["webui"], out
+    assert "L" not in _sids(out["cli"]), out
+
+
+def _compressed_subagent_under_cli_db(path):
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, model TEXT, message_count INTEGER, "
+        "started_at REAL, source TEXT, parent_session_id TEXT, ended_at REAL, end_reason TEXT)"
+    )
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, timestamp REAL)")
+    rows = [
+        ("W", "CLI run", 90.0, "cli", None, None, None),
+        ("O_old", "Orchestrator", 100.0, "subagent", "W", 150.0, "compression"),
+        ("O_tip", "Orchestrator", 151.0, "subagent", "O_old", None, None),
+        ("L", "Leaf", 120.0, "subagent", "O_old", None, None),
+    ]
+    for sid, title, started, source, parent, ended, reason in rows:
+        conn.execute(
+            "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)",
+            (sid, title, "gpt", 2, started, source, parent, ended, reason),
+        )
+    for sid, t in {"W": 95.0, "O_old": 110.0, "O_tip": 160.0, "L": 900.0}.items():
+        conn.execute("INSERT INTO messages (session_id, role, timestamp) VALUES (?,?,?)", (sid, "user", t))
+    conn.commit()
+    conn.close()
+
+
+def test_5305_leaf_of_compressed_subagent_parent_resolves_in_all_profiles_payload(tmp_path):
+    """Re-gate #2: importer-generated all-profiles rows (no lineage enrichment): L names O_old,
+    the payload only has O_tip with _lineage_root_id='O_old' and L has no _parent_lineage_tip_id.
+    L must resolve to O_tip's lineage instead of vanishing; like D(CLI) -> O -> L it orphans
+    next to the orphaned O_tip in the WebUI tab."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    _compressed_subagent_under_cli_db(db)
+    rows = models._load_cli_sessions_uncached(tmp_path, db, None, visible_session_limit=20, include_claude_code=False)
+    by_id = {r["session_id"]: r for r in rows}
+    assert set(by_id) == {"W", "O_tip", "L"}, sorted(by_id)
+    assert by_id["O_tip"]["_lineage_root_id"] == "O_old"
+    assert not by_id["L"].get("_parent_lineage_tip_id"), by_id["L"]
+    for r in rows:
+        r.setdefault("profile", "a")
+    out = _render_tabs(json.dumps(rows, default=str))
+    assert _sids(out["webui"]).count("L") + _sids(out["cli"]).count("L") == 1, out
+    assert {"sid": "O_tip", "orphan": True} in out["webui"], out
+    assert {"sid": "L", "orphan": True} in out["webui"], out
+
+
+def test_5305_subagent_of_orphaned_branch_child_stays_reachable():
+    """Re-gate #3: W in project q, B a (non-subagent) child of W with no project, L a subagent
+    of B, viewing Unassigned. B renders as an orphan; L must not be hidden behind it."""
+    rows = [
+        _web("W", project_id="q"),
+        _web("B", parent_session_id="W", relationship_type="child_session", parent_source="webui"),
+        _sub("L", "B", "webui", updated_at=102),
+    ]
+    out = _render_tabs(json.dumps(rows), project="__no_project__")
+    assert {"sid": "B", "orphan": True} in out["webui"], out
+    assert "L" in _sids(out["webui"]), out

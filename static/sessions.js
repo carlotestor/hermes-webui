@@ -7819,6 +7819,23 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       parentRow._child_session_attention={...childAttention};
     }
   };
+  // Every payload row by id and by compression-lineage root, so a child naming its parent's
+  // pre-compression segment resolves to the row that represents that lineage in this payload.
+  const payloadById=new Map();
+  const payloadByLineageRoot=new Map();
+  const indexPayloadRow=(s)=>{
+    if(!s||!s.session_id) return;
+    if(!payloadById.has(s.session_id)) payloadById.set(s.session_id,s);
+    if(s._lineage_root_id&&!payloadByLineageRoot.has(s._lineage_root_id)) payloadByLineageRoot.set(s._lineage_root_id,s);
+  };
+  if(payloadRowsById instanceof Map) payloadRowsById.forEach(indexPayloadRow);
+  [...(rawSessions||[]),...referenceSessions].forEach(indexPayloadRow);
+  const payloadParentFor=(s)=>{
+    const pid=s&&s.parent_session_id;
+    if(!pid) return null;
+    return payloadById.get(pid)||payloadById.get(s._parent_lineage_tip_id)
+      ||payloadByLineageRoot.get(pid)||payloadByLineageRoot.get(s._parent_lineage_root_id)||null;
+  };
   const visibleBySid=new Map();
   const visibleBySegmentSid=new Map();
   const visibleByLineageKey=new Map();
@@ -7829,7 +7846,7 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     if(seen.has(session.session_id)) return 0;
     seen.add(session.session_id);
     // A child of a compressed parent may name its pre-compression segment; order it by the tip.
-    const parent=session.parent_session_id&&(rawSessionsById.get(session.parent_session_id)||rawSessionsById.get(session._parent_lineage_tip_id));
+    const parent=session.parent_session_id&&payloadParentFor(session);
     let depth=0;
     if(parent&&(_isChildSession(session)||(_isForkWithResolvableParent(session, sessionIdsInList)&&!(session&&session.pinned)))){
       depth=1+attachDepthFor(parent, seen);
@@ -7870,25 +7887,28 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
   for(const candidate of [...(rawSessions||[]),...(referenceSessions||[])]){
     if(candidate&&candidate.session_id&&!attachQueueById.has(candidate.session_id)) attachQueueById.set(candidate.session_id,candidate);
   }
-  const payloadRowFor=(sid)=>(sid&&((payloadRowsById instanceof Map&&payloadRowsById.get(sid))||attachQueueById.get(sid)))||null;
   // Raw sources is_cli_session_row never files as CLI; 'desktop' etc. are ambiguous.
-  const nonCliParentSources=['webui','subagent','cron','webhook','kanban','tool','api','api_server'];
+  const nonCliParentSources=['webui','cron','webhook','kanban','tool','api','api_server'];
   const subagentHostHiddenByScope=(leaf)=>{
     const seen=new Set();
     let cur=leaf;
     while(cur&&!seen.has(cur.session_id)){
       seen.add(cur.session_id);
-      const pid=cur.parent_session_id;
-      // Resolve a compressed parent through its lineage tip/root.
-      const parent=payloadRowFor(pid)||payloadRowFor(cur._parent_lineage_tip_id)||payloadRowFor(cur._parent_lineage_root_id);
+      const parent=payloadParentFor(cur);
       if(!parent){
-        if(typeof cur.parent_is_cli_session==='boolean') return !cur.parent_is_cli_session;
+        // A missing subagent parent is a child row, never a scope-hidden top-level host.
         const ps=String(cur.parent_source||'').trim().toLowerCase();
+        if(ps==='subagent') return false;
+        if(typeof cur.parent_is_cli_session==='boolean') return !cur.parent_is_cli_session;
         return nonCliParentSources.includes(ps)||(typeof _isMessagingSession==='function'&&_isMessagingSession({raw_source: ps}));
       }
       if(_isCliSession(parent)) return false;
       if(cur!==leaf&&(visibleBySid.has(parent.session_id)||visibleBySegmentSid.has(parent.session_id))) return false;
-      if(!_isDelegatedSubagentRow(parent)) return !visibleBySid.has(parent.session_id);
+      if(!_isDelegatedSubagentRow(parent)){
+        // Only a top-level row can be a host hidden by scope; a non-subagent child (branch) never is.
+        if(_isChildSession(parent)) return false;
+        return !visibleBySid.has(parent.session_id);
+      }
       cur=parent;
     }
     return false;
@@ -7907,7 +7927,9 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     const childLineageKey=child&&(child._lineage_root_id||child.lineage_root_id||child.parent_session_id);
     const isHiddenLineageReferenceChild=!!(child&&child.archived&&child.parent_session_id&&childLineageKey&&!child.pinned&&!childRenderable);
     if(!_isChildSession(child)&&!isForkChild&&!isHiddenLineageReferenceChild) continue;
-    const parentSid=child.parent_session_id;
+    const resolvedParent=payloadParentFor(child);
+    const parentSid=resolvedParent&&!visibleBySid.has(child.parent_session_id)&&!visibleBySegmentSid.has(child.parent_session_id)
+      ? resolvedParent.session_id : child.parent_session_id;
     let parentRow=visibleBySid.get(parentSid);
     let parentSegment=null;
     if(!parentRow&&visibleBySegmentSid.has(parentSid)){
