@@ -37,6 +37,8 @@ let _pendingCarryForwardSnapshot = null;
 // Debounced save — prevents hammering the server on every keystroke.
 let _draftSaveTimer = null;
 let _draftSaveTimerSid = null;
+let _draftSaveTimerPayload = null;
+let _draftSaveTimerRev = 0;
 const _DRAFT_SAVE_DELAY_MS = 400;
 const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
 const _composerDraftKnownPayloadSessions = new Set();
@@ -234,6 +236,8 @@ function _saveComposerDraft(sid, text, files) {
     _bumpComposerDraftRevision(sid);
   }
   _draftSaveTimerSid = sid;
+  _draftSaveTimerPayload = _composerDraftPayloadSignature(normalizedText, normalizedFiles);
+  _draftSaveTimerRev = _composerDraftRevision(sid);
   _draftSaveTimer = setTimeout(() => {
     api('/api/session/draft', {
       method: 'POST',
@@ -311,8 +315,10 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
   const hasServerDraftPayload = _composerDraftHasPayload(text, files);
 
   if (restoreSid && hasServerDraftPayload && _isComposerDraftRestoreSuppressed(restoreSid, text, files)) return;
-  // A delivered steer's draft is being compare-and-cleared: show it as empty.
-  if (restoreSid && typeof _steerDraftIsRetiring === 'function' && _steerDraftIsRetiring(restoreSid, text)) return _restoreComposerDraft(null, targetSid, opts);
+  // A delivered steer's exact draft (text and files) is being compare-and-cleared:
+  // show the empty projection. Only a payload can be retiring, so the empty
+  // re-entry never takes this branch again.
+  if (restoreSid && hasServerDraftPayload && typeof _steerDraftIsRetiring === 'function' && _steerDraftIsRetiring(restoreSid, text, files)) return _restoreComposerDraft(null, targetSid, opts);
   if (restoreSid && !hasServerDraftPayload) _clearComposerDraftRestoreSuppression(restoreSid);
 
   // Same-session force refreshes are driven by external state changes and may
@@ -359,8 +365,13 @@ function _clearComposerDraft(sid, text, files) {
 
 // Clear sid's saved draft only if it still equals text/files (server-side
 // compare-and-clear), so a newer draft saved meanwhile is kept.
-function _clearComposerDraftIfUnchanged(sid, text, files) {
+// maxRev: a pending debounced save of this same payload scheduled at or before
+// that draft revision would land after the clear and write it back, so cancel
+// it; a later save (re-typed by the user) or a different payload is newer.
+function _clearComposerDraftIfUnchanged(sid, text, files, maxRev) {
   if (!sid) return Promise.resolve(false);
+  if (_draftSaveTimerSid === sid && _draftSaveTimerRev <= Number(maxRev)
+      && _draftSaveTimerPayload === _composerDraftPayloadSignature(text, files)) clearTimeout(_draftSaveTimer);
   const ifFiles = _composerDraftFilesForPersist(files);
   return api('/api/session/draft', {
     method: 'POST',

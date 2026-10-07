@@ -13,6 +13,8 @@ def _run(scenario):
     helpers = src[src.index('let _steerUploadCache = null;'):src.index('function _steerFilesSignature(')]
     fn = src[src.index('async function _trySteer('):src.index('async function cmdTitle(')]
     pred = src[src.index('function _steerFallbackIsDeadRun('):src.index('function _steerOwnerStreamIsCurrent(')]
+    ses = (ROOT / 'static/sessions.js').read_text(encoding='utf-8')
+    pred += ses[ses.index('function _composerDraftFileSignature('):ses.index('function _composerDraftPayloadSignatureForSid(')]
     harness = r'''
 const assert=require('node:assert/strict');
 const S={session:{session_id:'s',active_stream_id:'run'},activeStreamId:'run',pendingFiles:[]};

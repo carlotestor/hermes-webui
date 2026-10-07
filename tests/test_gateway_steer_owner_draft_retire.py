@@ -60,16 +60,16 @@ async function api(path,opts){
     const next={...cur};if(body.text!==undefined)next.text=body.text;if(body.files!==undefined)next.files=body.files;
     drafts[body.session_id]=next;return {ok:true,draft:next};
   }
-  if(path==='/api/chat/steer'){await steerGate;return {accepted:false,fallback:'gateway_steer_uncertain',stream_id:'runA'};}
+  if(path==='/api/chat/steer'){if(steerReplies.length)return steerReplies.shift();await steerGate;return {accepted:false,fallback:'gateway_steer_uncertain',stream_id:'runA'};}
   throw new Error('unexpected '+path);
 }
-let releaseSteer;const steerGate=new Promise(r=>releaseSteer=r);
+const steerReplies=[];let releaseSteer;const steerGate=new Promise(r=>releaseSteer=r);
 let casGate=Promise.resolve();let _loadingSessionId=null;
 const noop=()=>{};
 const updateQueueBadge=noop,clearLiveToolCards=noop,updateSendBtn=noop,setStatus=noop,setComposerStatus=noop,syncTopbar=noop,renderMessages=noop,
-  _setActiveSessionUrl=noop,_setSessionViewedCount=noop,_steerTextWithPendingFiles=async x=>x,_steerFailureMessageKey=x=>x,_showSteerRecovery=noop,
+  _setActiveSessionUrl=noop,_setSessionViewedCount=noop,_steerTextWithPendingFiles=async(x,_s,f)=>x||(f&&f.length?'[files]':''),_steerFailureMessageKey=x=>x,_showSteerRecovery=noop,
   loadDir=async()=>{},startSessionStream=noop,_applyToAnchor=noop,_chatPayloadModelState=()=>({model:'m',model_provider:'p'});
-const _profileMatchesActiveProfile=()=>true;
+const _profileMatchesActiveProfile=()=>true,_showSteerIndicator=noop,_steerIndicatorText=x=>x;
 function _steerOwnerIsCurrent(sid){return !!(S.session&&S.session.session_id===sid);}
 function queueSessionMessage(sid,p){(queues[sid]=queues[sid]||[]).push(p.text);}
 const activeSid='A';
@@ -243,4 +243,96 @@ _saveComposerDraft('B9','b draft',[]);
 _clearComposerDraft('A','guidance',[]);
 await sleep(450);
 assert.equal(drafts.B9.text,'b draft');
+''')
+
+
+ATT = "const att={name:'a.txt',size:1,type:'text/plain'},newer={name:'new.txt',size:2,type:'text/plain'};"
+
+
+def test_attachment_only_retiring_draft_restores_empty_without_recursion():
+    _run(ATT + r'''
+S.pendingFiles=[att];
+const p=_trySteer('',false);await tick();
+await newSession();releaseSteer();assert.equal(await p,false);
+assert.equal(drafts.A.text,'');assert.equal(drafts.A.files.length,1,'attachment-only owner draft persisted');
+let releaseCas;casGate=new Promise(r=>releaseCas=r);
+emitLeftover('[files]');await tick();
+S.session={session_id:'A',active_stream_id:null,composer_draft:{...drafts.A}};inp.value='x';
+assert.doesNotThrow(()=>_restoreComposerDraft(drafts.A,'A'));
+assert.equal(inp.value,'','retiring attachment-only draft shown empty');
+releaseCas();await tick();await tick();await tick();
+assert.deepEqual(drafts.A,{text:'',files:[]});assert.equal(_steerRetiringBySid.size,0);
+''')
+
+
+def test_same_text_newer_files_draft_is_not_hidden_or_cleared():
+    _run(ATT + r'''
+const p=submitSteer();await tick();
+await newSession();releaseSteer();assert.equal(await p,false);
+assert.equal(drafts.A.text,'guidance');
+let releaseCas;casGate=new Promise(r=>releaseCas=r);
+emitLeftover('guidance');await tick();
+// While compare-and-clear is pending, a newer draft with the same text and a file wins.
+drafts.A={text:'guidance',files:_composerDraftFilesForPersist([newer])};
+S.session={session_id:'A',active_stream_id:null,composer_draft:{...drafts.A}};S.pendingFiles=[newer];
+_restoreComposerDraft(drafts.A,'A');
+assert.equal(inp.value,'guidance','newer same-text draft with other files restored while retiring');
+releaseCas();await tick();await tick();await tick();
+assert.equal(drafts.A.text,'guidance');assert.equal(drafts.A.files.length,1,'server kept newer draft');
+assert.equal(inp.value,'guidance','settlement left the newer visible draft');assert.deepEqual(S.pendingFiles,[newer]);
+_restoreComposerDraft(drafts.A,'A');assert.equal(inp.value,'guidance','still restorable after settle');
+''')
+
+
+def test_same_text_retyped_on_owner_after_retire_starts_survives():
+    _run(r'''
+const p=submitSteer();releaseSteer();assert.equal(await p,false);
+assert.equal(inp.value,'guidance');
+let releaseCas;casGate=new Promise(r=>releaseCas=r);
+emitLeftover('guidance');await tick();
+assert.equal(inp.value,'','owned visible draft retired');
+inp.value='guidance';_saveComposerDraft('A',inp.value,[]);   // user deliberately re-types it
+_restoreComposerDraft({text:'guidance',files:[]},'A');
+assert.equal(inp.value,'guidance','re-typed draft is newer, not retiring');
+releaseCas();await tick();await tick();await tick();
+assert.equal(inp.value,'guidance','settlement does not clear the re-typed draft');
+await sleep(450);assert.equal(drafts.A.text,'guidance','re-typed debounced save still lands');
+''')
+
+
+def test_debounced_save_of_retired_text_does_not_write_it_back():
+    _run(r'''
+const p=submitSteer();releaseSteer();assert.equal(await p,false);
+assert.equal(inp.value,'guidance');
+_saveComposerDraft('A',inp.value,[]);   // debounced save of the restored text, not yet sent
+emitLeftover('guidance');await tick();await tick();await tick();
+assert.equal(drafts.A&&drafts.A.text||'','');
+await sleep(450);
+assert.equal(drafts.A&&drafts.A.text||'','','pending save did not resurrect retired guidance');
+await returnToA();assert.equal(inp.value,'');
+''')
+
+
+def test_interior_line_of_accepted_multiline_steer_keeps_uncertain_recovery():
+    _run(r'''
+steerReplies.push({accepted:true,fallback:null,stream_id:'runA'});
+inp.value='';assert.equal(await _trySteer('accepted intro\nguidance\naccepted outro',false),true);
+const p=submitSteer();releaseSteer();assert.equal(await p,false);
+assert.equal(inp.value,'guidance');
+emitLeftover('accepted intro\nguidance\naccepted outro');await tick();await tick();
+assert.equal(inp.value,'guidance','recovery draft kept: leftover only proves the accepted steer');
+assert.equal(_steerUncertainBySid.size,1);
+''')
+
+
+def test_uncertain_multiline_steer_not_matched_by_two_separate_accepted_steers():
+    _run(r'''
+steerReplies.push({accepted:true,fallback:null,stream_id:'runA'},{accepted:true,fallback:null,stream_id:'runA'});
+assert.equal(await _trySteer('alpha',false),true);assert.equal(await _trySteer('beta',false),true);
+inp.value='';const p=_trySteer('alpha\nbeta',false);releaseSteer();assert.equal(await p,false);
+emitLeftover('alpha\nbeta');await tick();await tick();
+assert.equal(inp.value,'alpha\nbeta','separate accepted steers are not proof for the uncertain one');
+// Positive control: the uncertain steer joined after the accepted ones still reconciles.
+emitLeftover('alpha\nbeta\nalpha\nbeta');await tick();await tick();
+assert.equal(inp.value,'');assert.equal(_steerUncertainBySid.size,0);
 ''')

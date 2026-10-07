@@ -5,6 +5,7 @@ import http.client
 import json
 import logging
 import os
+import socket
 import threading
 import time
 import uuid
@@ -963,15 +964,17 @@ GATEWAY_STEER_ACCEPTED = "accepted"
 GATEWAY_STEER_REFUSED = "refused"
 GATEWAY_STEER_UNCERTAIN = "uncertain"
 GATEWAY_STEER_TIMEOUT_SECS = 10
+# Failures that prove no connection existed, so no request byte reached the Gateway.
+_GATEWAY_NOT_CONNECTED_ERRORS = (ConnectionRefusedError, socket.gaierror)
 
 
 def steer_gateway_run(run_id: str, text: str) -> str:
     """Forward steer text to the Gateway run.
 
     ``accepted``: 2xx with ``accepted: true``. ``refused``: the Gateway answered
-    otherwise, or the request never fully left (urllib wraps connect/send errors
-    in URLError), so a re-queue cannot double-deliver. ``uncertain``: the request
-    was sent but the answer was lost (timeout, reset, unreadable 2xx body); the
+    otherwise, or no connection was ever made (refused, DNS, unreachable), so a
+    re-queue cannot double-deliver. ``uncertain``: anything else — urllib wraps
+    send-phase errors (reset/timeout while writing) in the same URLError, and the
     Gateway may already hold the text.
     """
     run_id = str(run_id or "").strip()
@@ -1003,9 +1006,15 @@ def steer_gateway_run(run_id: str, text: str) -> str:
             payload = json.loads(response.read() or b"{}")
             accepted = isinstance(payload, dict) and payload.get("accepted") is True
             return GATEWAY_STEER_ACCEPTED if accepted else GATEWAY_STEER_REFUSED
-    except urllib.error.URLError:  # includes HTTPError: answered, or never sent
-        logger.debug("Gateway steer refused or not sent for run %s", run_id, exc_info=True)
+    except urllib.error.HTTPError:  # the Gateway answered with a non-2xx status
+        logger.debug("Gateway steer refused for run %s", run_id, exc_info=True)
         return GATEWAY_STEER_REFUSED
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, _GATEWAY_NOT_CONNECTED_ERRORS):
+            logger.debug("Gateway steer not sent for run %s", run_id, exc_info=True)
+            return GATEWAY_STEER_REFUSED
+        logger.debug("Gateway steer outcome unknown for run %s", run_id, exc_info=True)
+        return GATEWAY_STEER_UNCERTAIN
     except (OSError, ValueError, http.client.HTTPException):
         logger.debug("Gateway steer outcome unknown for run %s", run_id, exc_info=True)
         return GATEWAY_STEER_UNCERTAIN

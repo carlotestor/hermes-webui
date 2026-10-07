@@ -116,6 +116,32 @@ def test_connect_failure_before_sending_keeps_the_queue_fallback(gateway, monkey
     assert steer() == {"accepted": False, "fallback": "gateway_steer_queued", "stream_id": "run"}
 
 
+@pytest.mark.parametrize("exc", [ConnectionResetError(104, "reset"), TimeoutError("timed out")])
+def test_send_phase_failure_wrapped_in_urlerror_is_uncertain(gateway, monkeypatch, exc):
+    """urllib wraps errors raised while WRITING the request in URLError; the Gateway may
+    already have the steer, so it must not be re-queued as a new turn."""
+    import http.client
+
+    real_request = http.client.HTTPConnection.request
+
+    def request_then_fail(self, *a, **kw):
+        real_request(self, *a, **kw)  # the full POST reaches the Gateway ...
+        raise exc  # ... then the socket fails before the reply is read
+
+    monkeypatch.setattr(http.client.HTTPConnection, "request", request_then_fail)
+    assert steer() == {"accepted": False, "fallback": "gateway_steer_uncertain", "stream_id": "run"}
+    import time
+    deadline = time.monotonic() + 5
+    while not gateway.calls and time.monotonic() < deadline:  # stub thread records asynchronously
+        time.sleep(0.01)
+    assert gateway.calls[0][1] == {"input": "go left"}
+
+
+def test_dns_failure_keeps_the_queue_fallback(gateway, monkeypatch):
+    monkeypatch.setattr(gateway_chat, "gateway_run_endpoint", lambda run_id: ("http://no-such-host.invalid", ""))
+    assert steer() == {"accepted": False, "fallback": "gateway_steer_queued", "stream_id": "run"}
+
+
 def test_uncertain_steer_keeps_the_draft_in_the_browser():
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent
@@ -155,3 +181,22 @@ def test_reattach_status_replays_unconsumed_gateway_steer(monkeypatch, state):
         gateway_chat._STREAM_RUN_IDS.pop("rs", None)
         gateway_chat._STREAM_RUN_LIFECYCLE.pop("rs", None)
     assert events[0] == ("pending_steer_leftover", {"session_id": "sid", "text": "go left"})
+
+
+def test_uncertain_steer_warning_is_translated_in_every_non_english_locale():
+    import re
+    from pathlib import Path
+    src = (Path(__file__).parents[1] / "static" / "i18n.js").read_text(encoding="utf-8")
+    english = "Steer may have reached the agent (no reply from Gateway); your text is kept in the composer"
+    locales = {}
+    current = None
+    for line in src.splitlines():
+        m = re.match(r"^  '?([A-Za-z-]+)'?: \{", line)
+        if m:
+            current = m.group(1)
+        m = re.match(r"^\s+steer_fail_gateway_steer_uncertain: '(.*)',$", line)
+        if m:
+            locales[current] = m.group(1)
+    assert locales.pop("en") == english
+    assert len(locales) >= 14
+    assert {k: v for k, v in locales.items() if v == english} == {}
