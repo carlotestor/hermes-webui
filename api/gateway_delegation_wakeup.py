@@ -11,14 +11,15 @@ parent agent only sees the result when the user next types.
 
 This poller leases those rows with the Agent's reservation API
 (``SessionDB.reserve_caller_history_deliveries``), copies each result once into
-the session's model-facing ``context_messages`` (keyed by row id, so a retry
-never duplicates it), and starts a wakeup turn whose prompt is a FIXED nudge:
-the stored copy is the only one the model sees (the legacy Gateway path reads
-the state.db row instead; the runs-API fold skips content the caller already
-carries). Rows are committed only once the wake turn is persisted, and released
-otherwise; a WebUI crash in between just lets the lease expire and the next
-poll retries. Without reserve+commit the poller stays inert: the old final
-claim could lose a result, so there is no fallback to it.
+the session's model-facing ``context_messages`` (keyed by row id, tagged
+``_source: process_wakeup`` so the transcript shows it as a wakeup notice, not a
+user turn), and starts a wakeup turn whose prompt is a FIXED nudge. The lease is
+recorded on the sidecar (``delegation_reservation``) and settled by the Gateway
+worker: committed once the Gateway accepts the run (runs API: run id admitted;
+legacy transport: response opened), released if the turn ends before that. A
+restart before settlement reattaches the run and settles it, or the lease
+expires and the next poll retries. Refused wakes back off per session.
+Without reserve+commit the poller stays inert.
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 5.0
+BACKOFF_MAX_S = 300.0
 RESERVATION_OWNER = "hermes-webui"
 RESERVATION_TTL_S = 120.0
 WAKE_PROMPT = ("[IMPORTANT: A delegated subagent finished. Its result is already in your "
@@ -42,6 +44,7 @@ MAX_ROW_AGE_S = 6 * 3600
 _THREAD: threading.Thread | None = None
 _STOP = threading.Event()
 _LOCK = threading.Lock()
+_BACKOFF: dict[tuple[str, str], tuple[int, float]] = {}  # (db, state sid) -> (failures, retry at)
 
 _PENDING_SQL = (
     "SELECT DISTINCT session_id FROM messages WHERE role = 'user'"
@@ -135,8 +138,8 @@ def _start_wakeup(webui_sid: str) -> bool:
     return status < 400 and bool(resp.get("stream_id"))
 
 
-def _store_results_in_context(webui_sid: str, rows: list[dict]) -> None:
-    """Append each reserved result once to the sidecar's model-facing context; raises on failure."""
+def _store_results_in_context(webui_sid: str, rows: list[dict], reservation: dict) -> None:
+    """Append each reserved result once to the model-facing context and record the lease; raises on failure."""
     from api.config import _get_session_agent_lock
     from api.models import get_session
     from api.routes import _ensure_full_session_before_mutation
@@ -148,36 +151,81 @@ def _store_results_in_context(webui_sid: str, rows: list[dict]) -> None:
             context = [m for m in (getattr(s, "messages", None) or []) if isinstance(m, dict)
                        and m.get("role") in ("user", "assistant") and not m.get("_error")]
         have = {m.get("_delegation_delivery_id") for m in context if isinstance(m, dict)}
-        added = [{"role": "user", "content": r["content"], "_delegation_delivery_id": r["id"],
-                  "timestamp": time.time()} for r in rows if r["id"] not in have]
-        if added:
-            s.context_messages = context + added
+        added = [{"role": "user", "content": r["content"], "_source": "process_wakeup",
+                  "_delegation_delivery_id": r["id"], "timestamp": time.time()}
+                 for r in rows if r["id"] not in have]
+        s.context_messages = context + added
+        s.delegation_reservation = reservation
+        s.save(touch_updated_at=False)
+
+
+def settle_reservation(webui_sid: str, accepted: bool) -> None:
+    """Commit (Gateway accepted the wake run) or release the session's recorded lease. Never raises."""
+    from api.config import _get_session_agent_lock
+    from api.models import get_session
+
+    try:
+        with _get_session_agent_lock(webui_sid):
+            s = get_session(webui_sid)
+            res = getattr(s, "delegation_reservation", None)
+            if not isinstance(res, dict):
+                return
+            s.delegation_reservation = None
             s.save(touch_updated_at=False)
+        db = _session_db_cls()(Path(res["db"]))
+        try:
+            if accepted:
+                db.commit_caller_history_deliveries(res["token"], res["owner"])
+            else:
+                db.release_caller_history_deliveries(reservation_token=res["token"], owner=res["owner"])
+        finally:
+            db.close()
+    except Exception:
+        logger.warning("gateway delegation reservation settle failed for %s", webui_sid, exc_info=True)
+
+
+def _profile_uses_gateway(profile: str) -> bool:
+    from api.config import get_config_for_profile_home
+    from api.gateway_chat import webui_gateway_chat_enabled
+    from api.profiles import get_hermes_home_for_profile
+
+    return webui_gateway_chat_enabled(get_config_for_profile_home(get_hermes_home_for_profile(profile)))
 
 
 def _claim_and_wake(db_path: Path, state_sid: str, webui_sid: str) -> int:
-    """Reserve the session's pending rows, store them once, wake with a fixed prompt, then commit."""
+    """Reserve the session's pending rows, store them once, and wake with a fixed prompt.
+
+    The Gateway worker commits the lease once the run is accepted (``settle_reservation``).
+    """
     from api.background_process import _session_has_active_turn
 
-    if _session_has_active_turn(webui_sid):
-        return 0  # rows stay pending: the running turn's successor folds them, or the next poll
+    key = (str(db_path), state_sid)
+    if _BACKOFF.get(key, (0, 0.0))[1] > time.time() or _session_has_active_turn(webui_sid):
+        return 0  # rows stay pending: the running turn's successor folds them, or a later poll
     db = _session_db_cls()(db_path)
     try:
-        rows = db.reserve_caller_history_deliveries(state_sid, RESERVATION_OWNER, RESERVATION_TTL_S)
-        rows = [r for r in rows if isinstance(r.get("content"), str) and r["content"].strip()]
+        reserved = db.reserve_caller_history_deliveries(state_sid, RESERVATION_OWNER, RESERVATION_TTL_S)
+        rows = [r for r in reserved if isinstance(r.get("content"), str) and r["content"].strip()]
+        blank = [r["id"] for r in reserved if r not in rows]
+        if blank:  # nothing to deliver: settle them as the Gateway fold would
+            db.commit_caller_history_deliveries(blank, RESERVATION_OWNER)
         if not rows:
             return 0
         token = rows[0]["reservation_token"]
         try:
-            _store_results_in_context(webui_sid, rows)
+            _store_results_in_context(webui_sid, rows, {"db": str(db_path), "token": token,
+                                                        "owner": RESERVATION_OWNER})
             woke = _start_wakeup(webui_sid)
         except Exception:
             logger.warning("gateway delegation wakeup failed for %s", webui_sid, exc_info=True)
             woke = False
         if woke:
-            db.commit_caller_history_deliveries(token, RESERVATION_OWNER)
+            _BACKOFF.pop(key, None)
             return 1
+        settle_reservation(webui_sid, accepted=False)
         db.release_caller_history_deliveries(reservation_token=token, owner=RESERVATION_OWNER)
+        fails = _BACKOFF.get(key, (0, 0.0))[0] + 1
+        _BACKOFF[key] = (fails, time.time() + min(BACKOFF_MAX_S, POLL_INTERVAL_S * 2 ** fails))
         return 0
     finally:
         db.close()
@@ -194,7 +242,7 @@ def poll_once(since: float) -> int:
         for sid in session_ids:
             try:
                 webui_sid = _webui_session_id(db_path, sid, profile)
-                if webui_sid:
+                if webui_sid and _profile_uses_gateway(profile):
                     woken += _claim_and_wake(db_path, sid, webui_sid)
             except Exception:
                 logger.warning("gateway delegation wakeup raised for %s", sid, exc_info=True)
@@ -208,14 +256,9 @@ def _loop() -> None:
 
 
 def start_gateway_delegation_poller() -> bool:
-    """Start the poller when chat runs on the Gateway backend. Never raises."""
+    """Start the poller (any profile may chat through the Gateway; checked per row). Never raises."""
     global _THREAD
     try:
-        from api.config import get_config
-        from api.gateway_chat import webui_gateway_chat_enabled
-
-        if not webui_gateway_chat_enabled(get_config()):
-            return False
         if not _claim_api_available():
             logger.info("gateway delegation poller inactive: installed Hermes Agent lacks the delivery reserve/commit API")
             return False

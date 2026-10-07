@@ -1,8 +1,8 @@
 """Gateway-backend async-delegation completions must wake the WebUI session.
 
 The Gateway persists them as delivery rows in the profile state.db and starts
-no turn; the WebUI poller reserves them, wakes with a fixed prompt, and commits
-only once the wake turn is persisted. A fake SessionDB implements the Agent's
+no turn; the WebUI poller reserves them and wakes with a fixed prompt; the
+Gateway worker commits the lease only once the Gateway accepts the run. A fake SessionDB implements the Agent's
 reserve/commit/release contract (hermes-agent#125451).
 """
 import json
@@ -48,10 +48,13 @@ class FakeDB:
             out.append({"id": r["id"], "content": r["content"], "reservation_token": token})
         return out
 
-    def _held(self, token, owner):
-        return [r for r in self.rows.values() if not r["consumed"] and r["lease"]
-                and r["lease"]["token"] == token and r["lease"]["owner"] == owner
-                and r["lease"]["until"] > self.clock[0]]
+    def _held(self, token_or_ids, owner):
+        # A token settles its own lease even after expiry (a re-reserve replaces the token); ids need a live lease.
+        if isinstance(token_or_ids, str):
+            return [r for r in self.rows.values() if not r["consumed"] and r["lease"]
+                    and r["lease"]["token"] == token_or_ids and r["lease"]["owner"] == owner]
+        return [r for r in self.rows.values() if not r["consumed"] and r["lease"] and r["id"] in token_or_ids
+                and r["lease"]["owner"] == owner and r["lease"]["until"] > self.clock[0]]
 
     def commit_caller_history_deliveries(self, token, owner):
         held = self._held(token, owner)
@@ -97,6 +100,8 @@ def env(tmp_path, monkeypatch):
                         lambda _p, sid, prof: sid if (sessions / f"{sid}.json").is_file()
                         and gdw._sidecar_profile_matches(sessions / f"{sid}.json", prof) else None)
     monkeypatch.setattr(gdw, "_profile_state_dbs", lambda: [("default", db_path)])
+    monkeypatch.setattr(gdw, "_profile_uses_gateway", lambda _p: True)
+    gdw._BACKOFF.clear()
     monkeypatch.setattr(bp, "_session_has_active_turn", lambda _sid: False)
     calls = []
     status = {"v": 200}
@@ -105,6 +110,8 @@ def env(tmp_path, monkeypatch):
         # Records whether any row was committed before the wake turn was persisted.
         calls.append({"sid": sid, "prompt": prompt, "source": source,
                       "committed_before": any(r["consumed"] for r in FakeDB.rows.values())})
+        if status["v"] < 400 and status.get("accept", True):
+            gdw.settle_reservation(sid, accepted=True)  # what the Gateway worker does on acceptance
         return {"_status": status["v"], "stream_id": "s" if status["v"] < 400 else None}
 
     monkeypatch.setattr("api.routes.start_session_turn", fake_start)
@@ -136,6 +143,71 @@ def test_commit_only_after_wake_turn_persisted(env):
     assert gdw.poll_once(0) == 1
     assert calls[0]["committed_before"] is False
     assert FakeDB.rows[1]["consumed"] is True
+    assert Session.load("sid1").delegation_reservation is None
+
+
+def test_launched_but_unaccepted_wake_keeps_lease_until_worker_settles(env):
+    """start_session_turn returning a stream only means the local worker launched."""
+    calls, status = env
+    status["accept"] = False
+    FakeDB.add("sid1", "deleg_h")
+    assert gdw.poll_once(0) == 1
+    assert FakeDB.rows[1]["consumed"] is False and FakeDB.rows[1]["lease"] is not None
+    assert Session.load("sid1").delegation_reservation["owner"] == gdw.RESERVATION_OWNER
+    gdw.settle_reservation("sid1", accepted=False)  # the worker's teardown: Gateway never accepted
+    assert FakeDB.rows[1]["consumed"] is False and FakeDB.rows[1]["lease"] is None
+    status["accept"] = True
+    gdw._BACKOFF.clear()
+    assert gdw.poll_once(0) == 1 and FakeDB.rows[1]["consumed"] is True
+
+
+def test_stored_result_is_tagged_as_a_wakeup_notice(env):
+    FakeDB.add("sid1", "deleg_t")
+    gdw.poll_once(0)
+    stored = [m for m in _context() if m.get("_delegation_delivery_id")]
+    assert stored and stored[0]["_source"] == "process_wakeup"
+
+
+def test_refused_wake_backs_off(env, monkeypatch):
+    calls, status = env
+    status["v"] = 409
+    FakeDB.add("sid1", "deleg_k")
+    clock = [5000.0]
+    monkeypatch.setattr(gdw.time, "time", lambda: clock[0])
+    assert gdw.poll_once(0) == 0 and len(calls) == 1
+    assert gdw.poll_once(0) == 0 and len(calls) == 1  # backing off: no re-reserve, no re-wake
+    clock[0] += gdw.POLL_INTERVAL_S * 2 + 1
+    assert gdw.poll_once(0) == 0 and len(calls) == 2
+    status["v"] = 200
+    clock[0] += gdw.BACKOFF_MAX_S + 1
+    assert gdw.poll_once(0) == 1 and FakeDB.rows[1]["consumed"] is True
+
+
+def test_blank_delivery_is_not_left_reserved(env):
+    calls, _ = env
+    rid = FakeDB.add("sid1", "deleg_blank")
+    FakeDB.rows[rid]["content"] = "   "
+    assert gdw.poll_once(0) == 0 and calls == []
+    assert FakeDB.rows[rid]["lease"] is None and FakeDB.rows[rid]["consumed"] is True
+
+
+def test_profile_without_gateway_backend_is_skipped(env, monkeypatch):
+    calls, _ = env
+    monkeypatch.setattr(gdw, "_profile_uses_gateway", lambda p: p == "work")
+    FakeDB.add("sid1", "deleg_p")
+    assert gdw.poll_once(0) == 0 and calls == [] and FakeDB.rows[1]["lease"] is None
+
+
+def test_poller_starts_when_only_a_named_profile_uses_the_gateway(monkeypatch):
+    monkeypatch.setattr("api.gateway_chat.webui_gateway_chat_enabled", lambda *_a, **_k: False)
+    monkeypatch.setattr(gdw, "_session_db_cls", lambda: FakeDB)
+    for name in gdw._REQUIRED_API:
+        assert callable(getattr(FakeDB, name))
+    monkeypatch.setattr(gdw, "_loop", lambda: gdw._STOP.wait(5))
+    try:
+        assert gdw.start_gateway_delegation_poller() is True
+    finally:
+        gdw.stop_gateway_delegation_poller()
 
 
 @pytest.mark.parametrize("failure", ["409", "500", "raise"])
@@ -150,8 +222,11 @@ def test_failed_wake_releases_reservation(env, monkeypatch, failure):
         status["v"] = int(failure)
     assert gdw.poll_once(0) == 0
     assert FakeDB.rows[1]["consumed"] is False and FakeDB.rows[1]["lease"] is None
-    # Released rows are retried, and the stored copy is not duplicated.
-    monkeypatch.setattr("api.routes.start_session_turn", lambda *_a, **_k: {"_status": 200, "stream_id": "s"})
+    assert Session.load("sid1").delegation_reservation is None
+    # Released rows are retried (after the back-off), and the stored copy is not duplicated.
+    monkeypatch.setattr("api.routes.start_session_turn",
+                        lambda sid, *_a, **_k: gdw.settle_reservation(sid, True) or {"_status": 200, "stream_id": "s"})
+    gdw._BACKOFF.clear()
     assert gdw.poll_once(0) == 1
     assert FakeDB.rows[1]["consumed"] is True
     assert sum("deleg_c" in str(m.get("content")) for m in _context()) == 1
@@ -243,3 +318,64 @@ def test_real_agent_session_db_round_trip(env, tmp_path, monkeypatch):
     finally:
         db.close()
 
+
+
+@pytest.mark.parametrize("gateway_up", [True, False])
+def test_gateway_worker_settles_lease_on_profile_gateway(env, tmp_path, monkeypatch, gateway_up):
+    """The real worker commits only once the session profile's Gateway answers, else releases."""
+    import io
+    import urllib.error
+
+    import api.gateway_chat as gateway_chat
+    import api.streaming as streaming
+    from api import profiles
+    from api.config import STREAMS, create_stream_channel
+
+    root = tmp_path / "hermes"
+    for name, home in (("default", root), ("work", root / "profiles" / "work")):
+        home.mkdir(parents=True, exist_ok=True)
+        (home / ".env").write_text(f"HERMES_WEBUI_GATEWAY_BASE_URL=http://{name}-gateway:8642\n"
+                                   f"HERMES_WEBUI_GATEWAY_API_KEY={name}-key\n")
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", root)
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", set())
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://default-gateway:8642")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_API_KEY", "default-key")
+    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_USE_RUNS_API", raising=False)
+    monkeypatch.setattr(gateway_chat, "_gateway_reasoning_effort_for_request", lambda *a, **k: None)
+    monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {
+        "status": "not_configured", "source": "none", "label": "", "message_count": 0, "messages": []})
+    monkeypatch.setattr(streaming, "_prefill_messages_with_webui_context", lambda ctx, cfg: [])
+    seen = []
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        if req.full_url.endswith("/v1/capabilities"):
+            raise urllib.error.URLError("no runs api")
+        seen.append((req.full_url, req.get_header("Authorization"), FakeDB.rows[1]["consumed"]))
+        if not gateway_up:
+            raise urllib.error.URLError("connection refused")
+        return Resp(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n')
+
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
+    s = Session.load("sid1")
+    s.profile = "work"
+    s.active_stream_id, s.pending_user_message, s.pending_user_source = "st1", gdw.WAKE_PROMPT, "process_wakeup"
+    s.pending_attachments, s.pending_started_at = [], 1.0
+    s.save()
+    FakeDB.add("sid1", "deleg_w")
+    token = FakeDB().reserve_caller_history_deliveries("sid1", gdw.RESERVATION_OWNER, 60)[0]["reservation_token"]
+    gdw._store_results_in_context("sid1", [{"id": 1, "content": "r"}],
+                                  {"db": "x", "token": token, "owner": gdw.RESERVATION_OWNER})
+    STREAMS["st1"] = create_stream_channel()
+    gateway_chat._run_gateway_chat_streaming("sid1", gdw.WAKE_PROMPT, "m", str(tmp_path), "st1", [])
+
+    assert [(u, a) for u, a, _ in seen] == [("http://work-gateway:8642/v1/chat/completions", "Bearer work-key")]
+    assert seen[0][2] is False  # not committed before the Gateway answered
+    assert FakeDB.rows[1]["consumed"] is gateway_up
+    assert (FakeDB.rows[1]["lease"] is None) and Session.load("sid1").delegation_reservation is None
