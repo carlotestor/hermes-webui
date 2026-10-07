@@ -87,17 +87,20 @@ def _turn_running(turn):
         return bool(stream_id) and (live or stream_id in config.ACTIVE_RUNS)
 
 
-def retag_session_profile(session, profile):
-    """Move an empty session to `profile`, clearing the loop it left in its old profile."""
+def retag_session_profile(session, profile, retag):
+    """Run `retag(session, profile)` under the loop lock; a real move clears the loop left in the old profile."""
     with _session_lock(session.session_id):
         old = getattr(session, "profile", None)
-        session.profile = profile
+        session_profile, result = retag(session, profile)
+        if result != "retagged":
+            return session_profile, result
         try:
             from hermes_cli.loops import LoopManager
         except ImportError:  # no agent installed: no loop store, nothing to clear
-            return
+            return session_profile, result
         with _home(old):
             LoopManager(session_id=session.session_id).clear()
+        return session_profile, result
 
 
 def run_loop_command(session_id, args, request_profile=None):

@@ -56,14 +56,26 @@ def test_retag_between_load_and_launch_never_runs_other_profile(tmp_path, monkey
 def test_retag_helper_clears_old_profile_loop(tmp_path, monkeypatch):
     session = NS(session_id="s1", profile=None, messages=[])
     agent, loops, started = _setup(tmp_path, monkeypatch, session)
-    loops.retag_session_profile(session, "b")
+    from api.routes import _retag_empty_session_profile
+    assert loops.retag_session_profile(session, "b", _retag_empty_session_profile) == ("b", "retagged")
     assert session.profile == "b"
     with loops._home(None):
         assert agent.load_loop("s1").status == "cleared"
     from pathlib import Path
     src = (Path(__file__).resolve().parents[1] / "api" / "routes.py").read_text(encoding="utf-8")
-    assert src.count("retag_session_profile(s, requested_profile)") == 2
-    assert "s.profile = requested_profile" not in src
+    assert src.count("retag_session_profile(\n") == 2
+    assert src.count("s, requested_profile, _retag_empty_session_profile") == 2
+
+
+@requires_agent_modules
+def test_refused_retag_keeps_old_profile_loop(tmp_path, monkeypatch):
+    session = NS(session_id="s1", profile=None, messages=[], pinned=True)
+    agent, loops, started = _setup(tmp_path, monkeypatch, session)
+    from api.routes import _retag_empty_session_profile
+    assert loops.retag_session_profile(session, "b", _retag_empty_session_profile) == (None, "pinned_empty")
+    assert session.profile is None
+    with loops._home(None):
+        assert agent.load_loop("s1").status == "active"
 
 
 @requires_agent_modules
@@ -138,7 +150,12 @@ def test_retag_without_agent_modules_still_retags(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", no_agent)
     s = SimpleNamespace(session_id="s1", profile=None)
-    loops.retag_session_profile(s, "b")
+
+    def retag(sess, profile):
+        sess.profile = profile
+        return profile, "retagged"
+
+    loops.retag_session_profile(s, "b", retag)
     assert s.profile == "b"
 
 
@@ -147,7 +164,7 @@ def test_loop_command_rechecks_profile_under_retag_lock(tmp_path, monkeypatch):
     session = NS(session_id="s1", profile=None, messages=[])
     agent, loops, started = _setup(tmp_path, monkeypatch, session)
     loops.run_loop_command("s1", "stop")
-    loops.retag_session_profile(session, "b")  # lands after the route's ownership check, before the command
+    loops.retag_session_profile(session, "b", lambda s, p: (setattr(s, "profile", p), (p, "retagged"))[1])  # lands after the route's ownership check, before the command
     out = loops.run_loop_command("s1", "5m check", request_profile="default")
     assert "another profile" in out
     with loops._home("b"):
@@ -223,7 +240,7 @@ def test_stop_on_wakeup_via_real_cancel_pauses_loop(tmp_path, monkeypatch):
     loops.run_due_loops()
     assert streaming.cancel_stream("stream1")
     user = [m for m in session.messages if m.get("role") == "user"][-1]
-    assert user["timestamp"] == 1000  # the recovered row keeps the turn token
+    assert user["timestamp"] == 1000.75  # exact pending time and the turn token
     assert user["_active_turn_token"] == build_active_turn_token("stream1", 1000.75)
     config.ACTIVE_RUNS.pop("stream1", None)
     loops.run_due_loops()
@@ -264,7 +281,7 @@ def test_stop_on_fork_wakeup_pauses_loop_after_reload(tmp_path, monkeypatch):
     config.ACTIVE_RUNS.pop("stream1", None)
     holder["s"] = Session.load("s1")  # judge the durably settled transcript
     user = [m for m in holder["s"].messages if m.get("role") == "user"][-1]
-    assert user["_source"] == "fork" and user["timestamp"] == 1000
+    assert user["_source"] == "fork" and user["timestamp"] == 1000.75
     loops.run_due_loops()
     with loops._home(None):
         s = agent.load_loop("s1")
@@ -322,3 +339,4 @@ def test_stop_when_worker_settles_first_pauses_loop_after_reload(tmp_path, monke
         _due(agent)
     loops.run_due_loops()
     assert len(started) == 1
+
