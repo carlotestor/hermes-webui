@@ -433,10 +433,8 @@ def _gateway_http_error_event(
     safe = _redact_text(err_body or str(exc))[:500]
     if route_hint:
         return {
-            "label": "Gateway authentication failed" if exc.code == 401 else "Gateway request failed",
-            "type": "gateway_auth_error" if exc.code == 401 else "gateway_http_error",
+            **_gateway_route_error_classification(exc.code, route_hint),
             "message": f"Gateway returned HTTP {exc.code} for this profile.",
-            "hint": route_hint,
         }
     if exc.code == 401:
         return {
@@ -1229,11 +1227,28 @@ def _gateway_profile_route_hint(base_url: str, code, keyless_profile: bool = Fal
         )
     if code not in (401, 404) or not re.search(r"/p/[^/]+$", str(base_url or "")):
         return ""
+    if code == 401:
+        # The Gateway serves /p/<profile> but rejected the key: multiplexing is already on.
+        return (
+            "The shared Gateway serves this profile under /p/<profile> but rejected the key: set API_SERVER_KEY "
+            "in the profile's .env to the key that profile's Gateway uses, or set HERMES_WEBUI_GATEWAY_BASE_URL "
+            "in the profile's .env to a Gateway that serves this profile."
+        )
     return (
         "This profile's turn went to the shared Gateway under /p/<profile>. Enable gateway.multiplex_profiles "
         "on the Gateway (and set API_SERVER_KEY in the profile's .env), or set HERMES_WEBUI_GATEWAY_BASE_URL "
         "in the profile's .env to a Gateway that serves this profile."
     )
+
+
+def _gateway_route_error_classification(code, route_hint: str) -> dict:
+    """A Gateway routing refusal is not a provider/model error: classify it as the Gateway's."""
+    auth = code == 401
+    return {
+        "type": "gateway_auth_error" if auth else "gateway_http_error",
+        "label": "Gateway authentication failed" if auth else "Gateway request failed",
+        "hint": route_hint,
+    }
 
 
 def _resume_gateway_run_for_session(session) -> bool:
@@ -1279,6 +1294,7 @@ def _settle_gateway_terminal_error(
     *,
     persisted_model=None,
     persisted_model_provider=None,
+    route_classification=None,
 ):
     from api.streaming import (
         _classify_provider_error,
@@ -1293,7 +1309,7 @@ def _settle_gateway_terminal_error(
         session = get_session(session_id)
         if not _stream_writeback_is_current(session, stream_id):
             return None
-        error_classification = _classify_provider_error(terminal_error)
+        error_classification = route_classification or _classify_provider_error(terminal_error)
         error_payload = _provider_error_payload(
             terminal_error,
             error_classification["type"],
@@ -1613,9 +1629,10 @@ def _run_gateway_chat_streaming(
                     workspace,
                     model,
                     model_provider,
-                    f"{exc} {hint}".strip() if hint else str(exc),
+                    str(exc),
                     persisted_model=persisted_model,
                     persisted_model_provider=persisted_model_provider,
+                    route_classification=_gateway_route_error_classification(code, hint) if hint else None,
                 )
                 if error_payload is None:
                     return

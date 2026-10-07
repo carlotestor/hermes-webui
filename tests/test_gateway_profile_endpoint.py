@@ -241,7 +241,7 @@ def test_named_profile_refusal_names_the_routing_fix(code):
         route_hint=gateway_chat._gateway_profile_route_hint(f"{SHARED}/p/work", code),
     )
 
-    assert "gateway.multiplex_profiles" in event["hint"]
+    assert ("API_SERVER_KEY" if code == 401 else "gateway.multiplex_profiles") in event["hint"]
     assert "HERMES_WEBUI_GATEWAY_BASE_URL" in event["hint"] and "profile's .env" in event["hint"]
     assert gateway_chat._gateway_profile_route_hint(SHARED, code) == ""
     assert gateway_chat._gateway_profile_route_hint("http://gw/p/work/x", code) == ""
@@ -289,3 +289,44 @@ def test_keyless_profile_owned_url_401_names_the_key_fix():
     assert "API_SERVER_KEY" in hint and "profile's .env" in hint
     assert gateway_chat._gateway_profile_route_hint("http://localhost:8642", 401) == ""
     assert gateway_chat._gateway_profile_route_hint("http://localhost:8642", 404, keyless_profile=True) == ""
+
+
+def test_profile_route_401_points_at_the_profile_key_not_multiplexing():
+    hint401 = gateway_chat._gateway_profile_route_hint(f"{SHARED}/p/work", 401)
+    hint404 = gateway_chat._gateway_profile_route_hint(f"{SHARED}/p/work", 404)
+
+    assert "API_SERVER_KEY" in hint401 and "multiplex_profiles" not in hint401
+    assert "multiplex_profiles" in hint404
+
+
+@pytest.mark.parametrize("code,err_type", [(401, "gateway_auth_error"), (404, "gateway_http_error")])
+def test_runs_api_routing_refusal_is_not_classified_as_a_provider_error(homes, tmp_path, monkeypatch, code, err_type):
+    _, work = homes
+    (work / ".env").write_text("API_SERVER_KEY=work-key-0123456789\n")
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", tmp_path / "_index.json")
+    s = new_session(workspace=str(tmp_path))
+    s.profile = "work"
+    s.save()
+    stream_id = "stream-route"
+    s.active_stream_id = stream_id
+    s.save()
+    with STREAMS_LOCK:
+        STREAMS[stream_id] = create_stream_channel()
+    events = []
+
+    def refuse(*a, **k):
+        raise urllib.error.HTTPError(f"{SHARED}/p/work/v1/runs", code, "x", hdrs=Message(), fp=None)
+
+    monkeypatch.setattr(gateway_chat, "_gateway_use_runs_api_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *a, **k: True)
+    monkeypatch.setattr(gateway_chat, "_run_gateway_runs_api_streaming", refuse)
+    monkeypatch.setattr(gateway_chat, "_settle_gateway_terminal_error",
+                        lambda *a, **k: events.append(k.get("route_classification")) or None)
+
+    gateway_chat._run_gateway_chat_streaming(s.session_id, "hi", "m", str(tmp_path), stream_id, [])
+    with STREAMS_LOCK:
+        STREAMS.pop(stream_id, None)
+
+    assert events and events[0]["type"] == err_type
+    assert events[0]["hint"] == gateway_chat._gateway_profile_route_hint(f"{SHARED}/p/work", code)
