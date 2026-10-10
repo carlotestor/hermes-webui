@@ -351,11 +351,44 @@ def test_loop_scheduler_kill_switch(monkeypatch):
     assert loops.start_loop_scheduler() is True and spawned[0]["name"] == "webui-loop-scheduler"
 
 
-def test_legacy_stop_row_without_token_is_matched():
+def test_tokenless_row_is_never_matched_by_prompt():
+    # Token-only recognizer: an older token-less row with the same prompt must not shadow the real wakeup.
     from api import loops
-    turn = {"token": "tok", "started_at": 1000.75, "prompt": "check"}
-    msgs = [{"role": "user", "content": "check", "timestamp": 1000, "_source": "fork"},
-            {"role": "assistant", "content": "*Task cancelled.*", "_error": True, "_cancelled": True}]
-    assert loops._wakeup_outcome(msgs, turn) == (True, "*Task cancelled.*")
-    other = [dict(msgs[0], content="unrelated"), msgs[1]]
-    assert loops._wakeup_outcome(other, turn) == (False, "")
+    turn = {"token": "tok", "started_at": 1000.75, "prompt": "check"}  # records written before this fix carry prompt
+    msgs = [{"role": "user", "content": "check", "timestamp": 1000},
+            {"role": "assistant", "content": "old reply"},
+            {"role": "user", "content": "check", "timestamp": 1000.75, "_active_turn_token": "tok"},
+            {"role": "assistant", "content": "done\nLOOP_COMPLETE"}]
+    assert loops._wakeup_outcome(msgs, turn) == (False, "done\nLOOP_COMPLETE")
+    assert loops._wakeup_outcome(msgs[:2], turn) == (False, "")
+
+
+@requires_agent_modules
+def test_two_compressions_in_one_wakeup_still_judge_reply(tmp_path, monkeypatch):
+    session = NS(session_id="s1", profile=None, messages=[])
+    agent, loops, started = _setup(tmp_path, monkeypatch, session)
+    with loops._home(None):
+        _due(agent)
+        loops.run_due_loops()
+        db = agent._get_session_db()
+        db.create_session("s1", "webui")
+        db.create_session("c1", "webui", parent_session_id="s1")
+        db.create_session("c2", "webui", parent_session_id="c1")
+        assert agent.migrate_loop_to_session("s1", "c1") and agent.migrate_loop_to_session("c1", "c2")
+    session.session_id = "c2"
+    session.messages.append({"role": "assistant", "content": "done\nLOOP_COMPLETE"})
+    loops.run_due_loops()
+    with loops._home(None):
+        assert agent.load_loop("c2").status == "done"
+        assert db.get_meta(loops._TURN_PREFIX + "c2")  # re-keyed to the current session
+        _due(agent)
+    loops.run_due_loops()
+    assert len(started) == 1
+
+
+def test_turn_record_parent_cycle_terminates():
+    from api import loops
+    parents = {"a": "b", "b": "a"}
+    db = NS(get_meta=lambda k: None, get_session=lambda sid: {"parent_session_id": parents.get(sid)},
+            set_meta=lambda k, v: (_ for _ in ()).throw(AssertionError("no record to copy")))
+    assert loops._turn_record(db, "a") == {}

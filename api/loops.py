@@ -49,14 +49,10 @@ def _wakeup_outcome(messages, turn):
     from api.streaming import _session_has_cancel_marker
     msgs = list(messages or [])
     turn = turn or {}
-    token, at, prompt = turn.get("token"), turn.get("started_at"), turn.get("prompt")
+    token, at = turn.get("token"), turn.get("started_at")
 
     def _is_wakeup(m):  # Stop's recovered row carries the same token
-        if (token and m.get("_active_turn_token") == token) or (at and m.get("timestamp") == at):
-            return True
-        # Pre-upgrade Stop recovery: no token, timestamp truncated to int(started_at).
-        return bool(prompt and at and "_active_turn_token" not in m and m.get("timestamp") == int(at)
-                    and str(m.get("content") or "").strip() == prompt)
+        return bool((token and m.get("_active_turn_token") == token) or (at and m.get("timestamp") == at))
     for i, m in enumerate(msgs):
         if m.get("role") == "user" and _is_wakeup(m):
             rows = []
@@ -71,13 +67,17 @@ def _wakeup_outcome(messages, turn):
 
 
 def _turn_record(db, sid):
-    """The wakeup turn fired for this loop; follows compression's child->parent link, then re-keys it to sid."""
+    """The wakeup turn fired for this loop; walks the whole compression parent chain, then re-keys it to sid."""
     raw = db.get_meta(_TURN_PREFIX + sid)
-    if raw is None:
-        parent = (db.get_session(sid) or {}).get("parent_session_id")
-        raw = db.get_meta(_TURN_PREFIX + parent) if parent else None
-        if raw is not None:
-            db.set_meta(_TURN_PREFIX + sid, raw)
+    seen, cur = {sid}, sid
+    while raw is None:  # several rotations in one wakeup leave the record on an older ancestor
+        cur = (db.get_session(cur) or {}).get("parent_session_id")
+        if not cur or cur in seen:
+            break
+        seen.add(cur)
+        raw = db.get_meta(_TURN_PREFIX + cur)
+    if raw is not None and cur != sid:
+        db.set_meta(_TURN_PREFIX + sid, raw)
     return json.loads(raw or "{}")
 
 
@@ -196,7 +196,7 @@ def _run_one(profile, sid):
         at = resp.get("pending_started_at")
         db.set_meta(_TURN_PREFIX + sid, json.dumps(
             {"token": build_active_turn_token(resp.get("stream_id"), at), "started_at": at,
-             "stream_id": resp.get("stream_id"), "prompt": msg.strip()}))
+             "stream_id": resp.get("stream_id")}))
     except KeyError:  # session deleted
         mgr.clear()
 

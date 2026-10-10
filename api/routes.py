@@ -17792,11 +17792,9 @@ def handle_post(handler, parsed) -> bool:
         command = str(body.get("command", "") or "").strip()
         if not command:
             return bad(handler, "command is required")
-        sid = str(body.get("session_id", "") or "")
-        if sid and not _session_id_visible_to_request_profile(handler, sid):
-            return True
         if command.split()[0].lower() in ("/loop", "loop"):
-            from api.loops import run_loop_command
+            from api.loops import run_loop_command  # session_id ownership: generic POST guard above
+            sid = str(body.get("session_id", "") or "")
             return j(handler, {"output": run_loop_command(sid, command.partition(" ")[2],
                                                           request_profile=_get_active_profile_name())})
 
