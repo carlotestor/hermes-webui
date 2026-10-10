@@ -18548,10 +18548,13 @@ def handle_post(handler, parsed) -> bool:
                 # Read only the owner's quota scope: known foreign profiles never count, while
                 # root owners still read unclassified profiles for the unknown-owner guard below.
                 scope_owner = str(_session_field(s, "profile", None) or "default")
+                scope_key = _pin_profile(scope_owner)
                 if scope_owner in known_nonroots:
-                    keep_profile = lambda key, owner=_pin_profile(scope_owner): key == owner
+                    def keep_profile(key):
+                        return key == scope_key
                 else:
-                    keep_profile = lambda key: key not in known_nonroots
+                    def keep_profile(key):
+                        return key not in known_nonroots
                 quota_rows = _pin_quota_rows_from_state_db(
                     list(all_sessions()) + cached_rows + [target_profile_row], keep_profile
                 )
