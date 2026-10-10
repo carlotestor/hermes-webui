@@ -5,6 +5,14 @@
 
 ### Added
 
+- **Middle-click or Ctrl/Cmd-click a conversation in the sidebar to open it in a new tab.** Works for top-level rows
+  and for nested sub-conversations (a child of a compressed conversation opens the child itself, also after a refresh),
+  keeps each tab on its own profile, and leaves plain clicks, the action menu and touch gestures unchanged. Thanks
+  @red4711. (#7429)
+
+- **French voices for Edge text-to-speech.** Nine French Edge TTS voices are allowed and listed in Settings, grouped by
+  language, with the child voice labelled as such. Thanks @ruizanthony. (#7444)
+
 - **Extensions can add a small action to each message without touching transcript DOM.** A new
   `ext.messages.registerAction({ id, label, icon, roles, getPressed, onInvoke })` on the boot-trusted extension handle
   lets an extension put a Core-rendered `pin`, `bookmark` or `star` button after the built-in actions on settled user
@@ -34,6 +42,11 @@
   override it. (#7631 by @carlotestor)
 
 ### Performance
+
+- **Very long conversations no longer stall on the model-context step after a reply.** Following #8072, the
+  second comparison during settlement (which keeps the model's context free of replayed blocks and repeated
+  summaries) is now linear too. 2,000 rows take about 0.3 seconds instead of over a minute, and a 66,666-row
+  conversation settles in seconds, with byte-identical results. Thanks @hejuntt1014. (#8076, fixes #8073)
 
 - **Long conversations settle a reply much faster.** Finishing a stream compared the new transcript rows with the
   saved ones in time that grew with the square of the conversation length, while holding the conversation's lock.
@@ -121,6 +134,115 @@
   @laitekin. (#7297, fixes #7294)
 
 ### Fixed
+
+- **Long conversations no longer show tool results twice after compression.** When the agent compressed old tool
+  output into a one-line summary, the WebUI kept the full result and also spliced the summary in next to it, so repeated
+  tool cards built up over many compressions. A tool row already on screen is now recognised by its durable row identity
+  and not added again. Thanks @psanger. (#7990)
+
+- **Code blocks no longer flash unhighlighted while you scroll a long conversation.** In virtualized transcripts a
+  newly mounted code block was painted plain for a frame before syntax highlighting and tree views applied; they now
+  render highlighted on first paint, including after switching back to a cached conversation. Thanks @webtecnica.
+  (#7912, #7752)
+- **Starting the WebUI on a port that is already taken explains what to do.** `bootstrap.py` / `start.sh` now check the
+  port before launching: if your own WebUI is already running there it says so (and opens it), otherwise it names the
+  port as busy and suggests a free one instead of failing later with a bind error. Works for IPv4, IPv6 and HTTPS.
+  Thanks @mercael91. (#8112, #8111)
+
+- **A Git "terminal prompts disabled" answer from Git Credential Manager is reported as an authentication failure.**
+  Workspace Git status and fetch now show the sign-in message instead of a generic Git error when GCM refuses to prompt
+  because interactivity is disabled. Thanks @PeterPunk1320. (#8127)
+- **The "Move to project" picker is keyboard-reachable, translated and finger-sized.** Arrow keys, Home, End and Escape work (focus
+  returns to the ⋮ trigger), labels are translated in all 15 locales, and rows are 44px on touch. The picker uses the same placement
+  as the ⋮ menu (below the row, flipping above when that fits, pinned 8px inside the window and scrolling when taller), follows window
+  resizes, and closes when a resize or phone rotation hides the sidebar instead of floating over the composer. Thanks @ybai08. (#8052,
+  fixes #8044)
+
+- **Passkey enrollment works with security keys that send extensions.** Registering a YubiKey or another
+  authenticator that includes CBOR extension data no longer fails with "Trailing CBOR data"; malformed extension bytes
+  are rejected cleanly instead of causing a server error. Existing passkeys keep working. Thanks @Dandandad. (#8093, #8092)
+
+- **Codex sign-in sends an explicit User-Agent on its device-code requests**, so the OAuth endpoint no longer
+  sees a bare library default. Thanks @angelusbr. (#8118)
+
+- **A reply line that legitimately repeats earlier text is no longer hidden while it streams.** Echo suppression used to
+  match on text alone, so two different events with the same words (for example "Processing…" on both sides of a tool
+  call) collapsed into one. Rows are now de-duplicated by their identity, and only a genuinely re-delivered row is
+  dropped. Thanks @webtecnica. (#6293)
+- **A conversation no longer gets stuck on "session already has an active stream".** A tab that went away without a
+  clean disconnect (a half-open connection) kept its session channel alive for the life of the server, and a stream left
+  behind by a worker that exited without cleaning up blocked every new message in that conversation, sometimes for hours.
+  Abandoned channels are now collected once their subscribers stop draining, a new message clears a stream whose worker
+  is gone, and a restored Gateway run claims its ownership before it starts. Thanks @PeterPunk1320. (#7302)
+- **A closed mobile sidebar or workspace drawer is out of the keyboard's way.** Once a drawer has slid closed it is
+  inert and hidden from the tab order and screen readers, so Tab no longer walks into an invisible off-screen list;
+  closing it by tapping outside or with its own close button returns focus to the control that opened it, and the
+  hidden file-upload input is no longer a stray tab stop. Thanks @happy5318. (#7924)
+
+- **Sending uses the model's own provider.** Picking a model now sends with that model's provider instead of a stale
+  provider left on the conversation, including qualified ids such as `provider:model`, new chats and conversations whose
+  provider was removed. Saving Settings and reopening them no longer brings back a phantom "unsaved changes" bar.
+  Thanks @happy5318. (#7865, #7860)
+
+- **OpenAI text-to-speech starts sooner and plays to the end.** Long replies are split into chunks that play as they
+  arrive instead of waiting for the whole clip; a rate-limited (429) chunk is retried without stopping playback, and
+  every chunk request (OpenAI and Edge) stays pinned to the profile the reply started on, even if you switch profiles
+  mid-reply. Thanks @happy5318. (#7529)
+
+- **Conversation titles recover after a bad model reply.** When the title model returns a list of options, a menu or
+  other unusable text, the WebUI now rejects it and keeps or regenerates a proper title instead of saving the junk.
+  Genuine titles with commas or two parts are kept. A title generated while you reconnected to a continued
+  conversation now reaches that conversation, a title you renamed by hand is never overwritten, and repeated bad
+  replies from a model are capped. Thanks @CharlesMcquade. (#7318)
+- **A workspace panel you closed stays closed.** On phones, the on-screen keyboard (a viewport resize) no longer
+  reopens the workspace panel after you dismissed it. File and artifact previews are now owned by the open that started
+  them: a slow preview that finishes after you switched conversations, opened another file or closed the panel no longer
+  pops the panel back open or overwrites the newer selection, and a slow HTML preview still opens. HTML previews are also
+  downloaded once instead of twice. Thanks @sand01chi. (#6710)
+
+- **The auto-scroll setting is easier to find and understand.** Settings → Appearance's "Auto-follow new content" is
+  now "Auto-scroll to new content" with clearer helper text in 15 languages, and searching Settings for "autoscroll",
+  "auto-follow", "sticky" or "bottom" finds it. The setting itself and its default are unchanged. Thanks @webtecnica. (#6248)
+- **Portuguese extension trust warning reads correctly.** The Extensions trust-model text in Portuguese is rewritten in
+  clear, correct Portuguese with the same five facts (same origin, same authenticated APIs, browser-only settings, not for
+  secrets, load only trusted local folders). Thanks @angelusbr. (#7989)
+
+- **Gateway-backend browser turns no longer hang on a run-events stream that only sends keepalives.** A wall-clock
+  watchdog re-checks the run's status when the event stream makes no real progress for about two minutes: a finished
+  run settles from that status, and a running one reconnects from the last event without repeating tokens. A Gateway
+  that keeps closing the stream immediately is paced with a capped backoff instead of a reconnect storm, and Stop still
+  cancels promptly during a wait. Thanks @Ejmathewp. (#7978 by @Ejmathewp)
+
+- **Background git operations no longer pop up a credential-manager login window.** The update check and workspace
+  git actions already turned off terminal and askpass prompts, but Git Credential Manager has its own interaction switch,
+  so a cache miss during a background fetch could open an unexpected login window. Background git now also sets
+  `GCM_INTERACTIVE=never` and `credential.interactive=false`; cached credentials and stored helpers keep working. A
+  failed login on git 2.47+ (which says "unable to get password from user") is now reported as an authentication
+  failure instead of a generic git error. Thanks @Tivonsico. (#8085)
+
+- **Conversations no longer freeze after compression or an edit and silently hide every later turn.** A turn that
+  committed without a timestamped user message (a Gateway handoff or a background-process notification) stamped the
+  conversation's replay cutoff with the current clock time, newer than everything already saved. From then on the
+  merge hid exactly the new turns that would have moved the conversation past that cutoff, so the transcript stopped at
+  an old snapshot while the session kept running; one real conversation lost several thousand messages from view. The
+  cutoff now only ever moves to a real message time, and an already-frozen conversation heals: it reverts to its last
+  real cutoff (the recorded compression/edit point or the newest saved message), keeps everything that compression or an
+  edit removed hidden, and shows every turn after it. The one ambiguous case, an edit whose replacement turn never
+  reached the saved file with a time, stays as before rather than risk bringing deleted messages back.
+  Thanks @Peytonlukm. (#7946, fixes #7945)
+
+- **A Gateway conversation no longer gets stuck reloading forever.** When a Gateway-backed turn rewrote a conversation's
+  saved file, the live-update stream could keep comparing against an older cached message count, decide on every
+  reconnect that the server was ahead, and reload, reconnect and reload again, leaving the chat on "Loading
+  messages". The reconnect check now reads the current file's own message count through a small bounded read (it never
+  parses the whole transcript, and remembers the answer per file version so reconnect storms stay cheap), and files
+  written by crash recovery and repair carry a trustworthy count so a recovered conversation still catches up.
+  Thanks @alvistar. (#7673, fixes #7672)
+
+- **The Hermes dashboard link works when the dashboard is served under a sub-path.** A dashboard URL such as
+  `https://host/hermes/` is now accepted and opened with its path (and its trailing slash) intact, instead of being
+  rejected or cut back to the host. Backslashes and their encoded forms are still refused, and the server-side
+  reachability probe still targets the host only. Thanks @webtecnica. (#7909, fixes #7844)
 
 - **Work you stopped survives a restart.** When you press Stop, the partial reply and its tool cards are saved, and
   they now come back intact after the server restarts, on reload, in copies and branches, and in later turns. That
@@ -872,6 +994,9 @@
 
 ### Documentation
 
+- **Troubleshooting no longer sends package-managed installs to the stale in-tree venv.** It resolves the store
+  Python with `hermes --print-runtime-command` at each start (no `jq` needed) and stops the launcher instead of exporting
+  an empty path when that lookup fails. Thanks @smhc. (#8110)
 - **The README's remote-access paragraph now leads with Tailscale Serve.** It sent users straight to a
   `HERMES_WEBUI_HOST=0.0.0.0` bind, which contradicted the guide it links to. It now recommends Serve, which
   keeps WebUI on loopback behind tailnet-only HTTPS, and keeps the authenticated direct-IP bind as the
