@@ -34,6 +34,8 @@ from api.config import (
     STREAM_REASONING_TEXT, STREAM_LIVE_TOOL_CALLS,
     STREAM_GOAL_RELATED, PENDING_GOAL_CONTINUATION,
     STREAM_LAST_EVENT_ID,
+    stream_owned_registries,
+    release_stream_owned_registries,
     LOCK, SESSIONS, SESSIONS_MAX, SESSION_DIR,
     _get_session_agent_lock, _alias_session_agent_lock,
     _set_thread_env, _clear_thread_env,
@@ -4532,6 +4534,9 @@ def _strip_xml_tool_calls(text: str) -> str:
 
 def _sanitize_generated_title(text: str) -> str:
     """Sanitize LLM-generated title text before persisting to session."""
+    # Preserve newline candidate boundaries before markup normalization.
+    if _looks_like_title_option_menu(text):
+        return ''
     s = _strip_thinking_markup(text or '')
     s = re.sub(
         r'^\s*(?:[*_`~]+\s*)?(?:session\s+title|title)\s*:\s*(?:[*_`~]+\s*)?',
@@ -4540,12 +4545,120 @@ def _sanitize_generated_title(text: str) -> str:
         flags=re.IGNORECASE,
     )
     s = re.sub(r'^\s*title\s*:\s*', '', s, flags=re.IGNORECASE)
+    if _looks_like_title_option_menu(s):
+        return ''
     s = s.strip(" \t\r\n\"'`*_~")
     s = re.sub(r'\s+', ' ', s).strip()
     # Guard against chain-of-thought leakage, meta-reasoning, and trivial echo.
     if _is_bad_new_title(s):
         return ''
     return s[:80]
+
+
+_TITLE_OPTION_MENU_RE = re.compile(
+    r'^\s*(?:(?:[-*\u2022\u2023]|\d{1,2}[).:])\s+)?'
+    r'(?:(?:here (?:are|is)|some|good|possible)\s+)*(?:here (?:are|is)\s+some\s+|some\s+of\s+the\s+)?'
+    r'(?:session\s+)?title\s+(?:options?|suggestions?|ideas?|candidates?)\s*:',
+    flags=re.IGNORECASE,
+)
+
+# Evidence that a preamble introduces MULTIPLE candidates rather than one
+# selected title: numbered/bulleted entries or delimited candidates.
+# Unanchored: callers may pass raw stored titles (multiline lists) OR the
+# whitespace-collapsed sanitize form, where list markers are inline.
+_TITLE_MENU_LIST_RE = re.compile(
+    r'(?:[-*\u2022\u2023]|\d{1,2}[).:])\s+\S',
+    flags=re.IGNORECASE,
+)
+_TITLE_MENU_COMMA_JOIN_RE = re.compile(
+    r'\b(?:and|or|vs\.?|versus|then|but|while)\b', flags=re.IGNORECASE,
+)
+_TITLE_MENU_COMMA_SPAN_RE = re.compile(
+    r'^(?:and|or|vs\.?|versus|then|but|while|with|without|from|to|for|of|between|across|after|before)\b'
+    r'|\b(?:with|without|from|to|for|of|between|across|after|before)\s*$',
+    flags=re.IGNORECASE,
+)
+_TITLE_MENU_COMMA_VERB_RE = re.compile(
+    r'^(?:compare|comparing|contrast|contrasting|review|reviewing|explore|exploring|evaluate|evaluating)\b',
+    flags=re.IGNORECASE,
+)
+
+
+def _looks_like_title_option_menu(text: str) -> bool:
+    """Return True for a title-model menu rather than one selected title.
+
+    The preamble alone is not enough: legitimate single titles like
+    ``Title Suggestions: Migration Strategy`` or
+    ``Here Are Some Title Options for Session Naming`` exist and must not be
+    rejected. Classify as a menu only when multiple candidates follow —
+    two or more list entries, or delimiter-separated standalone alternatives.
+    Matching works on both raw stored text and the whitespace-collapsed sanitize
+    form. A grammatical comma inside one title is not a candidate boundary.
+    """
+    s = str(text or '')
+    s_m = _TITLE_OPTION_MENU_RE.match(s)
+    if not s_m:
+        return False
+    rest = s[s_m.end():]
+    if len(_TITLE_MENU_LIST_RE.findall(rest)) >= 2:
+        return True
+    # Only separators outside quoted terms delimit candidates. Two quoted
+    # words in a single comparison title are not a menu.
+    candidates = []
+    separators = []
+    start = 0
+    quote = None
+    for index, char in enumerate(rest):
+        if char in ('"', '\u201c', '\u201d'):
+            if quote is None:
+                quote = '\u201d' if char == '\u201c' else char
+            elif char == quote:
+                quote = None
+        elif quote is None and char in ',;\n':
+            candidates.append(rest[start:index].strip())
+            separators.append(char)
+            start = index + 1
+    candidates.append(rest[start:].strip())
+    if sum(bool(candidate) for candidate in candidates) < 2:
+        return False
+    if any(separator in ';\n' for separator in separators):
+        return True
+    # Two unquoted comma fragments are ambiguous even when both are short:
+    # "OAuth Tokens, Explained" is one title, not two choices. Explicit
+    # quotation or a leading list marker supplies the missing menu structure;
+    # otherwise require at least three alternatives. An explicit "or" between
+    # two fragments also marks a choice after an options preamble.
+    alternative = False
+    if len(candidates) == 2:
+        quoted = all(
+            (item.startswith('"') and item.endswith('"'))
+            or (item.startswith('\u201c') and item.endswith('\u201d'))
+            for item in candidates
+        )
+        marked = bool(re.match(r'^\s*(?:[-*\u2022\u2023]|\d{1,2}[).:])\s+', s))
+        alternative = bool(re.match(r'^or\b', candidates[-1], re.IGNORECASE))
+        if not (quoted or marked or alternative):
+            return False
+    # A comma can also join clauses in ONE title ("Compare REST, GraphQL and
+    # gRPC"). Require short standalone alternatives: a leading action verb,
+    # boundary-spanning preposition, or a connective joining the final segment
+    # to its predecessor makes the split ambiguous, so preserve the title.
+    for index, candidate in enumerate(candidates):
+        if not candidate or len(candidate) > 50 or len(candidate.split()) > 6:
+            return False
+        if (candidate[0] == candidate[-1] == '"'
+                or (candidate[0] == '\u201c' and candidate[-1] == '\u201d')):
+            continue  # A fully quoted alternative may itself contain "and".
+        # An explicit "or" is the option separator, not a grammatical span
+        # within the second candidate; still inspect its remaining words.
+        span_candidate = candidate[3:].strip() if alternative and index == 1 else candidate
+        if (_TITLE_MENU_COMMA_SPAN_RE.search(span_candidate)
+                or (index == 0 and _TITLE_MENU_COMMA_VERB_RE.match(candidate))
+                or (index == len(candidates) - 1
+                    and _TITLE_MENU_COMMA_JOIN_RE.search(candidate)
+                    and not alternative)):
+            return False
+    return True
 
 
 def _looks_invalid_generated_title(text: str) -> bool:
@@ -4566,6 +4679,7 @@ def _looks_invalid_generated_title(text: str) -> bool:
         or re.search(r'^\s*(i|we)\s+(should|need to|will|can)\b', s, flags=re.IGNORECASE)
         or re.search(r'^\s*let me\b', s, flags=re.IGNORECASE)
         or re.search(r"^\s*here(?:'s| is) (?:a |my )?(?:thinking|thought)", s, flags=re.IGNORECASE)
+        or _looks_like_title_option_menu(s)
     )
 
 
@@ -4837,11 +4951,26 @@ def _latest_exchange_snippets(messages):
                 user_text = ''
                 asst_text = ''
                 break
-            if not user_text:
-                user_text = candidate
+            user_text = candidate
+            # Never cross a user boundary to borrow an older assistant reply.
+            break
         if user_text and asst_text:
             break
     return user_text[:500], asst_text[:500]
+
+
+def _title_exchange_for_unresolved_title(messages):
+    """Pick the best completed exchange while an automatic title is unresolved.
+
+    The first exchange is normally the right title source.  If its model output
+    was rejected, however, retrying that same opener on every later turn cannot
+    recover a session that starts with a warm-up message.  Use the latest
+    completed exchange once another user turn exists, while leaving successful
+    titles and configured periodic refreshes untouched.
+    """
+    if _count_exchanges(messages) > 1:
+        return _latest_exchange_snippets(messages)
+    return _first_exchange_snippets(messages)
 
 
 def _count_exchanges(messages):
@@ -4897,8 +5026,13 @@ def _is_provisional_title(current_title: str, messages) -> bool:
     return any(candidate and current == candidate for candidate in candidates)
 
 
-def _background_title_generation_inputs(session):
-    """Return sanitized first-exchange inputs when background title generation is eligible."""
+def _background_title_generation_eligible(session):
+    """True when background title generation should run for *session*.
+
+    Covers the default/provisional placeholders plus structurally invalid
+    generated titles (e.g. a persisted title-option menu), which must re-enter
+    the self-heal path even though ``llm_title_generated`` is set.
+    """
     messages = getattr(session, 'messages', None) or []
     title = getattr(session, 'title', '')
     invalid_existing_title = _looks_invalid_generated_title(title)
@@ -4909,11 +5043,24 @@ def _background_title_generation_inputs(session):
         or _is_provisional_title(title, messages)
         or invalid_existing_title
     )
-    if not eligible_title or (
-        getattr(session, 'llm_title_generated', False) and not invalid_existing_title
-    ):
+    if not eligible_title:
+        return False
+    return not (getattr(session, 'llm_title_generated', False) and not invalid_existing_title)
+
+
+def _background_title_generation_inputs(session):
+    """Return (user_text, assistant_text) title inputs when eligible, else None.
+
+    Exchange selection: normally the first completed exchange names the
+    session; if its model output was rejected, retrying the same warm-up
+    opener forever cannot recover, so a later completed exchange is used
+    instead once one exists.
+    """
+    if not _background_title_generation_eligible(session):
         return None
-    user_text, assistant_text = _first_exchange_snippets(messages)
+    user_text, assistant_text = _title_exchange_for_unresolved_title(
+        getattr(session, 'messages', None) or []
+    )
     return (user_text, assistant_text) if user_text and assistant_text else None
 
 
@@ -6334,34 +6481,65 @@ def _fallback_title_from_exchange(user_text: str, assistant_text: str) -> Option
     return 'Conversation topic'
 
 
-def _is_generic_fallback_title(title: str) -> bool:
+def _is_generic_fallback_title(title) -> bool:
     """Return True for low-information fallback labels that should not be persisted."""
     return str(title or '').strip().lower() in {'conversation topic'}
 
 
-def _run_background_title_update(session_id: str, user_text: str, assistant_text: str, placeholder_title: str, put_event, agent=None):
-    """Generate and publish a better title after `done`, then end the stream."""
+# Recovery cap for a model that keeps answering badly: an invalid model output
+# suppresses the local fallback so the next completed exchange retries the LLM
+# (the local fallback would mark a warm-up opener as successfully titled). A
+# model that ALWAYS returns the wrong language or a list would otherwise retry
+# forever — one title call per turn plus the invalid-output backup chain. After
+# this many exchanges with a still-invalid title, accept the local fallback and
+# stop retrying (maintainer re-gate, #7318).
+_TITLE_RECOVERY_MAX_EXCHANGES = 3
+
+
+def _run_background_title_update(session_id: str, user_text: str, assistant_text: str, placeholder_title: str, put_event, agent=None, stream_owner_id: str = None):
+    """Generate and publish a better title after `done`, then end the stream.
+
+    ``session_id`` is the title target (the canonical/continuation session the
+    title is loaded from and persisted to). ``stream_owner_id`` is the SSE
+    stream owner: when context compression rotated the session ID mid-stream,
+    the client captured the ORIGINAL ``_run_agent_streaming`` session id and
+    its ``stream_end`` fence (static/messages.js) rejects mismatched ids — so
+    ``stream_end`` must be emitted with the original id or the EventSource
+    never closes.
+    """
     try:
+        # Read the canonical in-memory session while deciding whether this
+        # automatic pass may run. A manual rename can race the background LLM
+        # request, so the later write path rebinds under the same lock too.
+        # get_session() itself acquires the global session LOCK in its cache
+        # resolver, so it must run OUTSIDE the explicit critical section
+        # (plain non-reentrant threading.Lock); rebind under LOCK after it.
         try:
             s = get_session(session_id)
+            with LOCK:
+                cached_session = SESSIONS.get(session_id)
+                if cached_session is not None and getattr(cached_session, 'session_id', None) == session_id:
+                    s = cached_session
+                _invalid_existing = _looks_invalid_generated_title(s.title)
+                current = str(s.title or '').strip()
+                already_generated = getattr(s, 'llm_title_generated', False)
+                manual_title = session_has_manual_title(s)
+                still_auto = (
+                    current == placeholder_title
+                    or current in ('Untitled', 'New Chat', '')
+                    or _is_provisional_title(current, s.messages)
+                    or _invalid_existing
+                )
         except KeyError:
             _put_title_status(put_event, session_id, 'skipped', 'missing_session')
             return
         # Allow self-heal when a previously generated title leaked thinking text.
-        _invalid_existing = _looks_invalid_generated_title(s.title)
-        if getattr(s, 'llm_title_generated', False) and not _invalid_existing:
-            _put_title_status(put_event, session_id, 'skipped', 'already_generated', str(s.title or ''))
+        if already_generated and not _invalid_existing:
+            _put_title_status(put_event, session_id, 'skipped', 'already_generated', current)
             return
-        current = str(s.title or '').strip()
-        if session_has_manual_title(s):
+        if manual_title:
             _put_title_status(put_event, session_id, 'skipped', 'manual_title', current)
             return
-        still_auto = (
-            current == placeholder_title
-            or current in ('Untitled', 'New Chat', '')
-            or _is_provisional_title(current, s.messages)
-            or _invalid_existing
-        )
         if not still_auto:
             _put_title_status(put_event, session_id, 'skipped', 'manual_title', current)
             return
@@ -6372,19 +6550,48 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
                 _put_title_status(put_event, session_id, 'skipped', 'title_generation_disabled', current)
                 return
             aux_title_configured = _aux_title_configured()
+            rejected_model_output = False
             if agent and not aux_title_configured:
                 next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
+                rejected_model_output = llm_status in ('llm_invalid', 'llm_language_mismatch')
                 if not next_title and llm_status in ('llm_error', 'llm_invalid'):
                     next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, use_agent_model=True, conversation_id=session_id)
+                    rejected_model_output = rejected_model_output or llm_status in ('llm_invalid_aux', 'llm_language_mismatch_aux')
             else:
                 next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, conversation_id=session_id)
+                rejected_model_output = llm_status in ('llm_invalid_aux', 'llm_language_mismatch_aux')
                 if not next_title and agent and llm_status in ('llm_error_aux', 'llm_invalid_aux'):
                     next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
+                    rejected_model_output = rejected_model_output or llm_status in ('llm_invalid', 'llm_language_mismatch')
             source = llm_status
-            if not next_title:
+            # An invalid response is different from an unavailable title model:
+            # choosing a local fallback here would mark a warm-up opener as
+            # successfully titled, blocking the later unresolved-title retry.
+            # Keep the provisional title and retry on the next completed exchange.
+            invalid_model_output = rejected_model_output or llm_status in {
+                'llm_invalid',
+                'llm_invalid_aux',
+                'llm_language_mismatch',
+                'llm_language_mismatch_aux',
+            }
+            # Recovery cap: accept the local fallback once the session has this
+            # many exchanges — a model that keeps answering badly must not mint
+            # one title call per turn forever (#7318 re-gate, SHOULD-FIX). The
+            # count reads the already-materialized session messages snapshot
+            # (no lock held); a concurrently appended message can only make the
+            # cap more permissive by one turn, which is acceptable here.
+            try:
+                exchange_count = _count_exchanges(s.messages)
+            except Exception:
+                exchange_count = 0
+            recovery_capped = invalid_model_output and exchange_count >= _TITLE_RECOVERY_MAX_EXCHANGES
+            if not next_title and (not invalid_model_output or recovery_capped):
                 fallback_title = _fallback_title_from_exchange(user_text, assistant_text)
                 if fallback_title and not _is_generic_fallback_title(fallback_title):
-                    logger.debug("Using local fallback for session title generation")
+                    logger.debug(
+                        "Using local fallback for session title generation%s",
+                        " (recovery cap reached)" if recovery_capped else "",
+                    )
                     next_title = fallback_title
                     source = 'fallback'
                 elif fallback_title:
@@ -6427,7 +6634,22 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
                 _put_title_status(put_event, session_id, source, fallback_reason, effective_title, raw_preview)
             else:
                 _put_title_status(put_event, session_id, source, llm_status, effective_title, raw_preview)
-            put_event('title', {'session_id': session_id, 'title': effective_title})
+            put_event('title', {
+                # The listener keys its guard on session_id, so this must be the
+                # TITLE TARGET (B) — not the stream owner (A): after an A→B
+                # compression rotation, a reattached listener runs with
+                # activeSid=B and would reject an A-keyed event before ever
+                # checking expectedCurrent, leaving B's malformed title in place.
+                'session_id': session_id,
+                'stream_owner_session_id': stream_owner_id or session_id,
+                'target_session_id': session_id,
+                'title': effective_title,
+                # The title this event REPLACES. The client passes it back as
+                # expectedCurrent so a listener-style update is accepted even
+                # when the outgoing title is a malformed persisted value that
+                # no default/provisional candidate matches (#7318 re-gate).
+                'expectedCurrent': current,
+            })
             # Sync the generated title to state.db so `hermes sessions list` shows it.
             try:
                 from api.state_sync import sync_session_title
@@ -6437,7 +6659,7 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
         else:
             _put_title_status(put_event, session_id, 'skipped', source or 'unchanged', effective_title, raw_preview)
     finally:
-        put_event('stream_end', {'session_id': session_id})
+        put_event('stream_end', {'session_id': stream_owner_id or session_id})
 
 
 def _run_background_title_refresh(session_id: str, user_text: str, assistant_text: str, current_title: str, put_event, agent=None):
@@ -7856,6 +8078,30 @@ def _message_identity(msg):
     )
 
 
+def _durable_tool_row_identity(msg):
+    """Return (tool_call_id, row_id) for a tool row with a valid durable row.
+
+    Agent-side compression rewrites old tool results in model context to a
+    one-line summary while keeping the state.db row, so content-based identity
+    differs from the visible full-output row. A durable row ID proves row
+    identity (run-state contract), so backfill can match on it instead.
+    """
+    if not isinstance(msg, dict) or msg.get('role') != 'tool':
+        return None
+    # Read the row through the canonical provenance helper: messages loaded
+    # from state.db (and IDs preserved from older Agents) carry
+    # ``_state_db_row_id`` rather than ``_row_id``, and both sides of the
+    # backfill must normalize to the same identity. Contradictory aliases are
+    # invalid and fall back to content-based matching.
+    row_id, valid = _state_db_row_identity_details(msg)
+    if not valid or row_id is None or int(row_id) <= 0:
+        return None
+    tool_call_id = msg.get('tool_call_id')
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        return None
+    return (tool_call_id, row_id)
+
+
 def _messages_have_prefix(messages, prefix, *, key_fn=None):
     key_fn = key_fn or _message_identity
     if len(messages or []) < len(prefix or []):
@@ -7932,39 +8178,22 @@ def _strip_replayed_prefix(existing_messages, candidates):
     return candidates[matched:]
 
 
-def _looks_like_replayed_session_arc_summary(previous_msg, candidate_msg):
-    """Return True for repeated LCM/session summaries with refreshed hints.
+def _session_arc_summary_key(message):
+    """Identify long summaries by role, provider payload and normalized prefix."""
+    if not isinstance(message, dict):
+        return None
+    text = ' '.join(_message_text(message.get('content', '')).split())
+    if len(text) < 2000 or not text.startswith('[Session Arc Summary'):
+        return None
+    api_content = message.get('api_content')
+    normalized = ' '.join(api_content.split()) if isinstance(api_content, str) and api_content else None
+    return (message.get('role'), normalized, text[:1500])
 
-    LCM summary cards can be re-injected with the same long recovered context
-    and a different tail such as an expand hint. Exact identity misses those,
-    but appending both copies bloats every later model prompt.
-    """
-    if not isinstance(previous_msg, dict) or not isinstance(candidate_msg, dict):
-        return False
-    if previous_msg.get('role') != candidate_msg.get('role'):
-        return False
-    previous_api_content = previous_msg.get("api_content")
-    candidate_api_content = candidate_msg.get("api_content")
-    normalized_previous_api_content = (
-        " ".join(previous_api_content.split())
-        if isinstance(previous_api_content, str) and previous_api_content
-        else None
-    )
-    normalized_candidate_api_content = (
-        " ".join(candidate_api_content.split())
-        if isinstance(candidate_api_content, str) and candidate_api_content
-        else None
-    )
-    if normalized_previous_api_content != normalized_candidate_api_content:
-        return False
-    previous_text = " ".join(_message_text(previous_msg.get('content', '')).split())
-    candidate_text = " ".join(_message_text(candidate_msg.get('content', '')).split())
-    if len(previous_text) < 2000 or len(candidate_text) < 2000:
-        return False
-    marker = '[Session Arc Summary'
-    if not previous_text.startswith(marker) or not candidate_text.startswith(marker):
-        return False
-    return previous_text[:1500] == candidate_text[:1500]
+
+def _looks_like_replayed_session_arc_summary(previous_msg, candidate_msg):
+    """Recognize the same recovered context with a refreshed trailing hint."""
+    previous_key = _session_arc_summary_key(previous_msg)
+    return previous_key is not None and previous_key == _session_arc_summary_key(candidate_msg)
 
 
 def _strip_replayed_context_items(existing_messages, candidates):
@@ -7976,27 +8205,75 @@ def _strip_replayed_context_items(existing_messages, candidates):
 
     existing_keys = [_message_replay_key(m) for m in existing_messages]
     candidate_keys = [_message_replay_key(m) for m in candidates]
-    existing_large = [m for m in existing_messages if isinstance(m, dict)]
+    # Reversing both sequences turns a match starting at candidate idx into a
+    # match ending at the corresponding reversed position. A suffix automaton
+    # computes these longest matches without scanning every old start again.
+    transitions, links, lengths = [{}], [-1], [0]
+    last = 0
+    for key in reversed(existing_keys):
+        current = len(transitions)
+        transitions.append({})
+        lengths.append(lengths[last] + 1)
+        links.append(0)
+        parent = last
+        while parent >= 0 and key not in transitions[parent]:
+            transitions[parent][key] = current
+            parent = links[parent]
+        if parent >= 0:
+            target = transitions[parent][key]
+            if lengths[parent] + 1 == lengths[target]:
+                links[current] = target
+            else:
+                clone = len(transitions)
+                transitions.append(dict(transitions[target]))
+                lengths.append(lengths[parent] + 1)
+                links.append(links[target])
+                while parent >= 0 and transitions[parent].get(key) == target:
+                    transitions[parent][key] = clone
+                    parent = links[parent]
+                links[target] = links[current] = clone
+        last = current
+
+    matches = [0] * len(candidate_keys)
+    state = matched = 0
+    for idx in range(len(candidate_keys) - 1, -1, -1):
+        key = candidate_keys[idx]
+        while state and key not in transitions[state]:
+            state = links[state]
+            matched = min(matched, lengths[state])
+        target = transitions[state].get(key)
+        if target is None:
+            matched = 0
+        else:
+            state = target
+            matched += 1
+        matches[idx] = matched
+
+    summary_keys = set()
+    unusual_summary_keys = []
+    for message in existing_messages:
+        key = _session_arc_summary_key(message)
+        if key is not None:
+            try:
+                summary_keys.add(key)
+            except TypeError:
+                # Preserve the old equality rule for malformed, unhashable roles.
+                unusual_summary_keys.append(key)
     cleaned = []
     idx = 0
     min_block = 3
     while idx < len(candidates):
         msg = candidates[idx]
-        if any(_looks_like_replayed_session_arc_summary(prev, msg) for prev in existing_large):
+        key = _session_arc_summary_key(msg)
+        try:
+            repeated_summary = key is not None and key in summary_keys
+        except TypeError:
+            repeated_summary = key in unusual_summary_keys
+        if repeated_summary:
             idx += 1
             continue
 
-        best = 0
-        for start in range(len(existing_keys)):
-            length = 0
-            while (
-                idx + length < len(candidate_keys)
-                and start + length < len(existing_keys)
-                and candidate_keys[idx + length] == existing_keys[start + length]
-            ):
-                length += 1
-            if length > best:
-                best = length
+        best = matches[idx]
         if best >= min_block:
             idx += best
             continue
@@ -8627,7 +8904,29 @@ def _advance_truncation_watermark_after_commit(session) -> None:
             if isinstance(ts, (int, float)) and ts > 0:
                 session.truncation_watermark = float(ts)
                 return
-    session.truncation_watermark = time.time()
+    # No timestamped user row (e.g. a handoff/background-notification turn
+    # committed without one). The watermark's meaning is "suppress the
+    # REPLACED tail", so it must stay anchored to a real message timestamp --
+    # stamping wall-clock time here made the watermark NEWER than every row in
+    # the sidecar, which permanently starved the sidecar_advanced_past_watermark
+    # guard of the only signal that would let newer state.db rows merge back.
+    # That is a self-locking filter: the rows needed to advance the sidecar past
+    # the watermark are exactly the rows the watermark hides. Clamp to the
+    # newest real message instead, keeping the sidecar able to advance past it.
+    # Never 0.0 (the truncate-to-empty sentinel that must keep blocking replay,
+    # #2914) -- hence the >0 check.
+    newest_real_ts = None
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        ts = msg.get('timestamp') or msg.get('_ts')
+        if isinstance(ts, (int, float)) and ts > 0:
+            newest_real_ts = ts if newest_real_ts is None else max(newest_real_ts, ts)
+    if newest_real_ts is not None:
+        session.truncation_watermark = float(newest_real_ts)
+    # Otherwise: genuinely no timestamped row at all. Keep the existing (stale)
+    # value rather than inventing a wall-clock boundary — a too-old watermark
+    # only over-filters the replaced tail; it cannot self-lock the merge.
 
 
 def _merge_display_messages_after_agent_result(
@@ -8773,27 +9072,48 @@ def _merge_display_messages_after_agent_result(
             )
         )
         _display_id_set = {_message_identity(m) for m in previous_display}
-        _context_id_set = {
-            _message_identity(m)
-            for m in previous_context
-            if not (
+        # A context tool row whose durable row is already displayed is the same
+        # row (e.g. an Agent-pruned summary of the visible full output), never
+        # a context-only turn, regardless of how its content was rewritten.
+        # Map it to its display twin's identity so it is never inserted but
+        # still anchors the backfill cursor at the visible tool result.
+        _display_identity_by_durable_tool_row = {}
+        for m in previous_display:
+            _durable = _durable_tool_row_identity(m)
+            if _durable is not None:
+                _display_identity_by_durable_tool_row.setdefault(_durable, _message_identity(m))
+
+        def _is_displayed_native_image_context_row(m):
+            return (
                 isinstance(m, dict)
                 and m.get('_active_turn_token') in _displayed_native_image_context_tokens
             )
+
+        def _displayed_durable_tool_twin_identity(m):
+            _durable = _durable_tool_row_identity(m)
+            if _durable is None:
+                return None
+            return _display_identity_by_durable_tool_row.get(_durable)
+
+        _context_id_set = {
+            _message_identity(m)
+            for m in previous_context
+            if not _is_displayed_native_image_context_row(m)
+            if _displayed_durable_tool_twin_identity(m) is None
             if not _is_context_compression_marker(m)
             and not _is_compressed_context_tool_result_summary_message(m)
         }
         _has_context_only_turns = bool(_context_id_set - _display_id_set)
         if _has_context_only_turns:
-            context_keys = [
-                None
-                if (
-                    isinstance(m, dict)
-                    and m.get('_active_turn_token') in _displayed_native_image_context_tokens
+            context_keys = []
+            for m in previous_context:
+                if _is_displayed_native_image_context_row(m):
+                    context_keys.append(None)
+                    continue
+                _twin_identity = _displayed_durable_tool_twin_identity(m)
+                context_keys.append(
+                    _twin_identity if _twin_identity is not None else _message_identity(m)
                 )
-                else _message_identity(m)
-                for m in previous_context
-            ]
             # Precompute display keys once; avoids repeated json.dumps calls inside
             # the inner any() loop (was O(D²·C) — see perf fix below).
             _display_keys = [_message_identity(m) for m in previous_display]
@@ -10968,18 +11288,20 @@ def _run_agent_streaming(
                     ephemeral=bool(ephemeral),
                     backend=WEBUI_LOCAL_CHAT_BACKEND,
                 )
+                # Worker admission ends the launch phase (#7302 finding 5): retire
+                # the claim published at registration. Ownership lives in
+                # ACTIVE_RUNS from here on.
+                from api.config import retire_pre_admission_claim_if_owned
+
+                retire_pre_admission_claim_if_owned(stream_id, streams_lock_held=True)
     if q is None:
-        # The stream was cancelled before the worker started; the route layer
-        # already registered the stream owner, so release it here to avoid
-        # leaking a STREAM_SESSION_OWNERS entry that the teardown finally never sees.
-        unregister_stream_owner(stream_id)
-        try:
-            clear_session_writeback_owner_if_owned(session_id, stream_id)
-        except Exception:
-            logger.debug(
-                "Failed to clear session writeback owner for stream %s", stream_id,
-                exc_info=True,
-            )
+        # The stream was cancelled (or cleared as an orphan) before this worker
+        # was admitted, so no teardown finally will ever run for it: release
+        # EVERY registry the route layer registered for the stream, not just the
+        # owner and writeback rows. STREAM_GOAL_RELATED is written before worker
+        # admission (api/routes.py `_start_chat_stream_for_session`), so a
+        # pre-start cancellation otherwise strands it for the process lifetime.
+        release_stream_owned_registries(stream_id, session_id=session_id)
         return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
@@ -14181,7 +14503,11 @@ def _run_agent_streaming(
                 # Only auto-generate title when still default; preserves user renames
                 if s.title == 'Untitled' or s.title == 'New Chat' or not s.title:
                     s.title = title_from(s.messages, s.title)
-                _bg_title_inputs = _background_title_generation_inputs(s)
+                _bg_title_inputs = None
+                if _background_title_generation_eligible(s):
+                    _u0, _a0 = _title_exchange_for_unresolved_title(s.messages)
+                    if _u0 and _a0:
+                        _bg_title_inputs = (_u0, _a0)
                 # Read token/cost usage from the agent object (if available).
                 # Per-turn overwrite (#1857): replace cumulative session totals with the
                 # agent's most recent values, which already represent the current turn's
@@ -14904,6 +15230,7 @@ def _run_agent_streaming(
                 threading.Thread(
                     target=_run_background_title_update,
                     args=(s.session_id, *_bg_title_inputs, str(s.title or '').strip(), put, agent),
+                    kwargs={'stream_owner_id': session_id},
                     daemon=True,
                 ).start()
             else:
@@ -15581,14 +15908,14 @@ def _run_agent_streaming(
         # restore above.
         _reset_turn_session_identity(_turn_session_identity_tokens)
         with STREAMS_LOCK:
-            STREAMS.pop(stream_id, None)
-            CANCEL_FLAGS.pop(stream_id, None)
-            AGENT_INSTANCES.pop(stream_id, None)  # Clean up agent instance reference
-            STREAM_PARTIAL_TEXT.pop(stream_id, None)  # Clean up partial text buffer (#893)
-            STREAM_REASONING_TEXT.pop(stream_id, None)  # Clean up reasoning trace (#1361 §A)
-            STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)  # Clean up tool calls (#1361 §B)
-            STREAM_GOAL_RELATED.pop(stream_id, None)  # Clean up goal-related flag (#1932)
-            STREAM_LAST_EVENT_ID.pop(stream_id, None)  # Clean up event_id pointer (stage-364)
+            # ONE list for every per-stream registry (#7302 re-gate): this is the
+            # same tuple the chat/start orphan recovery releases, so a registry
+            # added later cannot be popped here and forgotten there (or the
+            # reverse). Per-registry cleanup notes (partial text #893, reasoning
+            # #1361 §A, tool calls #1361 §B, goal flag #1932, event id stage-364)
+            # live with the registries in api/config.py.
+            for _stream_registry in stream_owned_registries():
+                _stream_registry.pop(stream_id, None)
             unregister_active_run(stream_id)
             # Clean up the stream-owner registry so stale stream_id→session_id
             # mappings do not accumulate over thousands of completed streams (#6351).
@@ -15962,6 +16289,13 @@ def cancel_stream(stream_id: str) -> bool:
         # _clear_stale_stream_state() can eventually reclaim the session if the
         # worker is stuck in C-level I/O and never reaches its finally (#6623).
         update_active_run(stream_id, phase="cancelling", cancelled_at=time.time())
+
+        # Stop also ends the launch phase when the worker was never admitted: retire
+        # the claim on this same edge, AFTER the cancellation is published and BEFORE
+        # ownership is detached (#7302 finding 5). Retiring earlier would let a second
+        # chat/start slip in over a turn Stop already cancelled; retiring later leaves
+        # the claim behind, which would block a reuse of this stream id.
+        _live_config.retire_pre_admission_claim_if_owned(stream_id, streams_lock_held=True)
 
         # Stop and Steer share STREAMS_LOCK -> ACTIVE_RUNS_LOCK ordering.
         # Publish cancellation and detach ownership before releasing the edge;
