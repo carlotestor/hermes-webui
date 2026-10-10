@@ -106,17 +106,33 @@ def env(tmp_path, monkeypatch):
     calls = []
     status = {"v": 200}
 
-    def fake_start(sid, prompt, source="process_wakeup"):
+    def fake_start(sid, prompt, source="process_wakeup", on_admitted=None):
         # Records whether any row was committed before the wake turn was persisted.
         calls.append({"sid": sid, "prompt": prompt, "source": source,
                       "committed_before": any(r["consumed"] for r in FakeDB.rows.values())})
-        if status["v"] < 400 and status.get("accept", True):
-            gdw.settle_reservation(sid, accepted=True)  # what the Gateway worker does on acceptance
-        return {"_status": status["v"], "stream_id": "s" if status["v"] < 400 else None}
+        if status["v"] >= 400:
+            return {"_status": status["v"], "stream_id": None}
+        _admit(sid, "s", on_admitted)
+        if status.get("accept", True):
+            gdw.settle_reservation(sid, "s", accepted=True)  # what the Gateway worker does on acceptance
+        return {"_status": status["v"], "stream_id": "s"}
 
     monkeypatch.setattr("api.routes.start_session_turn", fake_start)
     yield calls, status
     models.SESSIONS.clear()
+
+
+def _admit(sid, stream_id, on_admitted):
+    """What _start_chat_stream_for_session does for an admitted turn: hook + save under the lock."""
+    from api.config import _get_session_agent_lock
+    from api.models import get_session
+
+    with _get_session_agent_lock(sid):
+        s = get_session(sid)
+        if on_admitted is not None:
+            on_admitted(s, stream_id)
+        s.active_stream_id = stream_id
+        s.save()
 
 
 def _context(sid="sid1"):
@@ -154,7 +170,9 @@ def test_launched_but_unaccepted_wake_keeps_lease_until_worker_settles(env):
     assert gdw.poll_once(0) == 1
     assert FakeDB.rows[1]["consumed"] is False and FakeDB.rows[1]["lease"] is not None
     assert Session.load("sid1").delegation_reservation["owner"] == gdw.RESERVATION_OWNER
-    gdw.settle_reservation("sid1", accepted=False)  # the worker's teardown: Gateway never accepted
+    gdw.settle_reservation("sid1", "other-stream", accepted=True)  # a different turn's worker: no-op
+    assert FakeDB.rows[1]["consumed"] is False and FakeDB.rows[1]["lease"] is not None
+    gdw.settle_reservation("sid1", "s", accepted=False)  # the worker's teardown: Gateway never accepted
     assert FakeDB.rows[1]["consumed"] is False and FakeDB.rows[1]["lease"] is None
     status["accept"] = True
     gdw._BACKOFF.clear()
@@ -225,7 +243,8 @@ def test_failed_wake_releases_reservation(env, monkeypatch, failure):
     assert Session.load("sid1").delegation_reservation is None
     # Released rows are retried (after the back-off), and the stored copy is not duplicated.
     monkeypatch.setattr("api.routes.start_session_turn",
-                        lambda sid, *_a, **_k: gdw.settle_reservation(sid, True) or {"_status": 200, "stream_id": "s"})
+                        lambda sid, *_a, on_admitted=None, **_k: _admit(sid, "s", on_admitted)
+                        or gdw.settle_reservation(sid, "s", True) or {"_status": 200, "stream_id": "s"})
     gdw._BACKOFF.clear()
     assert gdw.poll_once(0) == 1
     assert FakeDB.rows[1]["consumed"] is True
@@ -370,8 +389,11 @@ def test_gateway_worker_settles_lease_on_profile_gateway(env, tmp_path, monkeypa
     s.save()
     FakeDB.add("sid1", "deleg_w")
     token = FakeDB().reserve_caller_history_deliveries("sid1", gdw.RESERVATION_OWNER, 60)[0]["reservation_token"]
-    gdw._store_results_in_context("sid1", [{"id": 1, "content": "r"}],
-                                  {"db": "x", "token": token, "owner": gdw.RESERVATION_OWNER})
+    s = Session.load("sid1")
+    gdw._publish_results(s, [{"id": 1, "content": "r"}],
+                         {"db": "x", "sid": "sid1", "token": token, "owner": gdw.RESERVATION_OWNER,
+                          "stream_id": "st1"})
+    s.save()
     STREAMS["st1"] = create_stream_channel()
     gateway_chat._run_gateway_chat_streaming("sid1", gdw.WAKE_PROMPT, "m", str(tmp_path), "st1", [])
 
@@ -379,3 +401,128 @@ def test_gateway_worker_settles_lease_on_profile_gateway(env, tmp_path, monkeypa
     assert seen[0][2] is False  # not committed before the Gateway answered
     assert FakeDB.rows[1]["consumed"] is gateway_up
     assert (FakeDB.rows[1]["lease"] is None) and Session.load("sid1").delegation_reservation is None
+
+
+def test_concurrent_human_turn_cannot_consume_the_wake_lease(env, monkeypatch):
+    """Review 5443897300 CORE: a human send admitted before the wake turn must not commit its rows."""
+    calls, _ = env
+    FakeDB.add("sid1", "deleg_race")
+    human_settles = []
+
+    def human_wins(sid, prompt, source="process_wakeup", on_admitted=None):
+        # The human turn took the session first: chat-start answers 409 and never calls the hook.
+        calls.append(prompt)
+        gdw.settle_reservation(sid, "human-stream", accepted=True)  # human run accepted by the Gateway
+        human_settles.append(sid)
+        return {"_status": 409, "stream_id": None}
+
+    monkeypatch.setattr("api.routes.start_session_turn", human_wins)
+    assert gdw.poll_once(0) == 0 and human_settles == ["sid1"]
+    assert FakeDB.rows[1]["consumed"] is False and FakeDB.rows[1]["lease"] is None
+    assert not [m for m in _context() if m.get("_delegation_delivery_id")]  # nothing published
+    assert Session.load("sid1").delegation_reservation is None
+    # The Agent's next-run fold (or a later wake) still delivers the result exactly once.
+    assert [r["id"] for r in FakeDB().claim_caller_history_deliveries("sid1")] == [1]
+
+
+def test_unaccepted_launched_wake_backs_off(env, monkeypatch):
+    """Review 5443897300 SHOULD-FIX A: a wake the Gateway never accepts must not re-wake every poll."""
+    calls, status = env
+    status["accept"] = False
+    clock = [5000.0]
+    monkeypatch.setattr(gdw.time, "time", lambda: clock[0])
+    FakeDB.add("sid1", "deleg_down")
+    for _ in range(4):
+        n = gdw.poll_once(0)
+        if Session.load("sid1").delegation_reservation:
+            gdw.settle_reservation("sid1", "s", accepted=False)  # worker teardown: Gateway down
+        clock[0] += gdw.POLL_INTERVAL_S
+    assert len(calls) == 2  # attempt 1, then one retry after the 10 s back-off; not 4
+    assert gdw._BACKOFF[(str(gdw._profile_state_dbs()[0][1]), "sid1")][0] == 2
+
+
+def test_failed_commit_keeps_lease_and_is_retried(env, monkeypatch):
+    """Greptile 4206021139: the sidecar lease survives a failed commit; the next poll re-commits it."""
+    calls, _ = env
+    FakeDB.add("sid1", "deleg_flaky")
+    real_commit = FakeDB.commit_caller_history_deliveries
+    fail = {"n": 1}
+
+    def flaky(self, token, owner):
+        if fail["n"]:
+            fail["n"] -= 1
+            raise RuntimeError("database is locked")
+        return real_commit(self, token, owner)
+
+    monkeypatch.setattr(FakeDB, "commit_caller_history_deliveries", flaky)
+    assert gdw.poll_once(0) == 1 and FakeDB.rows[1]["consumed"] is False
+    res = Session.load("sid1").delegation_reservation
+    assert res and res["accepted"] is True
+    FakeDB.clock[0] += gdw.RESERVATION_TTL_S + 1  # even after the lease expired
+    assert gdw.poll_once(0) == 0 and len(calls) == 1  # re-committed, not re-woken
+    assert FakeDB.rows[1]["consumed"] is True and Session.load("sid1").delegation_reservation is None
+
+
+def test_in_process_profile_state_db_is_not_scanned(env, monkeypatch):
+    """Review 5443897300 SHOULD-FIX B: no state.db query for profiles not on the Gateway backend."""
+    monkeypatch.setattr(gdw, "_profile_uses_gateway", lambda _p: False)
+    monkeypatch.setattr(gdw, "_pending_session_ids", lambda *_a: pytest.fail("scanned"))
+    FakeDB.add("sid1", "deleg_np")
+    assert gdw.poll_once(0) == 0
+
+
+def test_pending_scan_uses_rowid_high_water_mark(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "s.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, display_kind TEXT,"
+                 " display_metadata TEXT, timestamp REAL)")
+    meta = json.dumps({"delegation_id": "d"})
+    conn.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?)",
+                     [(i, "plain", "user", None, None, 1.0) for i in range(1, 50)]
+                     + [(50, "sidA", "user", "async_delegation_complete", meta, 1.0)])
+    conn.commit()
+    gdw._FLOOR.pop(str(db), None)
+    assert gdw._pending_session_ids(db, 0) == ["sidA"] and gdw._FLOOR[str(db)] == 50
+    conn.execute("UPDATE messages SET display_metadata = json_set(display_metadata, '$.caller_history_consumed', 1)")
+    conn.commit()
+    assert gdw._pending_session_ids(db, 0) == [] and gdw._FLOOR[str(db)] == 51
+    conn.execute("INSERT INTO messages VALUES (51, 'sidB', 'user', 'hidden', ?, 1.0)", (meta,))
+    conn.commit()
+    conn.close()
+    assert gdw._pending_session_ids(db, 0) == ["sidB"]
+
+
+def test_chat_start_runs_on_admitted_only_for_the_admitted_turn(env, monkeypatch):
+    """The real chat-start: a session already streaming answers 409 without publishing the hook."""
+    import api.routes as routes
+    from api.config import STREAMS, create_stream_channel
+
+    hook = []
+    s = Session.load("sid1")
+    s.active_stream_id = "human"
+    s.save()
+    STREAMS["human"] = create_stream_channel()
+    monkeypatch.setattr(routes, "_active_stream_blocks_chat_start", lambda *_a, **_k: True)
+    try:
+        resp = routes._start_chat_stream_for_session(
+            s, msg=gdw.WAKE_PROMPT, workspace="/w", model="m", external_runtime_owned=True,
+            source="process_wakeup", on_admitted=lambda *a: hook.append(a))
+    finally:
+        STREAMS.pop("human", None)
+    assert resp["_status"] == 409 and hook == []
+
+
+def test_gateway_worker_config_is_the_session_profile(tmp_path, monkeypatch):
+    """Review 5443897300 Low: runs-API/reasoning/service-tier settings come from the session profile."""
+    import api.gateway_chat as gateway_chat
+    from api import profiles
+
+    root = tmp_path / "hermes"
+    (root / "profiles" / "work").mkdir(parents=True)
+    (root / "profiles" / "work" / "config.yaml").write_text("agent:\n  reasoning_effort: high\n")
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", root)
+    assert gateway_chat._gateway_config_for_profile("default") is None
+    assert gateway_chat._gateway_config_for_profile("") is None
+    assert gateway_chat._gateway_config_for_profile("work")["agent"]["reasoning_effort"] == "high"
