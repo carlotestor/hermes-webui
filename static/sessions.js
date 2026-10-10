@@ -2099,6 +2099,13 @@ async function newSession(flash, options={}){
         ||((_bareModel&&!_familyMismatch&&!_fallbackIsNamedCustom)?(_fallbackProvider||null):null)
         ||null;
     }
+    // #7865: New Chat replaces S.session without going through loadSession(),
+    // so drop the previous session's explicit-picker evidence here (placed
+    // AFTER the provider fallback assignment on purpose — see the note in
+    // _pickerExplicitPickKey about not disturbing the newSession source-shape
+    // window). The marker must never authorize a provider override for a
+    // different (new) session.
+    if(S.session&&S.session.session_id&&typeof _clearExplicitPickerPick==='function') _clearExplicitPickerPick(S.session.session_id);
     const data=await api('/api/session/new',{method:'POST',body:JSON.stringify(reqBody)});
     if(consumedExplicitModelOverride&&typeof _clearEmptyComposerModelOverride==='function'){
       _clearEmptyComposerModelOverride();
@@ -2273,7 +2280,7 @@ async function loadSession(sid){
   // notifications so extensions always see the canonical session id, not the
   // raw sidebar click id (which may differ after lineage folding).
   if(!opts.skipLineageResolve && typeof _resolveSessionIdFromSidebarLineage==='function'){
-    const resolvedSid=_resolveSessionIdFromSidebarLineage(sid);
+    const resolvedSid=(typeof _sessionUrlTargetsExactSid==='function' && _sessionUrlTargetsExactSid(sid)) ? sid : _resolveSessionIdFromSidebarLineage(sid);
     if(resolvedSid&&resolvedSid!==sid){
       if(!opts._continuationParentSid) opts={...opts,_continuationParentSid:sid};
       sid=resolvedSid;
@@ -2345,6 +2352,22 @@ async function loadSession(sid){
   // triggered compression.
   if(typeof clearCompressionUi==='function') clearCompressionUi();
   else window._compressionUi=null;
+  // #7865: drop the explicit-picker evidence for the session being left. The
+  // marker authorizes _modelProviderForSend to let the dropdown override the
+  // loaded session's provider, so it must never outlive the session it was
+  // written for: a restored session's provider comes from the session itself,
+  // and a stale pick from the previous session would hijack it when the
+  // catalog repaint leaves another provider's identically-valued option
+  // selected (the restore syncs the topbar before the catalog refresh).
+  if(currentSid&&typeof _clearExplicitPickerPick==='function') _clearExplicitPickerPick(currentSid);
+  // #7865: also drop the marker for the session being LOADED, not just the one
+  // being left. The marker lives in sessionStorage, so it survives a page
+  // reload: on a fresh boot S.session is null, so currentSid above is null and
+  // nothing is cleared for the session the boot is restoring. A stale pick
+  // would then survive into the restored session and let the dropdown override
+  // the provider the session itself holds. Clearing the target sid covers both
+  // the fresh-boot restore and the A->B->A round trip.
+  if(sid&&sid!==currentSid&&typeof _clearExplicitPickerPick==='function') _clearExplicitPickerPick(sid);
   // Show loading indicator immediately for responsiveness.
   // Cleared by renderMessages() once full session data arrives.
   // Persist the current composer draft before switching away so it can be
@@ -2380,6 +2403,13 @@ async function loadSession(sid){
     }
   }
   const _keepStaleUntilLoaded = !!opts.keepStaleUntilLoaded && sameSessionForceReload;
+  // #7865: a force-reload (external refresh / state.db change / boot restore of
+  // the SAME session) is also a session load. Clear this session's explicit
+  // picker evidence so the reloaded session's own provider stays authoritative:
+  // the catalog repaint after a restore can leave another provider's
+  // identically-valued option selected, and a surviving pick would let that
+  // option hijack the provider the session record holds.
+  if(sameSessionForceReload&&typeof _clearExplicitPickerPick==='function') _clearExplicitPickerPick(sid);
   if (currentSid !== sid || forceReload) {
     // #3306: When force-reloading the currently-active session (e.g. external
     // poll triggering a refresh), snapshot the existing messages BEFORE we
@@ -4904,6 +4934,10 @@ function _sessionUrlForSid(sid){
     current.searchParams.delete('q');
     current.searchParams.delete('prompt');
     current.searchParams.delete('send');
+    // `exact` is a one-shot child-row new-tab hint (see _markSessionUrlExact),
+    // not a durable page parameter: drop it so it cannot leak into the next
+    // session URL this tab navigates to.
+    current.searchParams.delete('exact');
     const retained=new URLSearchParams();
     current.searchParams.forEach((value,key)=>{
       if(key!=='action'||value!=='new-chat') retained.append(key,value);
@@ -4915,7 +4949,15 @@ function _sessionUrlForSid(sid){
 }
 function _setActiveSessionUrl(sid){
   if(typeof window==='undefined'||!window.history||!sid) return;
-  const next=_sessionUrlForSid(sid);
+  let next=_sessionUrlForSid(sid);
+  // Keep the one-shot exact-target marker while this tab stays on the same
+  // session, so a refresh of a child row's new tab still lands on the child
+  // instead of folding into its compressed parent; switching sessions drops it.
+  if(typeof _sessionUrlRequestsExactTarget==='function' && typeof _markSessionUrlExact==='function'
+     && typeof _sessionIdFromLocation==='function'
+     && _sessionIdFromLocation()===sid && _sessionUrlRequestsExactTarget()){
+    next=_markSessionUrlExact(next);
+  }
   if(next && next!==(window.location.pathname+window.location.search+window.location.hash)){
     let consumeLaunchAction=false;
     try{
@@ -4925,6 +4967,178 @@ function _setActiveSessionUrl(sid){
     const method=consumeLaunchAction?'replaceState':'pushState';
     window.history[method]({session_id:sid},'',next);
   }
+}
+
+/**
+ * Middle-click (or Ctrl/Cmd+click) on a sidebar session row opens that
+ * session's deep link (`/session/<id>`) in a new browser tab instead of
+ * switching the current tab. Boot already resolves the id from the URL
+ * (`_sessionIdFromLocation` + `loadSession(saved)`), so the new tab lands
+ * directly on the session. Never fires for the ⋮ action menu, checkboxes,
+ * tag chips, lineage/child toggles, while renaming, or in batch select mode.
+ */
+// Whether the row's owning agent profile can be loaded in a NEW tab without
+// breaking the tab that issued the gesture. A new tab that boots a session
+// owned by another profile switches the shared `hermes_profile` cookie, so the
+// source tab keeps its session but its next /api/chat/start, approval and
+// metadata calls fail with 409 session_profile_mismatch. With "show sessions
+// from all profiles" off every row belongs to the active profile; with it on,
+// an unknown owner is treated as unverifiable and refused.
+function _newTabOwningProfileAllowed(session){
+  const activeProfile=(typeof S!=='undefined'&&S&&S.activeProfile)?S.activeProfile:'default';
+  const owningProfile=(typeof _sidebarSessionProfileName==='function')?_sidebarSessionProfileName(session):'';
+  // A KNOWN owner is authoritative regardless of the show-all toggle: turning
+  // "show sessions from all profiles" off flips `_showAllProfiles` immediately,
+  // but the sidebar keeps rendering the previous scope's foreign rows until the
+  // refetch lands. A toggle-based shortcut would wave those retained foreign
+  // rows through, switching the shared cookie and 409'ing the source tab. So
+  // always compare a known owner against the active profile.
+  if(owningProfile){
+    return _profileMatchesActiveProfile(owningProfile,activeProfile);
+  }
+  // Unknown owner: allow only when the loaded sidebar cache is definitively a
+  // single-profile scope for the active profile (show-all off). Anything else —
+  // show-all on, no scope, an all-profiles scope, or a different scope profile —
+  // is unverifiable and refused.
+  if(typeof _showAllProfiles!=='undefined'&&_showAllProfiles) return false;
+  const scope=(typeof _allSessionsScope!=='undefined'&&_allSessionsScope)?_allSessionsScope:null;
+  if(!scope||scope.allProfiles!==false) return false;
+  const scopeProfile=(typeof scope.profile==='string')?scope.profile.trim():'';
+  if(!scopeProfile) return false;
+  return _profileMatchesActiveProfile(scopeProfile,activeProfile);
+}
+// Whether this environment can actually open a session in a second window.
+// The native macOS shell (hermes-swift-mac) exposes `window.open` but its
+// WKWebView delegate does not implement `webView(_:createWebViewWith:…)`, so
+// WebKit silently drops the tab (hermes-swift-mac#102). Callers that mutate
+// gesture state before opening must consult this *first*: otherwise they park
+// the gesture to idle and the fall-through _finishSessionGesture early-returns,
+// turning the click into a dead click instead of master's same-tab load.
+function _newTabOpenSupported(){
+  if(typeof window==='undefined'||typeof window.open!=='function') return false;
+  const wk=(window.webkit&&window.webkit.messageHandlers)?window.webkit.messageHandlers:null;
+  if(wk&&(wk.hermesNotify||wk.hermesTheme)) return false; // hermes-swift-mac#102
+  return true;
+}
+// Mark a `/session/<id>` deep link as an *exact* target. Boot honors the marker
+// (see `_sessionUrlRequestsExactTarget`) and loads that id without lineage
+// folding, so a nested child row opened in a new tab lands on the child rather
+// than on its compressed parent's lineage row (#7429 review 2026-10-08).
+function _markSessionUrlExact(url){
+  if(!url||typeof url!=='string') return url;
+  if(/([?&])exact=1(\b|$)/.test(url)) return url;
+  const hashIdx=url.indexOf('#');
+  const head=hashIdx>=0?url.slice(0,hashIdx):url;
+  const tail=hashIdx>=0?url.slice(hashIdx):'';
+  return head+(head.indexOf('?')>=0?'&':'?')+'exact=1'+tail;
+}
+// Whether the current deep link carries the exact-target marker. Boot passes
+// `skipLineageResolve` when it does, mirroring a plain child-row same-tab click
+// (`_openSidebarSession(child, {skipLineageResolve:true})`), so the child row's
+// new tab lands on the child and not on its compressed parent's lineage tip.
+// Ordinary deep links keep the lineage-tip landing an old segment URL expects.
+function _sessionUrlRequestsExactTarget(){
+  if(typeof window==='undefined'||!window.location) return false;
+  try{
+    const qs=new URLSearchParams(window.location.search||'');
+    return qs.get('exact')==='1';
+  }catch(_e){return false;}
+}
+// Lineage folding maps a nested child id onto its compressed parent's row. A tab
+// opened on a child via its exact-target link (`/session/<child>?exact=1`) must
+// keep showing that child on every load of it, not only at boot: browser Back
+// to that entry and same-session refreshes (poll, session-updated) also go
+// through loadSession() (#7429 release review). Only the session the URL names
+// is exempt, so navigating elsewhere from that tab folds lineage as usual.
+function _sessionUrlTargetsExactSid(sid){
+  if(!sid || typeof _sessionUrlRequestsExactTarget!=='function' || typeof _sessionIdFromLocation!=='function') return false;
+  return _sessionUrlRequestsExactTarget() && _sessionIdFromLocation()===sid;
+}
+function _openSessionUrlInNewTab(sid, session, opts){
+  if(!sid||typeof window==='undefined'||typeof window.open!=='function') return false;
+  // Native macOS shell (hermes-swift-mac): its WKWebView delegate does not
+  // implement webView(_:createWebViewWith:…), so WebKit silently drops
+  // window.open(url,'_blank','noopener'), and `noopener` makes window.open
+  // return null so the drop is undetectable here. Treat the embedded shell as
+  // having no multi-window support and decline, so every tap path falls back
+  // to its same-tab load (hermes-swift-mac#102). Drop this once the app
+  // implements the delegate.
+  const _wkHandlers=(typeof window!=='undefined'&&window.webkit&&window.webkit.messageHandlers)?window.webkit.messageHandlers:null;
+  if(_wkHandlers&&(_wkHandlers.hermesNotify||_wkHandlers.hermesTheme)) return false;
+  if(typeof _sessionSelectMode!=='undefined'&&_sessionSelectMode) return false;
+  if(typeof _renamingSid!=='undefined'&&_renamingSid) return false;
+  // Foreign/unknown owning profile: consume the gesture (return true so callers
+  // skip the same-tab path) and surface a notice instead of switching cookies.
+  if(session&&!_newTabOwningProfileAllowed(session)){
+    if(typeof showToast==='function') showToast(t('session_new_tab_other_profile'),3000);
+    return true;
+  }
+  let url=null;
+  try{url=_sessionUrlForSid(sid);}catch(_e){return false;}
+  if(!url) return false;
+  // Child-row call sites pass {exact:true}: the deep link declares the child id
+  // authoritative so boot does not fold it into its compressed parent's row.
+  if(opts&&opts.exact) url=_markSessionUrlExact(url);
+  try{
+    window.open(url,'_blank','noopener');
+    return true;
+  }catch(_e){return false;}
+}
+// Shared choke point for the pointer-tap paths below: returns true when the
+// event was consumed as an open-in-new-tab (caller must skip same-tab open).
+// `opts.exact` (child rows) marks the deep link as the exact target.
+function _consumeSessionNewTabClick(e, sid, session, opts){
+  if(!e||!sid) return false;
+  const isModifiedClick=!!(e.ctrlKey||e.metaKey);
+  const isMiddleClick=(typeof e.button==='number'&&e.button===1)||e.which===2;
+  if(!isModifiedClick&&!isMiddleClick) return false;
+  // The class exclusion list below is the authoritative action-target guard:
+  // every row kind's ⋮ menu lives under `.session-actions` (plus the checkbox,
+  // tag, child/lineage count and lineage-segment controls). The per-row closure
+  // `_isSessionActionTarget` is not visible here and its `typeof` probe never
+  // fired, so it was removed rather than left as a dead check.
+  if(e.target&&e.target.closest){
+    try{
+      if(e.target.closest('.session-actions,.session-select-cb-wrapper,.session-tag,.session-child-count,.session-lineage-count,.session-lineage-segment')) return false;
+    }catch(_e){}
+  }
+  if(typeof _sessionSelectMode!=='undefined'&&_sessionSelectMode) return false;
+  if(typeof _renamingSid!=='undefined'&&_renamingSid) return false;
+  if(typeof e.preventDefault==='function') e.preventDefault();
+  if(typeof e.stopPropagation==='function') e.stopPropagation();
+  return _openSessionUrlInNewTab(sid, session, opts);
+}
+// `auxclick` fires for the middle button where `click` never does; `mousedown`
+// also preventDefaults button-1 so the browser doesn't start autoscroll.
+function _wireSessionNewTabListeners(node, getSid, getSession, opts){
+  if(!node||typeof node.addEventListener!=='function'||typeof getSid!=='function') return;
+  node.addEventListener('auxclick',(e)=>{
+    if(!e) return;
+    const btn=(typeof e.button==='number')?e.button:(e.which===2?1:0);
+    if(btn!==1) return;
+    if(e.target&&e.target.closest){
+      try{
+        if(e.target.closest('.session-actions,.session-select-cb-wrapper,.session-tag,.session-child-count,.session-lineage-count,.session-lineage-segment')) return;
+      }catch(_e2){}
+    }
+    if(typeof e.preventDefault==='function') e.preventDefault();
+    if(typeof e.stopPropagation==='function') e.stopPropagation();
+    _openSessionUrlInNewTab(getSid(), typeof getSession==='function'?getSession():undefined, opts);
+  });
+  node.addEventListener('mousedown',(e)=>{
+    if(!e) return;
+    const btn=(typeof e.button==='number')?e.button:(e.which===2?1:0);
+    if(btn!==1) return;
+    if(e.target&&e.target.closest){
+      try{
+        if(e.target.closest('.session-actions,.session-select-cb-wrapper,.session-tag,.session-child-count,.session-lineage-count,.session-lineage-segment')) return;
+      }catch(_e2){}
+    }
+    // Swallow the middle-button default (autoscroll / back-nav chord) without
+    // claiming the gesture: pointerup's _finishSessionGesture still ignores
+    // button!==0, so no swipe/rename/tap side effects can fire from this.
+    if(typeof e.preventDefault==='function') e.preventDefault();
+  });
 }
 
 // ── Batch select mode ──
@@ -5009,7 +5223,7 @@ function _renderBatchActionBar(){
   // Move
   const moveBtn=document.createElement('button');moveBtn.className='batch-action-btn';
   moveBtn.textContent=t('session_batch_move');
-  moveBtn.onclick=(e)=>{e.stopPropagation();_showBatchProjectPicker();};bar.appendChild(moveBtn);
+  moveBtn.onclick=(e)=>{e.stopPropagation();_showBatchProjectPicker(moveBtn);};bar.appendChild(moveBtn);
   // Delete
   const deleteBtn=document.createElement('button');deleteBtn.className='batch-action-btn batch-action-btn-danger';
   deleteBtn.textContent=t('session_batch_delete');
@@ -5051,19 +5265,19 @@ function _renderBatchActionBar(){
     }catch(e){showToast('Delete failed: '+(e.message||e));}
   };bar.appendChild(deleteBtn);
 }
-function _showBatchProjectPicker(){
+function _showBatchProjectPicker(openerEl){
   const ids=[..._selectedSessions];if(!ids.length)return;
   const bar=$('batchActionBar');if(!bar)return;
   bar.querySelectorAll('.batch-project-picker').forEach(p=>p.remove());
   const picker=document.createElement('div');picker.className='project-picker batch-project-picker';
-  const none=document.createElement('div');none.className='project-picker-item';none.textContent='No project';
+  const none=_projectPickerItem();none.textContent=t('project_picker_none');
   none.onclick=async()=>{picker.remove();
     try{await Promise.all(ids.map(sid=>api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:sid,project_id:null})})));
       showToast('Removed from project');exitSessionSelectMode();await renderSessionList();
     }catch(e){showToast('Move failed: '+(e.message||e));}
   };picker.appendChild(none);
   for(const p of(_allProjects||[])){
-    const item=document.createElement('div');item.className='project-picker-item';
+    const item=_projectPickerItem();
     if(p.color){const dot=document.createElement('span');dot.className='color-dot';
       dot.style.cssText='width:6px;height:6px;border-radius:50%;background:'+p.color+';flex-shrink:0;';item.appendChild(dot);}
     const name=document.createElement('span');name.textContent=p.name;item.appendChild(name);
@@ -5076,6 +5290,13 @@ function _showBatchProjectPicker(){
   bar.appendChild(picker);
   const close=(e)=>{if(!picker.contains(e.target)){picker.remove();document.removeEventListener('click',close);}};
   setTimeout(()=>document.addEventListener('click',close),0);
+  // Escape closes the picker and hands focus back to the Move button (#8044).
+  picker.setAttribute('aria-label',t('session_batch_move'));
+  _wireProjectPickerKeys(picker,()=>{
+    picker.remove();document.removeEventListener('click',close);
+    _focusSessionActionMenuRestoreTarget(openerEl);
+  });
+  _focusProjectPickerItem(picker);
 }
 
 function _focusSessionActionMenuRestoreTarget(target){
@@ -7665,7 +7886,14 @@ function _lineageSegmentsForRender(s,lineageKey,skipCached){
     if(!seg||!seg.session_id||seg.session_id===currentSid||seen.has(seg.session_id)) return;
     if(seg.role==='child_session') return;
     seen.add(seg.session_id);
-    segments.push({...seg});
+    const copy={...seg};
+    // Lineage-report rows are serialised by the owning profile's state DB but
+    // ship without a `profile` field (api/agent_sessions.py), so the new-tab
+    // profile gate would treat them as unverifiable and refuse them under
+    // "show all profiles". Attribute an ownerless segment to the row that owns
+    // the report, which is always in the active profile.
+    if(!(typeof copy.profile==='string'&&copy.profile.trim())&&s&&typeof s.profile==='string'&&s.profile.trim()) copy.profile=s.profile;
+    segments.push(copy);
   };
   for(const seg of (Array.isArray(s&&s._lineage_segments)?s._lineage_segments:[])) addSegment(seg);
   if(!skipCached){
@@ -9179,8 +9407,10 @@ function renderSessionListFromCache(){
         row.title=t('session_lineage_segment_open');
         row.onclick=async(e)=>{
           e.stopPropagation();
+          if(_consumeSessionNewTabClick(e, seg.session_id, seg)) return;
           await _openSidebarSession(seg, {skipLineageResolve:true});
         };
+        _wireSessionNewTabListeners(row, ()=>seg.session_id, ()=>seg);
         lineageList.appendChild(row);
       }
       sessionText.appendChild(lineageList);
@@ -9190,7 +9420,10 @@ function renderSessionListFromCache(){
       childList.className='session-child-sessions';
       ['pointerdown','pointerup','click','touchstart','touchmove','touchend','touchcancel'].forEach(ev=>childList.addEventListener(ev,e=>e.stopPropagation()));
       const sortedChildren=[...s._child_sessions];
-      const openChildSession=async(childSession)=>{
+      const openChildSession=async(childSession, openOpts={})=>{
+        // A child row's deep link must land on the child, not on its
+        // compressed parent's lineage tip: mark the new-tab URL exact.
+        if(openOpts&&openOpts.newTab) return _openSessionUrlInNewTab(childSession.session_id, childSession, {exact:true});
         await _openSidebarSession(childSession, {skipLineageResolve:true});
       };
       const childLabelFor=(child)=>{
@@ -9424,8 +9657,10 @@ function renderSessionListFromCache(){
               return;
             }
             e.stopPropagation();
+            if(_consumeSessionNewTabClick(e, child.session_id, child, {exact:true})) return;
             await openChildSession(child);
           };
+          _wireSessionNewTabListeners(mainBtn, ()=>child.session_id, ()=>child, {exact:true});
           row._startRename=_buildSessionRenameStarter(child, mainBtn, ()=>{
             mainBtn.textContent=childLabelFor(child);
           });
@@ -9476,6 +9711,7 @@ function renderSessionListFromCache(){
             e.stopPropagation();
             _openSessionActionMenu(child, actions||row);
           };
+          _wireSessionNewTabListeners(row, ()=>child.session_id, ()=>child, {exact:true});
           childList.appendChild(row);
           continue;
         }
@@ -9486,8 +9722,10 @@ function renderSessionListFromCache(){
         row.title='Open child session';
         row.onclick=async(e)=>{
           e.stopPropagation();
+          if(_consumeSessionNewTabClick(e, child.session_id, child, {exact:true})) return;
           await openChildSession(child);
         };
+        _wireSessionNewTabListeners(row, ()=>child.session_id, ()=>child, {exact:true});
         childList.appendChild(row);
       }
       sessionText.appendChild(childList);
@@ -9851,11 +10089,42 @@ function renderSessionListFromCache(){
     el.onpointerup=(e)=>{
       if(e.pointerType==='touch') return;
       if(e.pointerType==='mouse' && e.button!==0) return;  // ignore right/middle click
+      if((e.ctrlKey||e.metaKey) && !_sessionSelectMode && !_renamingSid && _gestureState!=='idle' && !_longPressMenuOpened && (typeof _newTabOpenSupported!=='function'||_newTabOpenSupported())){
+        // Ctrl/Cmd+click opens in a new tab; keep the current tab untouched.
+        // Gated on select/rename mode: _consumeSessionNewTabClick refuses
+        // those modes, and mutating gesture state first would make the
+        // fall-through _finishSessionGesture early-return on 'idle',
+        // breaking the row (de)select toggle.
+        // Also gated on _gestureState!=='idle' (a press must have begun on
+        // THIS row: a Ctrl-release over a row the user never pressed on must
+        // do nothing, mirroring _finishSessionGesture's own first check) and
+        // on !_longPressMenuOpened (a pen long-press menu is already open, so
+        // don't stack a new tab on top of it — the open Greptile P1).
+        // Settle the gesture machine first via the shared choke point: a pen
+        // (or touch-emulated) drag may have painted swipe offsets, and a
+        // shaky click may have added the 'dragging' class — parking
+        // _gestureState alone would leave the row visually displaced.
+        // _clearPointerDragState() parks idle, disarms the long-press timer,
+        // and settles swipe paint when a drag was in flight.
+        clearTimeout(_tapTimer);_tapTimer=null;_lastTapTime=0;
+        _clearPointerDragState();
+        el.classList.remove('loading');
+        if(_consumeSessionNewTabClick(e, s.session_id, s)) return;
+      }
       if(_finishSessionGesture(e.clientX,e.clientY,e.target,e.pointerType)) e.stopPropagation();
     };
+    _wireSessionNewTabListeners(el, ()=>s.session_id, ()=>s);
     // Add ondblclick for more reliable double-click detection
     el.ondblclick=(e)=>{
       if(e.pointerType==='mouse' && e.button!==0) return;
+      // A Ctrl/Cmd+double-click is two modified clicks: each pointerup opens
+      // one new tab. Don't also start a rename in the current tab (master
+      // only renamed). Outside select mode, bail entirely.
+      if(typeof _newTabOpenSupported!=='function'||_newTabOpenSupported()){
+        if((e.ctrlKey||e.metaKey) && !_sessionSelectMode) return;
+      }
+      // On a shell with no second window _newTabOpenSupported() is false, so
+      // the bail above is skipped and master's rename path stays.
       if(_renamingSid) return;
       if(actions&&actions.contains(e.target)) return;
       if(_sessionSelectMode){e.stopPropagation();if(!readOnly)toggleSessionSelect(s.session_id);return;}
@@ -10098,9 +10367,8 @@ function _showProjectPicker(session, anchorEl){
   const picker=document.createElement('div');
   picker.className='project-picker';
   // "No project" option
-  const none=document.createElement('div');
-  none.className='project-picker-item'+(!session.project_id?' active':'');
-  none.textContent='No project';
+  const none=_projectPickerItem('',!session.project_id);
+  none.textContent=t('project_picker_none');
   none.onclick=async()=>{
     picker.remove();
     document.removeEventListener('click',close);
@@ -10136,8 +10404,7 @@ function _showProjectPicker(session, anchorEl){
   };
   for(const p of _allProjects){
     if (_profileHidesProject(p.profile)) continue;
-    const item=document.createElement('div');
-    item.className='project-picker-item'+(session.project_id===p.project_id?' active':'');
+    const item=_projectPickerItem('',session.project_id===p.project_id);
     if(p.color){
       const dot=document.createElement('span');
       dot.className='color-dot';
@@ -10162,9 +10429,8 @@ function _showProjectPicker(session, anchorEl){
     picker.appendChild(item);
   }
   // "+ New project" shortcut at the bottom
-  const createItem=document.createElement('div');
-  createItem.className='project-picker-item project-picker-create';
-  createItem.textContent='+ New project';
+  const createItem=_projectPickerItem('project-picker-create');
+  createItem.textContent=t('project_picker_new');
   createItem.onclick=async()=>{
     picker.remove();
     document.removeEventListener('click',close);
@@ -10196,26 +10462,198 @@ function _showProjectPicker(session, anchorEl){
   // Append to body and position using getBoundingClientRect so it isn't clipped
   // by overflow:hidden on .session-item ancestors
   document.body.appendChild(picker);
-  const rect=anchorEl.getBoundingClientRect();
   picker.style.position='fixed';
   picker.style.zIndex='999';
-  // Prefer opening below; flip above if too close to bottom of viewport
-  const spaceBelow=window.innerHeight-rect.bottom;
-  if(spaceBelow<160&&rect.top>160){
-    picker.style.bottom=(window.innerHeight-rect.top+4)+'px';
-    picker.style.top='auto';
-  }else{
-    picker.style.top=(rect.bottom+4)+'px';
-    picker.style.bottom='auto';
+  _positionProjectPicker(picker,anchorEl);
+  // Close on outside click
+  const close=(e)=>{if(!picker.contains(e.target)&&e.target!==anchorEl){picker.remove();document.removeEventListener('click',close);}};
+  setTimeout(()=>document.addEventListener('click',close),0);
+  // Keyboard (#8044): arrows move between the rows, Escape closes the picker
+  // and hands focus back to the conversation's ⋮ trigger.
+  picker.setAttribute('aria-label',t('session_move_project'));
+  const dismiss=(opts)=>{
+    picker.remove();
+    document.removeEventListener('click',close);
+    // Not to a row that is going out of sight with its sidebar.
+    if(opts&&opts.restoreFocus===false) return;
+    _focusSessionActionMenuRestoreTarget(_projectPickerFocusReturnTarget(session,anchorEl));
+  };
+  _wireProjectPickerKeys(picker,dismiss);
+  _openProjectPicker={picker,anchorEl,sessionId:session.session_id,dismiss};
+  _focusProjectPickerItem(picker);
+}
+
+// The open single-conversation picker, for the resize listener below. A closed
+// picker is found out by being detached, so no close path has to clear this.
+let _openProjectPicker=null;
+
+function _positionProjectPicker(picker, anchorEl){
+  const rect=anchorEl.getBoundingClientRect();
+  // Placed as _positionSessionActionMenu places the ⋮ menu: below the anchor,
+  // above it when that fits whole, else slid up over the anchor until it fits.
+  // Natural height first (the CSS already caps it at 100dvh - 16px).
+  picker.style.maxHeight='';
+  const pickerH=picker.offsetHeight||0;
+  const margin=8;
+  const maxAvail=window.innerHeight-margin*2;
+  let top=rect.bottom+4;
+  if(top+pickerH>window.innerHeight-margin && rect.top>pickerH+12){
+    top=rect.top-pickerH-4;            // flip above when there is room
   }
+  if(pickerH>maxAvail){
+    picker.style.maxHeight=maxAvail+'px'; // taller than the screen: pin and scroll
+    top=margin;
+  }else{
+    if(top+pickerH>window.innerHeight-margin) top=window.innerHeight-margin-pickerH;
+    if(top<margin) top=margin;         // slide to fit, overlapping the anchor
+  }
+  picker.style.top=top+'px';
+  picker.style.bottom='auto';
   // Align right edge of picker with right edge of button; keep within viewport
   const pickerW=Math.min(220,Math.max(160,picker.scrollWidth||160));
   let left=rect.right-pickerW;
   if(left<8) left=8;
   picker.style.left=left+'px';
-  // Close on outside click
-  const close=(e)=>{if(!picker.contains(e.target)&&e.target!==anchorEl){picker.remove();document.removeEventListener('click',close);}};
-  setTimeout(()=>document.addEventListener('click',close),0);
+}
+
+// An open picker follows a resize or a rotation, as the ⋮ menu does. A sidebar
+// repaint may have replaced the row it was opened from: place it by the row
+// that conversation has now.
+window.addEventListener('resize',()=>{
+  const open=_openProjectPicker;
+  if(!open) return;
+  if(!open.picker.isConnected){
+    _openProjectPicker=null;
+    return;
+  }
+  // On the next frame: boot.js collapses the sidebar in a resize listener of
+  // its own, which runs after this one.
+  requestAnimationFrame(()=>{
+    if(!open.picker.isConnected) return;
+    let anchor=open.anchorEl;
+    if(!anchor.isConnected){
+      // The row for a long press, the row's own ⋮ trigger for a picker opened from one.
+      anchor=_findSessionRenameRow(open.sessionId);
+      if(anchor&&open.anchorEl.classList.contains('session-actions-trigger')){
+        anchor=_projectPickerFocusReturnTarget({session_id:open.sessionId},null)||anchor;
+      }
+    }
+    // A resize can hide the sidebar the row is in. The row is then still laid
+    // out for a moment, inside a sidebar that fades or slides out of sight, so
+    // the hidden state is read from what hides it, and focus is not handed
+    // back to the row.
+    if(!anchor||!anchor.offsetParent||_projectPickerSidebarHidden(anchor)){
+      open.dismiss({restoreFocus:false});
+      return;
+    }
+    _positionProjectPicker(open.picker,anchor);
+    // A shorter window can cap the picker's height over the row the keyboard is on.
+    const focused=document.activeElement;
+    if(focused&&open.picker.contains(focused)) _focusProjectPickerRow(open.picker,focused);
+  });
+});
+
+// Whether the sidebar that holds `el` is out of sight: collapsed at desktop
+// widths (a turned phone closes the drawer and collapses it), or a drawer that
+// is not open at phone widths (a large phone turned upright, a window narrowed
+// below boot.js's 641px).
+function _projectPickerSidebarHidden(el){
+  const sidebar=el.closest('.sidebar');
+  if(!sidebar||sidebar.classList.contains('mobile-open')) return false;
+  if(sidebar.closest('.layout.sidebar-collapsed')) return true;
+  return typeof _isDesktopWidth==='function'&&!_isDesktopWidth();
+}
+
+// ── Project picker rows and keyboard (#8044) ────────────────────────────
+// A picker row is a real button, so Tab reaches it and Enter/Space activate
+// it. `active` is the session's current project: the single-session picker
+// passes a boolean and the row becomes a checked radio item; the batch picker
+// passes nothing, since several sessions have no one current project.
+function _projectPickerItem(extraClass, active){
+  const item=document.createElement('button');
+  item.type='button';
+  item.className='project-picker-item'+(extraClass?' '+extraClass:'')+(active?' active':'');
+  if(typeof active==='boolean'){
+    item.setAttribute('role','menuitemradio');
+    item.setAttribute('aria-checked',active?'true':'false');
+  }else{
+    item.setAttribute('role','menuitem');
+  }
+  return item;
+}
+
+// Menu keys for a project picker, as on the session ⋮ menu: ArrowDown/ArrowUp
+// wrap, Home/End jump, Escape runs `onEscape`. Tab closes the menu too and is
+// then left to the browser, so focus moves on from where the picker was opened
+// instead of leaving an open picker behind that no key can reach any more.
+function _wireProjectPickerKeys(picker, onEscape){
+  picker.setAttribute('role','menu');
+  const pickerItems=()=>Array.from(picker.querySelectorAll('.project-picker-item:not([disabled])'));
+  picker.addEventListener('keydown',e=>{
+    if(e.key==='Escape'){
+      e.preventDefault();
+      e.stopPropagation();
+      onEscape();
+      return;
+    }
+    if(e.key==='Tab'){
+      onEscape();
+      return;
+    }
+    const items=pickerItems();
+    if(!items.length) return;
+    const currentIndex=Math.max(0,items.indexOf(document.activeElement));
+    let nextIndex=null;
+    if(e.key==='ArrowDown') nextIndex=(currentIndex+1)%items.length;
+    else if(e.key==='ArrowUp') nextIndex=(currentIndex-1+items.length)%items.length;
+    else if(e.key==='Home') nextIndex=0;
+    else if(e.key==='End') nextIndex=items.length-1;
+    if(nextIndex===null) return;
+    e.preventDefault();
+    _focusProjectPickerRow(picker,items[nextIndex]);
+  });
+}
+
+// Focus a row and bring it into the picker's own scroll box. The focus itself
+// must not scroll (that would move the sidebar or the page), so a row past the
+// edge of a long, scrolling picker is revealed here instead.
+function _focusProjectPickerRow(picker, row){
+  if(!_focusSessionActionMenuRestoreTarget(row)) return false;
+  // Inside the picker's border, or the edge row's focus ring is clipped.
+  const top=picker.getBoundingClientRect().top+picker.clientTop;
+  const bottom=top+picker.clientHeight;
+  const rect=row.getBoundingClientRect();
+  if(rect.top<top) picker.scrollTop-=top-rect.top;
+  else if(rect.bottom>bottom) picker.scrollTop+=rect.bottom-bottom;
+  // With a mouse the batch picker is no scroll box: it grows inside the
+  // conversation list, and the list is what brings its row onto the screen.
+  row.scrollIntoView({block:'nearest'});
+  return true;
+}
+
+// On open, focus lands on the session's current project, else on the first row.
+function _focusProjectPickerItem(picker){
+  const target=picker.querySelector('.project-picker-item.active')||picker.querySelector('.project-picker-item');
+  return _focusProjectPickerRow(picker,target);
+}
+
+// Where focus returns when a session's picker closes: the conversation's ⋮
+// trigger. The picker is anchored on that trigger, or, after a right click or
+// a long press, on the row or its actions box, which hold the trigger but
+// cannot take focus themselves. The sidebar may also have been repainted
+// since, which replaces all of them: then it is the trigger of the row now
+// showing the session.
+function _projectPickerFocusReturnTarget(session, anchorEl){
+  const triggerOf=el=>{
+    if(!el||!el.isConnected) return null;
+    if(el.classList&&el.classList.contains('session-actions-trigger')) return el;
+    // An expanded parent row also holds its fork children's rows, each with a
+    // trigger of its own, and they come before the parent's in the DOM. Only
+    // the row's own trigger will do: a child of the actions box, which is a
+    // child of the row.
+    return el.querySelector(':scope > .session-actions-trigger, :scope > .session-actions > .session-actions-trigger');
+  };
+  return triggerOf(anchorEl)||triggerOf(_findSessionRenameRow(session&&session.session_id));
 }
 
 // Resize a .project-create-input to fit its current value (or placeholder).
