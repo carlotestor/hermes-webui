@@ -1869,11 +1869,24 @@ def test_gateway_tool_full_args_and_result_supersede_preview():
     assert completed["snippet"] == long_out
 
 
-def test_gateway_tool_completed_without_result_keeps_preview_only():
+def test_gateway_tool_completed_without_result_persists_preview_as_snippet():
     _, completed = _gateway_tool_progress_event(
         {"event": "tool.completed", "tool": "terminal", "preview": "short"}
     )
-    assert "snippet" not in completed and completed["preview"] == "short"
+    assert completed["snippet"] == "short" and completed["preview"] == "short"
+    stream_id = "snap-preview-only"
+    STREAM_LIVE_TOOL_CALLS[stream_id] = []
+    try:
+        gateway_chat._note_live_gateway_event(stream_id, *_gateway_tool_progress_event(
+            {"event": "tool.started", "tool": "terminal", "preview": "ls", "tool_call_id": "c1"}))
+        gateway_chat._note_live_gateway_event(stream_id, *_gateway_tool_progress_event(
+            {"event": "tool.completed", "tool": "terminal", "preview": "a.txt", "tool_call_id": "c1"}))
+        answer = {"role": "assistant", "content": "done", "timestamp": 1}
+        session = type("S", (), {"messages": [{"role": "user", "content": "q"}, dict(answer)], "tool_calls": []})()
+        gateway_chat._persist_gateway_turn_tool_calls(session, answer, STREAM_LIVE_TOOL_CALLS[stream_id])
+        assert [tc["snippet"] for tc in session.tool_calls] == ["a.txt"]
+    finally:
+        STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
 
 
 def test_runs_api_live_snapshot_keeps_completed_result_snippet():

@@ -586,7 +586,7 @@ def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
         # Full result when the Gateway sends one, else the bounded preview, so saved cards keep the output.
         from api.streaming import _tool_result_snippet
         result = payload.get("result")
-        snippet = _tool_result_snippet(result) if result is not None else ""
+        snippet = _tool_result_snippet(result if result is not None else (preview or ""))
         if snippet:
             event_payload["snippet"] = snippet
     if tid:
