@@ -1702,7 +1702,8 @@ let _steerUploadCache = null; // { sid, sig, paths }
 // Gateway steers whose outcome is unknown, by owner session, so a later
 // pending_steer_leftover carrying this submission can mark them delivered.
 // owned = the exact draft {text, files} this steer restored for its owner.
-const _steerUncertainBySid = new Map(); // sid -> { text, delivered, settled, ended, owned, rev }
+// Several may be outstanding per session: each keeps its own record.
+const _steerUncertainBySid = new Map(); // sid -> Set<{ text, delivered, settled, ended, owned, rev }>
 // Steers the Gateway accepted for the owner's current run. A leftover joins
 // pending submissions with "\n", so these claim their lines before an uncertain
 // steer may match (an accepted steer's lines are not proof for another one).
@@ -1724,31 +1725,43 @@ function _steerDraftIsRetiring(sid, text, files){
   return !!owned&&owned.rev===_steerDraftRevision(sid)&&_steerOwnedPayloadMatches(owned,text,files);
 }
 
+function _steerUncertainDrop(sid, entry){
+  const set=_steerUncertainBySid.get(sid);
+  if(!set||!set.delete(entry))return false;
+  if(!set.size)_steerUncertainBySid.delete(sid);
+  return true;
+}
+
 function _steerLines(text){
   return String(text||'').trim().split('\n').map(x=>x.trim());
 }
 
-function _steerFindRun(lines, want, free){
-  for(let i=0;i+want.length<=lines.length;i++){
-    if(want.every((w,j)=>free[i+j]&&lines[i+j]===w))return i;
-  }
-  return -1;
-}
-
-// The Agent joins several pending steers with "\n". Each accepted submission
-// first claims one contiguous run of the leftover's lines; text matches only when
-// its lines appear as a contiguous run of the lines left unclaimed. Ambiguous
-// membership (e.g. the text is an interior line of an accepted multiline steer,
-// or spans two separately accepted steers) therefore keeps the recovery draft.
-function _steerLeftoverContains(leftover, text, accepted){
+// The Agent joins its unconsumed steers with "\n", so a leftover is a sequence
+// of whole submitted bodies (each at most once; accepted ones may already have
+// been consumed) plus text this tab never sent. Explain the leftover with the
+// fewest unexplained lines over every such split: text was delivered only if
+// every best split uses it. Any equally good split without it (an interior or
+// prefix of an accepted body, two accepted steers spelling it) keeps recovery.
+const _STEER_MATCH_MAX_BODIES = 12;
+function _steerLeftoverContains(leftover, text, others){
   const lines=_steerLines(leftover);
-  const free=lines.map(()=>true);
-  for(const other of (Array.isArray(accepted)?accepted:[])){
-    const want=_steerLines(other);
-    const at=_steerFindRun(lines,want,free);
-    if(at>=0)for(let j=0;j<want.length;j++)free[at+j]=false;
-  }
-  return _steerFindRun(lines,_steerLines(text),free)>=0;
+  const want=_steerLines(text);
+  const bodies=[want].concat((Array.isArray(others)?others:[]).slice(-_STEER_MATCH_MAX_BODIES).map(_steerLines));
+  const memo=new Map();
+  const best=(pos,used,withWant)=>{
+    if(pos>=lines.length)return 0;
+    const key=withWant+'|'+pos+'|'+used;
+    if(memo.has(key))return memo.get(key);
+    let m=1+best(pos+1,used,withWant);
+    for(let i=withWant?0:1;i<bodies.length;i++){
+      const b=bodies[i];
+      if(used&(1<<i)||pos+b.length>lines.length)continue;
+      if(b.every((w,j)=>lines[pos+j]===w))m=Math.min(m,best(pos+b.length,used|(1<<i),withWant));
+    }
+    memo.set(key,m);
+    return m;
+  };
+  return best(0,0,1)<best(0,0,0);
 }
 
 function _steerDraftRevision(sid){
@@ -1759,10 +1772,10 @@ function _steerDraftRevision(sid){
 // this, so an undelivered settled record can never reconcile. Drop it.
 function _steerSettleTerminal(sid){
   _steerAcceptedBySid.delete(sid);
-  const entry=_steerUncertainBySid.get(sid);
-  if(!entry)return;
-  if(entry.settled)_steerUncertainBySid.delete(sid);
-  else entry.ended=true;
+  for(const entry of [...(_steerUncertainBySid.get(sid)||[])]){
+    if(entry.settled)_steerUncertainDrop(sid,entry);
+    else entry.ended=true;
+  }
 }
 
 // Retire only the draft this steer restored: the visible composer when it still
@@ -1773,8 +1786,9 @@ function _steerClearVisibleOwned(sid, owned){
   if(!_steerOwnerIsCurrent(sid))return;
   const inp=$('msg');
   const staged=typeof S!=='undefined'&&Array.isArray(S.pendingFiles)?S.pendingFiles:[];
-  if(inp&&_steerOwnedPayloadMatches(owned,inp.value,staged)){
+  if(inp&&owned.rev===_steerDraftRevision(sid)&&_steerOwnedPayloadMatches(owned,inp.value,staged)){
     inp.value='';
+    if(typeof _noteComposerDraftPayload==='function')_noteComposerDraftPayload(sid,'',[]);
     if(typeof autoResize==='function')autoResize();
     if(staged.length){
       S.pendingFiles=[];
@@ -1786,9 +1800,15 @@ function _steerClearVisibleOwned(sid, owned){
   if(rec)rec.remove();
 }
 
+// owned.rev is the draft revision the recovery restored; a draft saved since
+// then (even an identical retype) is newer and is never cleared or cancelled.
 function _steerRetireOwnedDraft(sid, owned){
   if(!owned)return Promise.resolve();
-  const retiring={text:owned.text,files:owned.files,rev:_steerDraftRevision(sid)};
+  const retiring={text:owned.text,files:owned.files,rev:owned.rev};
+  if(retiring.rev!==_steerDraftRevision(sid)){
+    _steerClearVisibleOwned(sid,retiring);  // removes only the recovery chip
+    return Promise.resolve();
+  }
   _steerRetiringBySid.set(sid,retiring);
   _steerClearVisibleOwned(sid,retiring);
   const settle=cleared=>{
@@ -1806,13 +1826,17 @@ function _steerRetireOwnedDraft(sid, owned){
 // or uncertain steer means it was delivered. Before the response: mark it so the
 // response settles. After the response: retire the restored draft and settle.
 function _steerReconcileLeftover(sid, text){
-  const entry=_steerUncertainBySid.get(sid);
-  if(!entry||!_steerLeftoverContains(text,entry.text,_steerAcceptedBySid.get(sid)))return false;
-  entry.delivered=true;
-  if(!entry.settled)return true;
-  _steerUncertainBySid.delete(sid);
-  _steerRetireOwnedDraft(sid,entry.owned);
-  return true;
+  const entries=[...(_steerUncertainBySid.get(sid)||[])];
+  const accepted=_steerAcceptedBySid.get(sid)||[];
+  const proven=entries.filter(entry=>_steerLeftoverContains(text,entry.text,
+    accepted.concat(entries.filter(o=>o!==entry).map(o=>o.text))));
+  for(const entry of proven){
+    entry.delivered=true;
+    if(!entry.settled)continue;
+    _steerUncertainDrop(sid,entry);
+    _steerRetireOwnedDraft(sid,entry.owned);
+  }
+  return proven.length>0;
 }
 function _steerFilesSignature(files){
   try{
@@ -1893,7 +1917,8 @@ async function _trySteer(msg, explicitSteer){
     return false;
   }
   const inflight={text:steerText,delivered:false,settled:false,ended:false,owned:null,rev:_steerDraftRevision(ownerSid)};
-  _steerUncertainBySid.set(ownerSid,inflight);
+  if(!_steerUncertainBySid.has(ownerSid))_steerUncertainBySid.set(ownerSid,new Set());
+  _steerUncertainBySid.get(ownerSid).add(inflight);
   try{
     result=await api('/api/chat/steer',{
       method:'POST',
@@ -1904,19 +1929,19 @@ async function _trySteer(msg, explicitSteer){
     result={accepted:false, fallback:'network_error'};
   }
   const uncertain=!!(result&&result.fallback==='gateway_steer_uncertain');
-  if(!uncertain&&_steerUncertainBySid.get(ownerSid)===inflight)_steerUncertainBySid.delete(ownerSid);
+  if(!uncertain)_steerUncertainDrop(ownerSid,inflight);
   if(uncertain&&inflight.delivered){
     // The Gateway already handed this text back as a queued leftover: it was
     // delivered. Nothing was restored; clear the saved draft only if it is still
     // the submitted text, so a draft typed during the await survives.
-    if(_steerUncertainBySid.get(ownerSid)===inflight)_steerUncertainBySid.delete(ownerSid);
+    _steerUncertainDrop(ownerSid,inflight);
     _steerUploadCache=null;
     if(_steerDraftRevision(ownerSid)===inflight.rev){
       // No draft saved since submit: clear like an accepted steer (also drops a
       // debounced prefix of the submitted text).
       if(typeof _clearComposerDraft==='function') _clearComposerDraft(ownerSid,_steerRestoreText(originalMsg,explicitSteer),pendingFilesSnapshot);
     }else{
-      _steerRetireOwnedDraft(ownerSid,{text:_steerRestoreText(originalMsg,explicitSteer),files:pendingFilesSnapshot});
+      _steerRetireOwnedDraft(ownerSid,{text:_steerRestoreText(originalMsg,explicitSteer),files:pendingFilesSnapshot,rev:_steerDraftRevision(ownerSid)});
     }
     return true;
   }
@@ -1982,6 +2007,7 @@ async function _trySteer(msg, explicitSteer){
     if(inp&&inp.value&&inp.value!==restoreText)restored=false;
     if(inp&&restored){
       inp.value=restoreText;
+      if(typeof _noteComposerDraftPayload==='function')_noteComposerDraftPayload(ownerSid,restoreText,pendingFilesSnapshot);
       if(typeof autoResize==='function')autoResize();
     }
     if(typeof renderTray==='function')renderTray();
@@ -1989,11 +2015,11 @@ async function _trySteer(msg, explicitSteer){
     await _steerPersistDraftForOwner(ownerSid,originalMsg,explicitSteer,pendingFilesSnapshot);
   }
   if(uncertain){
-    inflight.owned=restored?{text:restoreText,files:pendingFilesSnapshot}:null;
+    // rev identifies the restored draft itself; later saves are newer drafts.
+    inflight.owned=restored?{text:restoreText,files:pendingFilesSnapshot,rev:_steerDraftRevision(ownerSid)}:null;
     inflight.settled=true;
     // A leftover or run end may have arrived during the draft persist above.
-    if((inflight.delivered||inflight.ended)&&_steerUncertainBySid.get(ownerSid)===inflight){
-      _steerUncertainBySid.delete(ownerSid);
+    if((inflight.delivered||inflight.ended)&&_steerUncertainDrop(ownerSid,inflight)){
       if(inflight.delivered)_steerRetireOwnedDraft(ownerSid,inflight.owned);
     }
   }

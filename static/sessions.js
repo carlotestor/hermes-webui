@@ -43,11 +43,21 @@ const _DRAFT_SAVE_DELAY_MS = 400;
 const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
 const _composerDraftKnownPayloadSessions = new Set();
 const _composerDraftRestoreSuppressedUntilBySid = new Map();
-// Bumped on every non-empty draft save, so callers can tell whether a newer
-// draft was saved for a session since they last looked.
+// Bumped when a non-empty draft differing from the composer's last known
+// payload is saved, so callers can tell whether a newer draft exists. Re-saving
+// the same payload (e.g. an autosave of a restored draft) is not newer.
 const _composerDraftRevBySid = new Map();
+const _composerDraftLastPayloadBySid = new Map();
 function _composerDraftRevision(sid) { return _composerDraftRevBySid.get(sid) || 0; }
-function _bumpComposerDraftRevision(sid) { _composerDraftRevBySid.set(sid, _composerDraftRevision(sid) + 1); }
+function _noteComposerDraftPayload(sid, text, files) {
+  _composerDraftLastPayloadBySid.set(sid, _composerDraftPayloadSignature(String(text || ''), _composerDraftFilesForPersist(files)));
+}
+function _bumpComposerDraftRevision(sid, text, files) {
+  const sig = _composerDraftPayloadSignature(text, files);
+  if (_composerDraftLastPayloadBySid.get(sid) === sig) return;
+  _composerDraftLastPayloadBySid.set(sid, sig);
+  _composerDraftRevBySid.set(sid, _composerDraftRevision(sid) + 1);
+}
 const _COMPOSER_DRAFT_RESTORE_SUPPRESS_MS = 30000;
 
 function _composerDraftFileSignature(file) {
@@ -233,7 +243,9 @@ function _saveComposerDraft(sid, text, files) {
   if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
     _clearComposerDraftRestoreSuppression(sid);
     _composerDraftKnownPayloadSessions.add(sid);
-    _bumpComposerDraftRevision(sid);
+    _bumpComposerDraftRevision(sid, normalizedText, normalizedFiles);
+  } else {
+    _noteComposerDraftPayload(sid, '', []);
   }
   _draftSaveTimerSid = sid;
   _draftSaveTimerPayload = _composerDraftPayloadSignature(normalizedText, normalizedFiles);
@@ -279,7 +291,9 @@ function _saveComposerDraftNow(sid, text, files) {
   const normalizedFiles = _composerDraftFilesForPersist(files);
   if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
     _clearComposerDraftRestoreSuppression(sid);
-    _bumpComposerDraftRevision(sid);
+    _bumpComposerDraftRevision(sid, normalizedText, normalizedFiles);
+  } else {
+    _noteComposerDraftPayload(sid, '', []);
   }
   // Most chat switches leave an empty composer. Avoid putting the switch path
   // behind a network POST unless there is new local draft content or an existing

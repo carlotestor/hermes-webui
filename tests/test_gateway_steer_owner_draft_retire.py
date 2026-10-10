@@ -336,3 +336,62 @@ assert.equal(inp.value,'alpha\nbeta','separate accepted steers are not proof for
 emitLeftover('alpha\nbeta\nalpha\nbeta');await tick();await tick();
 assert.equal(inp.value,'');assert.equal(_steerUncertainBySid.size,0);
 ''')
+
+
+def test_consumed_substring_then_pending_multiline_keeps_uncertain_prefix():
+    # Review 5441028456 item 1: 'guidance' was accepted and consumed, the pending
+    # multiline accepted body is the whole leftover, so 'accepted intro' is unproven.
+    _run(r"""
+steerReplies.push({accepted:true,fallback:null,stream_id:'runA'},{accepted:true,fallback:null,stream_id:'runA'});
+assert.equal(await _trySteer('guidance',false),true);
+assert.equal(await _trySteer('accepted intro\nguidance\naccepted outro',false),true);
+inp.value='';const p=_trySteer('accepted intro',false);releaseSteer();assert.equal(await p,false);
+assert.equal(inp.value,'accepted intro');
+emitLeftover('accepted intro\nguidance\naccepted outro');await tick();await tick();
+assert.equal(inp.value,'accepted intro','unproven uncertain steer keeps its recovery draft');
+assert.equal(_steerUncertainBySid.size,1);
+""")
+
+
+def test_uncertain_multiline_found_after_overlapping_accepted_steer():
+    # Greptile 4205694547: uncertain 'a\nb' + accepted 'a' -> leftover 'a\nb\na'.
+    _run(r"""
+inp.value='';const p=_trySteer('a\nb',false);releaseSteer();assert.equal(await p,false);
+assert.equal(inp.value,'a\nb');
+steerReplies.push({accepted:true,fallback:null,stream_id:'runA'});
+inp.value='a\nb';assert.equal(await _trySteer('a',false),true);
+emitLeftover('a\nb\na');await tick();await tick();await tick();
+assert.equal(inp.value,'','delivered uncertain steer retired');assert.equal(_steerUncertainBySid.size,0);
+""")
+
+
+def test_later_uncertain_steer_does_not_replace_earlier_recovery_record():
+    # Greptile 4205443403: a second uncertain steer must not drop the first's record.
+    _run(r"""
+const p1=submitSteer();releaseSteer();assert.equal(await p1,false);
+assert.equal(inp.value,'guidance');
+// Second steer sent while the first's recovery draft is still shown.
+assert.equal(await _trySteer('second',false),false);
+assert.equal(inp.value,'guidance');assert.equal(_steerUncertainBySid.get('A').size,2);
+emitLeftover('guidance');await tick();await tick();await tick();
+assert.equal(inp.value,'','first steer recovery retired');
+assert.equal(_steerUncertainBySid.get('A').size,1,'second steer still tracked');
+emitLeftover('second');await tick();await tick();
+assert.equal(_steerUncertainBySid.size,0);
+assert.deepEqual(queues.A,['guidance','second']);
+""")
+
+
+def test_erase_and_retype_identical_draft_before_leftover_keeps_pending_save():
+    # Review 5441028456 item 2: the retyped draft is newer, not the restored one.
+    _run(r"""
+const p=submitSteer();releaseSteer();assert.equal(await p,false);
+assert.equal(inp.value,'guidance');
+inp.value='';_saveComposerDraft('A',inp.value,[]);          // user clears (input event)
+inp.value='guidance';_saveComposerDraft('A',inp.value,[]);  // and deliberately retypes it
+emitLeftover('guidance');await tick();await tick();await tick();
+assert.equal(inp.value,'guidance','newer identical draft stays visible');
+await sleep(450);
+assert.equal(drafts.A&&drafts.A.text,'guidance','newer identical draft save still lands');
+finalChecks();
+""")

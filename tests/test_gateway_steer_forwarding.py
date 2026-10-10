@@ -171,6 +171,8 @@ def test_reattach_status_replays_unconsumed_gateway_steer(monkeypatch, state):
                         lambda *a: {"status": state, "output": "ok", "pending_steer": "go left"})
     monkeypatch.setattr(gateway_chat, "update_active_run", lambda *a, **k: None)
     monkeypatch.setattr("api.route_approvals.settle_gateway_pending_run", lambda *a, **k: None)
+    # The cancelled lane also persists the turn (covered by test_gateway_events_watchdog_7978).
+    monkeypatch.setattr(gateway_chat, "_settle_gateway_cancelled_turn", lambda *a, **k: None)
     try:
         gateway_chat._await_gateway_run_result(
             "sid", "rs", "run_9", "http://x", "", put_gateway_event=lambda e, d: events.append((e, d)),
