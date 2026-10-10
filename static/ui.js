@@ -20819,7 +20819,7 @@ function _syncToolCallGroupSummary(group){
         : _activitySettledProcessedLabel(group);
       label.textContent=processedLabel||t('processed_elapsed','');
       // A running subagent's open worklog is live work, not processed work.
-      if(group.getAttribute('data-subagent-running')==='1') label.textContent='Running';
+      if(group.getAttribute('data-subagent-running')==='1') label.textContent=t('gateway_running_label');
     }else{
       const rows=Array.from(group.querySelectorAll('.tool-card-row'));
       // Prefer the live _tcData classification; fall back to the durable data-*

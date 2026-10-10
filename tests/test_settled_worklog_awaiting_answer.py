@@ -10,8 +10,10 @@ folded into one "Processed" block. Every other session keeps one collapsed workl
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -156,7 +158,7 @@ def test_running_marked_worklog_is_labelled_running_not_processed():
         const _toolWorklogListEl = () => null, _syncToolWorklogToolGroup = () => {{}};
         const _activitySettledProcessedLabel = () => 'Processed in 4s';
         const _activityProcessedElapsedLabel = () => '';
-        const t = (k, v) => 'Processed ' + v;
+        const t = (k, v) => (k === 'gateway_running_label' ? 'In esecuzione' : 'Processed ' + v);
         eval({json.dumps(sync)});
         const out = [];
         _syncToolCallGroupSummary(mk({{ 'data-tool-worklog-group': '1', 'data-subagent-running': '1' }}));
@@ -166,7 +168,17 @@ def test_running_marked_worklog_is_labelled_running_not_processed():
         console.log(JSON.stringify(out));
         """
     )
-    assert json.loads(_run_node_script(script)) == ["Running", "Processed in 4s"]
+    # The running label comes from the locale catalog, not a hard-coded English string.
+    assert json.loads(_run_node_script(script)) == ["In esecuzione", "Processed in 4s"]
+
+
+def test_running_subagent_dot_pulses_and_respects_reduced_motion():
+    css = (Path(__file__).resolve().parents[1] / "static" / "style.css").read_text(encoding="utf-8")
+    sel = '.tool-worklog-group[data-tool-worklog-group="1"][data-subagent-running="1"] .as-dot'
+    rule = re.search(re.escape(sel) + r"\{([^}]*)\}", css).group(1)
+    assert "animation:wlpulse 1.3s ease-in-out infinite" in rule
+    reduced = re.search(r"@media \(prefers-reduced-motion: reduce\)\{\s*" + re.escape(sel) + r"\{animation:none;\}", css)
+    assert reduced
 
 
 def _real_disclosure_harness():
