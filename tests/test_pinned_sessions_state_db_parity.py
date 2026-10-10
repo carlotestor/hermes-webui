@@ -492,3 +492,32 @@ def test_failed_sidecar_save_quota_follows_state_db(monkeypatch):
     assert post("pin_c")[0] == 200
     assert state_db["pin_c"] is True
     assert set(routes._PIN_QUOTA_RESERVATIONS) <= {("default", "pin_c")}
+
+
+def test_pinned_back_fill_does_not_stop_candidate_widening(tmp_path):
+    db = tmp_path / "state.db"
+    # 3 old pins, then 10 old plain conversations, then 2 newer ones and a 38-segment compression chain.
+    _make_state_db(db, sessions=15, pinned_ids={"cli_0000", "cli_0001", "cli_0002"})
+    conn = sqlite3.connect(str(db))
+    base = time.time() + 100
+    parent = None
+    for i in range(38):
+        sid = f"seg_{i:02d}"
+        conn.execute(
+            "INSERT INTO sessions (id, source, session_source, title, model, started_at, message_count,"
+            " parent_session_id, end_reason) VALUES (?, 'cli', 'cli', 'chain', 'm', ?, 2, ?, ?)",
+            (sid, base + i, parent, "compression" if i < 37 else None),
+        )
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, 'user', 'hi', ?)",
+            (f"sm_{i}", sid, base + i),
+        )
+        parent = sid
+    conn.commit()
+    conn.close()
+
+    rows = agent_sessions.read_importable_agent_session_rows(db, limit=5, exclude_sources=None)
+
+    assert {r["id"] for r in rows if r.get("pinned")} == {"cli_0000", "cli_0001", "cli_0002"}
+    # Pinned back-fill must not count toward the recency slice: five unpinned conversations.
+    assert len([r for r in rows if not r.get("pinned")]) == 5

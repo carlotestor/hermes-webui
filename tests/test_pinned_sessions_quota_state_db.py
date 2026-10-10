@@ -189,7 +189,7 @@ def test_same_session_id_in_two_profiles_counts_as_two_lineages(monkeypatch):
     sess = PinSess("same", profile="default")
     persisted = [{"session_id": "same", "pinned": True, "profile": "work"}, sess.compact()]
     post = patch_pin_endpoint(monkeypatch, {"same": sess}, limit=1, persisted=persisted)
-    monkeypatch.setattr(routes, "_pin_quota_rows_from_state_db", lambda rows: list(rows))
+    monkeypatch.setattr(routes, "_pin_quota_rows_from_state_db", lambda rows, *_a: list(rows))
     monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: writes.append(p) or True)
     monkeypatch.setattr(routes, "list_profiles_api", lambda: [
         {"name": "default", "is_default": True}, {"name": "work", "is_default": False}])
@@ -200,7 +200,29 @@ def test_same_session_id_in_two_profiles_counts_as_two_lineages(monkeypatch):
     # A second default pin is refused by default's own limit of 1.
     other = PinSess("other", profile="default")
     post = patch_pin_endpoint(monkeypatch, {"other": other}, limit=1, persisted=persisted + [sess.compact()])
-    monkeypatch.setattr(routes, "_pin_quota_rows_from_state_db", lambda rows: list(rows))
+    monkeypatch.setattr(routes, "_pin_quota_rows_from_state_db", lambda rows, *_a: list(rows))
     monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: writes.append(p) or True)
     assert post("other")[0] == 400
     assert writes == [True] and other.pinned is False
+
+
+def test_corrupt_foreign_profile_db_does_not_block_a_pin(tmp_path, monkeypatch):
+    from api import models, routes
+
+    default_db, work_db = tmp_path / "default.db", tmp_path / "work.db"
+    _state_db(default_db, [("new_pin", None, None, None, 0)])
+    work_db.write_bytes(b"not a sqlite database" * 64)
+    sess = PinSess("new_pin")
+    post = patch_pin_endpoint(monkeypatch, {"new_pin": sess}, persisted=[sess.compact()])
+    monkeypatch.setattr(models, "_pin_state_db_path", lambda profile=None: work_db if profile == "work" else default_db)
+    monkeypatch.setattr(
+        routes, "list_profiles_api",
+        lambda: [{"name": "default", "is_default": True}, {"name": "work", "is_default": False}],
+    )
+    monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda s, p: True)
+
+    assert post("new_pin")[0] == 200
+    assert sess.pinned is True
+    # The corrupt profile's own quota scope still fails closed.
+    rows = [{"session_id": "w1", "pinned": False, "profile": "work"}]
+    assert routes._pin_quota_rows_from_state_db(rows, lambda key: key == "work") is None

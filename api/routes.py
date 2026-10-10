@@ -474,10 +474,11 @@ def _pin_quota_profile_keys(rows) -> list | None:
     return sorted(keys)
 
 
-def _pin_quota_rows_from_state_db(rows) -> list[dict] | None:
-    """Quota rows for every profile with ``pinned`` taken from its state.db; ``None`` if unreadable.
+def _pin_quota_rows_from_state_db(rows, keep_profile=None) -> list[dict] | None:
+    """Quota rows with ``pinned`` taken from each profile's state.db; ``None`` if unreadable.
 
-    State.db-only pins join their compression lineage; a profile with no pin store keeps cached flags.
+    *keep_profile* limits which profile keys are read, so a foreign profile's broken DB cannot
+    block a pin. State.db-only pins join their lineage; a profile with no pin store keeps cached flags.
     """
     by_profile: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
@@ -486,6 +487,8 @@ def _pin_quota_rows_from_state_db(rows) -> list[dict] | None:
     profile_keys = _pin_quota_profile_keys(rows)
     if profile_keys is None:
         return None
+    if keep_profile is not None:
+        profile_keys = [k for k in profile_keys if keep_profile(k)]
     out: list[dict] = []
     for profile_key in profile_keys:
         profile_rows = by_profile.get(profile_key, [])
@@ -18542,8 +18545,15 @@ def handle_post(handler, parsed) -> bool:
                     snapshot_seq = _PIN_QUOTA_COMMIT_SEQ
                     cached_rows = [existing.compact() for existing in SESSIONS.values()]
                 target_profile_row = {"session_id": "", "profile": getattr(s, "profile", None)}
+                # Read only the owner's quota scope: known foreign profiles never count, while
+                # root owners still read unclassified profiles for the unknown-owner guard below.
+                scope_owner = str(_session_field(s, "profile", None) or "default")
+                if scope_owner in known_nonroots:
+                    keep_profile = lambda key, owner=_pin_profile(scope_owner): key == owner
+                else:
+                    keep_profile = lambda key: key not in known_nonroots
                 quota_rows = _pin_quota_rows_from_state_db(
-                    list(all_sessions()) + cached_rows + [target_profile_row]
+                    list(all_sessions()) + cached_rows + [target_profile_row], keep_profile
                 )
                 if quota_rows is None:
                     return bad(handler, "Could not read pins from state.db to check the pin limit", 503)
@@ -31504,6 +31514,9 @@ def _handle_session_import(handler, body):
         profile=get_active_profile_name(),
     )
     s.pinned = body.get("pinned", False)
+    # Queue the pin for state.db now, or the Agent's later row creation resets it to unpinned.
+    if s.pinned and not _write_pin_to_state_db(s, True):
+        return bad(handler, "Could not record the pin in state.db", 503)
     with LOCK:
         SESSIONS[s.session_id] = s
         SESSIONS.move_to_end(s.session_id)

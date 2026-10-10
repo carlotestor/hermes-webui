@@ -24,7 +24,7 @@ def test_pin_and_unpin_write_state_db_under_uri_special_home(tmp_path, monkeypat
     install_sqlite_session_db(monkeypatch)
     monkeypatch.setattr(state_sync, "_resolve_state_db_path", lambda profile=None: db)
     monkeypatch.setattr(state_sync, "_get_state_db", lambda profile=None: state_sync_db(db))
-    monkeypatch.setattr(routes, "_pin_quota_rows_from_state_db", lambda rows: [dict(r) for r in rows])
+    monkeypatch.setattr(routes, "_pin_quota_rows_from_state_db", lambda rows, *_a: [dict(r) for r in rows])
     monkeypatch.setattr(routes, "list_profiles_api", lambda: [{"name": "default", "is_default": True}])
 
     assert state_sync.state_db_knows_session("s1", profile="default") is True

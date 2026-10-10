@@ -1100,7 +1100,8 @@ def read_importable_agent_session_rows(
                 projected = _project(raw_rows)
                 window_exhausted = (
                     len(raw_rows) >= candidate_limit
-                    and len(projected) < result_limit
+                    # Back-filled pins sit outside the recency slice; only unpinned rows fill it.
+                    and sum(not row.get("pinned") for row in projected) < result_limit
                 )
                 if not window_exhausted:
                     # Either the request is satisfied or the raw candidate window

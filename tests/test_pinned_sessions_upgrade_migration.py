@@ -365,3 +365,44 @@ def test_compression_honours_a_confirmed_unpin_after_migration(upgrade_env):
 
     assert _rotate(env) is False
     assert db_pins(env.db) == {"root": False, "child": False}
+
+
+def test_imported_pin_survives_the_agent_row_default(upgrade_env, monkeypatch):
+    from types import SimpleNamespace
+
+    env = upgrade_env
+    _make_db(env.db, ["other"])
+    env.sidecars.update({"other": False})
+    _sidebar_build(env)  # migration marked complete
+
+    saved = []
+
+    class _Imported:
+        def __init__(self, **kw):
+            self.session_id, self.profile, self.pinned, self.messages = "imported", "default", False, []
+
+        def save(self, **_kw):
+            saved.append(self.pinned)
+            env.sidecars[self.session_id] = bool(self.pinned)
+
+        def compact(self):
+            return {"session_id": self.session_id}
+
+    replies = []
+    monkeypatch.setattr(env.routes, "Session", _Imported)
+    monkeypatch.setattr(env.routes, "SESSIONS", __import__("collections").OrderedDict())
+    monkeypatch.setattr(env.routes, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(env.routes, "publish_session_list_changed", lambda *a, **kw: None)
+    monkeypatch.setattr(env.routes, "public_session_projection", lambda d: d)
+    monkeypatch.setattr(env.routes, "j", lambda h, payload, status=200, **kw: replies.append(status) or True)
+    monkeypatch.setattr(env.routes, "bad", lambda h, msg, status=400: replies.append(status) or True)
+    env.routes._handle_session_import(SimpleNamespace(), {"messages": [], "pinned": True})
+    assert replies == [200] and saved == [True]
+
+    # The Agent inserts the row with its default pinned=0; the import pin must win.
+    conn = sqlite3.connect(str(env.db))
+    conn.execute("INSERT INTO sessions (id, pinned) VALUES ('imported', 0)")
+    conn.commit()
+    conn.close()
+    assert _sidebar_build(env) == {"other": False, "imported": True}
+    assert db_pins(env.db)["imported"] is True
