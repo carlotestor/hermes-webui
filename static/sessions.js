@@ -8606,6 +8606,16 @@ function _isDelegatedSubagentRow(s){
 // every other row keeps its own. Memoized per render, so each lineage resolves once.
 function _sidebarProjectResolver(rowsById){
   const memo=new Map();
+  // Resolve the parent like the attach step does: a child of a compressed parent names its
+  // pre-compression segment, which the payload carries only as the tip's _lineage_root_id.
+  const byLineageRoot=new Map();
+  if(rowsById) rowsById.forEach(r=>{ if(r&&r._lineage_root_id&&!byLineageRoot.has(r._lineage_root_id)) byLineageRoot.set(r._lineage_root_id,r); });
+  const parentOf=(s)=>{
+    const pid=s.parent_session_id;
+    if(!rowsById||!pid) return null;
+    return rowsById.get(pid)||rowsById.get(s._parent_lineage_tip_id)
+      ||byLineageRoot.get(pid)||byLineageRoot.get(s._parent_lineage_root_id)||null;
+  };
   return function projectIdFor(s){
     if(!s) return null;
     const path=[];
@@ -8617,7 +8627,7 @@ function _sidebarProjectResolver(rowsById){
       if(cur.project_id||!_isDelegatedSubagentRow(cur)){ result=cur.project_id||null; if(sid) path.push(sid); break; }
       if(onPath.has(sid)) break;
       onPath.add(sid); path.push(sid);
-      cur=rowsById?rowsById.get(cur.parent_session_id):null;
+      cur=parentOf(cur);
     }
     for(const sid of path) memo.set(sid,result);
     return result;

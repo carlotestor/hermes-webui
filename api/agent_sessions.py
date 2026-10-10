@@ -1131,14 +1131,14 @@ def read_importable_agent_session_rows(
                 have.add(parent.get('id'))
                 pending.append(parent)
             # The sidebar reads parent_source as "the parent is in this payload". A delegated child whose
-            # parent row is not in it (absent, or a non-subagent parent such as a Desktop/CLI session that
-            # missed the slice) must not claim that, or the child vanishes. WebUI parents are exempt: the
-            # WebUI bucket supplies their row, so the child nests (or follows its filtered-out parent).
+            # parent row is not returned here must not claim that, or the child vanishes. No WebUI exemption:
+            # a WebUI parent may have no sidecar; when it has one, the route stamps parent_is_cli_session
+            # from that row, which the client checks before parent_source.
             for row in selected:
                 if not _is_subagent(row) or not row.get('parent_session_id'):
                     continue
                 parent = _parent_of(row)
-                if parent is not None and (parent.get('id') in have or str(parent.get('source') or '').strip().lower() == 'webui'):
+                if parent is not None and parent.get('id') in have:
                     continue
                 row['parent_source'] = None
             return _result(selected, window_exhausted)

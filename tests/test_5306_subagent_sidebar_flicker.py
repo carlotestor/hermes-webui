@@ -657,8 +657,8 @@ console.log(JSON.stringify({{top, nested}}));
         assert "leaf" in out["top"] and out["nested"] == [], out
 
 
-def _desktop_parent_db(path, newer):
-    """A Desktop parent that went quiet, its delegated child, and `newer` hotter unrelated rows."""
+def _desktop_parent_db(path, newer, parent_source="desktop"):
+    """A Desktop (or other-source) parent that went quiet, its delegated child, and `newer` hotter unrelated rows."""
     import sqlite3
 
     conn = sqlite3.connect(str(path))
@@ -667,7 +667,7 @@ def _desktop_parent_db(path, newer):
         "started_at REAL, source TEXT, parent_session_id TEXT, ended_at REAL, end_reason TEXT)"
     )
     conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, timestamp REAL)")
-    rows = [("desk", "Desktop run", 100.0, "desktop", None), ("leaf", "Leaf", 120.0, "subagent", "desk")]
+    rows = [("desk", "Desktop run", 100.0, parent_source, None), ("leaf", "Leaf", 120.0, "subagent", "desk")]
     rows += [(f"new{i}", f"Newer {i}", 300.0 + i, "subagent", None) for i in range(newer)]
     for sid, title, started, source, parent in rows:
         conn.execute(
@@ -939,3 +939,41 @@ def test_5305_subagent_of_orphaned_branch_child_stays_reachable():
     out = _render_tabs(json.dumps(rows), project="__no_project__")
     assert {"sid": "B", "orphan": True} in out["webui"], out
     assert "L" in _sids(out["webui"]), out
+
+
+@pytest.mark.parametrize("tip_hint", [False, True])
+def test_5305_leaf_of_compressed_subagent_follows_project_of_lineage(tip_hint):
+    """Re-gate (5443895388): W(project p) -> O_old -> O_tip, L.parent_session_id='O_old', all
+    profiles. Project filtering must resolve O_old through lineage like attachment does: L
+    nests under W in project p and stays out of Unassigned (master: L listed in Unassigned)."""
+    extra = {"_parent_lineage_root_id": "O_old"}
+    if tip_hint:
+        extra["_parent_lineage_tip_id"] = "O_tip"
+    rows = json.dumps([
+        _web("W", project_id="p"),
+        _sub("O_tip", "W", "webui", _lineage_root_id="O_old"),
+        _sub("L", "O_old", "subagent", updated_at=102, **extra),
+    ])
+    own = _render_tabs(rows, project="p")
+    assert own["webui"] == [{"sid": "W", "orphan": False}, {"sid": "O_tip", "orphan": False},
+                            {"sid": "L", "orphan": False}], own
+    unassigned = _render_tabs(rows, project="__no_project__")
+    assert "L" not in _sids(unassigned["webui"]) + _sids(unassigned["cli"]), unassigned
+
+
+def test_5305_subagent_of_sidecarless_webui_parent_outside_slice_stays_reachable(tmp_path):
+    """Greptile 4205554465: a webui-source parent in the oversample but not the 20-row slice (and
+    with no WebUI sidecar) is not returned, so the child must not keep parent_source='webui'
+    ("parent is in this payload"); otherwise the client hides it in both tabs."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    _desktop_parent_db(db, newer=19, parent_source="webui")
+    rows = models._load_cli_sessions_uncached(tmp_path, db, None, visible_session_limit=20, include_claude_code=False)
+    ids = [r["session_id"] for r in rows]
+    assert "leaf" in ids and "desk" not in ids, ids
+    assert next(r for r in rows if r["session_id"] == "leaf")["parent_source"] is None
+    for r in rows:
+        r.setdefault("profile", "a")
+    out = _render_tabs(json.dumps(rows, default=str))
+    assert [r for r in out["webui"] + out["cli"] if r["sid"] == "leaf"] == [{"sid": "leaf", "orphan": True}], out
