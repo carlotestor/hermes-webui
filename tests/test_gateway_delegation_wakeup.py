@@ -433,7 +433,7 @@ def test_unaccepted_launched_wake_backs_off(env, monkeypatch):
     monkeypatch.setattr(gdw.time, "time", lambda: clock[0])
     FakeDB.add("sid1", "deleg_down")
     for _ in range(4):
-        n = gdw.poll_once(0)
+        gdw.poll_once(0)
         if Session.load("sid1").delegation_reservation:
             gdw.settle_reservation("sid1", "s", accepted=False)  # worker teardown: Gateway down
         clock[0] += gdw.POLL_INTERVAL_S
