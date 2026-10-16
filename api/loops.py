@@ -107,6 +107,26 @@ def retag_session_profile(session, profile, retag):
         return session_profile, result
 
 
+@contextmanager
+def archive_guard(session_id):
+    """Hold the loop lock (taken before the agent lock) across an archive; pause the loop if it archived.
+
+    Yields a dict; the caller stores the archived session under "session" once it is saved.
+    """
+    out = {}
+    with _session_lock(session_id):
+        yield out
+        s = out.get("session")
+        if s is None or not getattr(s, "archived", False):
+            return
+        try:
+            from hermes_cli.loops import LoopManager
+        except ImportError:  # no agent installed: no loop store
+            return
+        with _home(getattr(s, "profile", None)):
+            LoopManager(session_id=session_id).pause(reason="session archived")
+
+
 def run_loop_command(session_id, args, request_profile=None):
     """`request_profile`: the caller's profile; re-checked under the lock a retag takes."""
     from api.models import get_session
@@ -178,8 +198,12 @@ def _run_one(profile, sid):
             return
         if cli.goal_blocks_loop_tick(sid):
             return
-        if not _profiles_match(get_session(sid, metadata_only=True).profile, profile):
+        meta = get_session(sid, metadata_only=True)
+        if not _profiles_match(meta.profile, profile):
             mgr.clear()  # the session moved to another profile: never launch this loop there
+            return
+        if getattr(meta, "archived", False):
+            mgr.pause(reason="session archived")  # a hidden chat must not keep spending provider calls
             return
         msg = mgr.fire_tick()
         if not msg or mgr.lost:

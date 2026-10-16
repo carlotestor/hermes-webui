@@ -501,7 +501,7 @@ async function _runAgentCommandTransport(text,_meta){
   if(!command) throw new Error('command is required');
   const data=await api('/api/commands/exec',{
     method:'POST',
-    body:JSON.stringify({command,session_id:S.session&&S.session.session_id||''})
+    body:JSON.stringify(/^\/?loop(\s|$)/i.test(command)?{command,session_id:S.session&&S.session.session_id||''}:{command})  // only /loop is session-scoped
   });
   return String(data&&data.output||'(no output)');
 }

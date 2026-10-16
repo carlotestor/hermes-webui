@@ -3,6 +3,7 @@ import threading
 from types import SimpleNamespace as NS
 
 from tests.conftest import requires_agent_modules
+from tests.test_issue7193_eager_start_rollback import _start as _start7193, issue7193_env  # noqa: F401
 
 
 def _setup(tmp_path, monkeypatch, session):
@@ -392,3 +393,72 @@ def test_turn_record_parent_cycle_terminates():
     db = NS(get_meta=lambda k: None, get_session=lambda sid: {"parent_session_id": parents.get(sid)},
             set_meta=lambda k, v: (_ for _ in ()).throw(AssertionError("no record to copy")))
     assert loops._turn_record(db, "a") == {}
+
+
+def test_launch_response_keeps_started_at_when_worker_clears_pending(issue7193_env, tmp_path, monkeypatch):
+    # greptile 4237618938: the response must carry the launch timestamp even if the worker
+    # (or Stop) cleared s.pending_* before the launcher read it back.
+    from api import routes
+    from api.models import new_session
+    cleared = threading.Event()
+
+    def worker(*_a, **_kw):
+        session.pending_started_at = None
+        session.pending_user_message = None
+        cleared.set()
+
+    monkeypatch.setattr(routes, "_run_agent_streaming", worker)
+    # runs after the session lock is released, before the response is built: let the worker win
+    monkeypatch.setattr(routes, "set_last_workspace", lambda *_a, **_kw: cleared.wait(2))
+    session = new_session(workspace=str(tmp_path / "workspace"))
+    resp = _start7193(session, workspace=tmp_path / "workspace")
+    assert cleared.wait(2) and session.pending_started_at is None
+    assert resp["pending_started_at"]  # captured under the lock, not re-read after the worker ran
+
+
+@requires_agent_modules
+def test_archived_session_loop_pauses_instead_of_firing(tmp_path, monkeypatch):
+    session = NS(session_id="s1", profile=None, messages=[], archived=True)
+    agent, loops, started = _setup(tmp_path, monkeypatch, session)
+    with loops._home(None):
+        _due(agent)
+    loops.run_due_loops()
+    assert started == []
+    with loops._home(None):
+        s = agent.load_loop("s1")
+        assert s.status == "paused" and s.paused_reason == "session archived"
+
+
+@requires_agent_modules
+def test_archive_guard_pauses_loop_under_loop_lock(tmp_path, monkeypatch):
+    session = NS(session_id="s1", profile=None, messages=[], archived=False)
+    agent, loops, started = _setup(tmp_path, monkeypatch, session)
+    with loops.archive_guard("s1") as guard:
+        assert loops._session_lock("s1").locked()  # held before the caller takes the agent lock
+        session.archived = True
+        guard["session"] = session
+    with loops._home(None):
+        assert agent.load_loop("s1").paused_reason == "session archived"
+    with loops.archive_guard("s1") as guard:  # unarchive does not touch the loop
+        session.archived = False
+        guard["session"] = session
+    with loops._home(None):
+        assert agent.load_loop("s1").status == "paused"
+
+
+def test_only_loop_command_carries_session_id():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "static" / "commands.js").read_text(encoding="utf-8")
+    body = src[src.index("async function _runAgentCommandTransport"):]
+    body = body[:body.index("\n}\n")]
+    assert "/^\\/?loop(\\s|$)/i.test(command)?{command,session_id:" in body and ":{command})" in body
+
+
+def test_busy_loop_reply_stays_in_owning_chat():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text(encoding="utf-8")
+    busy = src[src.index("_pc.name==='loop'"):src.index("const defaultMessageMode=")]
+    busy = busy[:busy.index("return;")]
+    assert "_loopMsgs=S.messages" in busy and "_loopMsgs.push({role:'assistant'" in busy
+    assert "S.messages.push({role:'assistant'" not in busy
+    assert "S.messages===_loopMsgs&&(S.session&&S.session.session_id)===_loopSid" in busy
