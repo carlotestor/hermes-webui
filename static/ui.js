@@ -20787,6 +20787,15 @@ function renderMessages(options){
           _materializeDeferredWorklogRows(group);
         }
         if(!(group.textContent||'').trim()) continue; // empty group can't help
+        // A delegated transcript's worklog the user collapsed stays collapsed:
+        // its poll re-renders on new rows, and the chip itself keeps the turn
+        // non-blank, so honour the saved disclosure instead of force-opening.
+        if(typeof _isDelegatedSubagentTranscript==='function'&&_isDelegatedSubagentTranscript()
+           &&typeof _readActivityDisclosureState==='function'
+           &&_readActivityDisclosureState(group.getAttribute('data-activity-disclosure-key'))==='closed'){
+          revealed=true;
+          continue;
+        }
         if(group.classList.contains('tool-call-group-collapsed')){
           group.classList.remove('tool-call-group-collapsed');
           group.classList.add('open');

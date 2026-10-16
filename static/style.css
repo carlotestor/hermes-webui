@@ -3964,6 +3964,8 @@ body.resizing .sidebar{transition:none!important;}
   font-weight:400;
   opacity:.82;
 }
+/* Running chip: the live label must not inherit the settled muted grey (2.86:1 light). */
+.tool-worklog-group[data-tool-worklog-group="1"][data-subagent-running="1"] .tool-worklog-label{color:var(--accent-text);opacity:1;}
 .tool-worklog-group[data-tool-worklog-group="1"]:not([data-run-activity-group="1"]) .tool-worklog-summary:hover{
   background:transparent;
 }

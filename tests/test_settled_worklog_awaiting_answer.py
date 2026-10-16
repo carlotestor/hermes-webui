@@ -414,3 +414,48 @@ def test_subagent_finishing_with_unchanged_count_collapses_worklog():
     assert json.loads(_run_node_script(script)) == [
         [True, False], "unchanged", [True, True], False, "skipped", 1,
     ]
+
+
+def _collapsed_after_poll(session, saved):
+    """Render a prose-less last turn whose worklog the user had collapsed, as a poll reload does."""
+    script = textwrap.dedent(
+        f"""{_render_messages_harness()}
+        const _baseEnsure = ensureActivityGroup;
+        function _readActivityDisclosureState(key) {{ return key ? {json.dumps(saved)} : null; }}
+        ensureActivityGroup = function (parent, opts) {{
+          const group = _baseEnsure(parent, opts);
+          group.setAttribute('data-activity-disclosure-key', 'wl:' + parent.children.length);
+          // The real ensureActivityGroup honours the saved disclosure for delegated transcripts.
+          group.classList.add('tool-call-group-collapsed');
+          group.textContent = 'terminal';  // a non-empty chip, as rows render in the app
+          return group;
+        }};
+        S = {{ session: {json.dumps(session)}, messages: {json.dumps(TWO_TURNS_RUNNING)},
+              toolCalls: [], busy: false }};
+        renderMessages();
+        const groups = elements.msgInner.querySelectorAll('.tool-worklog-group');
+        console.log(JSON.stringify(groups[groups.length - 1].classList.contains('tool-call-group-collapsed')));
+        """
+    )
+    return json.loads(_run_node_script(script))
+
+
+def test_collapsed_running_chip_stays_collapsed_when_poll_brings_rows():
+    # The user collapsed the Running chip; the poll reloads the prose-less last
+    # turn. The blank-turn fail-safe must honour the saved 'closed' disclosure.
+    assert _collapsed_after_poll(RUNNING_SUBAGENT, "closed") is True
+    # Without a saved collapse the blank-turn fail-safe still reveals it, and
+    # non-delegated sessions keep the master behaviour.
+    assert _collapsed_after_poll(RUNNING_SUBAGENT, None) is False
+    assert _collapsed_after_poll(WEBUI_SESSION, "closed") is False
+
+
+def test_running_label_uses_accent_text_after_settled_label_rule():
+    css = (Path(__file__).resolve().parents[1] / "static" / "style.css").read_text(encoding="utf-8")
+    settled = '.tool-worklog-group[data-tool-worklog-group="1"]:not([data-run-activity-group="1"]) .tool-worklog-label{'
+    running = '.tool-worklog-group[data-tool-worklog-group="1"][data-subagent-running="1"] .tool-worklog-label{'
+    assert running in css
+    rule = css[css.index(running) + len(running):].split("}", 1)[0]
+    assert "color:var(--accent-text)" in rule and "opacity:1" in rule
+    # Equal specificity: source order must put the running rule after the muted one.
+    assert css.index(running) > css.index(settled)
