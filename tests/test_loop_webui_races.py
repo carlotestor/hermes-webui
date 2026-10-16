@@ -3,7 +3,10 @@ import threading
 from types import SimpleNamespace as NS
 
 from tests.conftest import requires_agent_modules
-from tests.test_issue7193_eager_start_rollback import _start as _start7193, issue7193_env  # noqa: F401
+from tests import test_issue7193_eager_start_rollback as _r7193
+
+_start7193 = _r7193._start
+issue7193_env = _r7193.issue7193_env  # reused fixture: the eager chat-start sandbox
 
 
 def _setup(tmp_path, monkeypatch, session):
