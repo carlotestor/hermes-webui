@@ -87,6 +87,7 @@ def _configure_pin_route(monkeypatch, sessions, persisted, source, active_profil
     monkeypatch.setattr(routes, "_pin_quota_rows_from_state_db", lambda rows, *_a: [dict(r) for r in rows])
     monkeypatch.setattr(routes, "_write_pin_to_state_db", lambda *_: True)
     monkeypatch.setattr(routes, "_PIN_QUOTA_RESERVATIONS", {})
+    monkeypatch.setattr(routes, "get_session_profile_readonly", lambda sid: by_id[sid].profile)
     monkeypatch.setattr(routes, "list_profiles_api", lambda **_: [
         {"name": name, "is_default": name == "default"} for name in names])
     monkeypatch.setattr(profiles, "_root_profile_name_cache", set(root_names or {"default"}))
