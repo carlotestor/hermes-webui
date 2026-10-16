@@ -124,45 +124,29 @@ def test_sidebar_row_reads_pinned_from_state_db(tmp_path, monkeypatch):
     assert by_id["cli_0000"]["pinned"] is False
 
 
-class _FakeSessionDB:
-    calls = []
-
-    def __init__(self, db_path):
-        self.db_path = db_path
-
-    def get_session(self, _session_id):
-        return None
-
-    def set_session_pinned(self, session_id, pinned):
-        _FakeSessionDB.calls.append((str(self.db_path), session_id, pinned))
-        return True
-
-    def close(self):
-        pass
-
-
-def test_sync_session_pinned_writes_through_set_session_pinned(tmp_path, monkeypatch):
-    import sys
-    import types
+def test_sync_session_pinned_writes_the_profile_state_db(tmp_path, monkeypatch):
+    import sqlite3
 
     from api import state_sync
 
-    fake_mod = types.ModuleType("hermes_state")
-    fake_mod.SessionDB = _FakeSessionDB
-    monkeypatch.setitem(sys.modules, "hermes_state", fake_mod)
-    (tmp_path / "state.db").write_bytes(b"")
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, pinned INTEGER NOT NULL DEFAULT 0, hidden INTEGER DEFAULT 1, title TEXT)")
+    conn.execute("INSERT INTO sessions (id) VALUES ('abc123')")
+    conn.commit(); conn.close()
     monkeypatch.setattr(
         "api.profiles._resolve_profile_home_for_name", lambda _name: tmp_path, raising=False
     )
-    _FakeSessionDB.calls.clear()
+
+    def row():
+        with sqlite3.connect(db) as c:
+            return c.execute("SELECT pinned, hidden FROM sessions WHERE id = 'abc123'").fetchone()
 
     assert state_sync.sync_session_pinned("abc123", True, profile="default") is True
+    assert row() == (1, 0)  # pinning unhides, like the Agent setter
     assert state_sync.sync_session_pinned("abc123", False, profile="default") is True
-
-    assert _FakeSessionDB.calls == [
-        (str(tmp_path / "state.db"), "abc123", True),
-        (str(tmp_path / "state.db"), "abc123", False),
-    ]
+    assert row() == (0, 0)
+    assert state_sync.sync_session_pinned("missing", True, profile="default") is False
 
 
 def test_pin_route_writes_state_db_before_sidecar():

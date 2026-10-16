@@ -115,6 +115,42 @@ CLI_MIN_UNTITLED_USER_MESSAGE_COUNT = 2
 # window cannot collapse genuinely concurrently started children.
 CONTINUATION_STARTED_AT_TOLERANCE_SECONDS = 2.0
 
+
+def continuation_edge_sql(parent: str, child: str, columns: set[str]) -> str:
+    """SQL truth of ``_is_continuation_session(parent, child)`` for joined ``sessions`` aliases.
+
+    Only a compression end continues; forks (``session_source='fork'``), tool rows,
+    ``_branched_from``/``_delegate_from``/``_reset_from`` children of this parent, cross-source
+    children and children started before the boundary are lineage boundaries. Unparsable or
+    non-string marker evidence is a boundary too. Missing columns drop their guard.
+    """
+    clauses = [f"{parent}.end_reason = 'compression'"]
+    if 'session_source' in columns:
+        clauses.append(f"LOWER(TRIM(COALESCE({child}.session_source, ''))) <> 'fork'")
+    if 'source' in columns:
+        clauses.append(f"LOWER(TRIM(COALESCE({child}.source, ''))) <> 'tool'")
+        clauses.append(
+            f"(TRIM(COALESCE({parent}.source, '')) = '' OR TRIM(COALESCE({child}.source, '')) = ''"
+            f" OR LOWER(TRIM({parent}.source)) = LOWER(TRIM({child}.source)))"
+        )
+    if 'model_config' in columns:
+        mc = f"{child}.model_config"
+        clauses.append(f"(TRIM(COALESCE({mc}, '')) = '' OR (json_valid({mc}) AND json_type({mc}) = 'object'))")
+        for key in _MODEL_CONFIG_LINEAGE_KEYS:
+            path = f"'$.{key}'"
+            safe = f"(CASE WHEN json_valid({mc}) THEN {mc} ELSE '{{}}' END)"
+            clauses.append(
+                f"(json_type({safe}, {path}) IS NULL OR json_type({safe}, {path}) = 'null'"
+                f" OR (json_type({safe}, {path}) = 'text' AND TRIM(json_extract({safe}, {path})) <> ''"
+                f" AND TRIM(json_extract({safe}, {path})) <> {parent}.id))"
+            )
+    if {'started_at', 'ended_at'} <= columns:
+        clauses.append(
+            f"({parent}.ended_at IS NULL OR COALESCE({child}.started_at, 0)"
+            f" >= {parent}.ended_at - {CONTINUATION_STARTED_AT_TOLERANCE_SECONDS!r})"
+        )
+    return "(" + " AND ".join(clauses) + ")"
+
 # Accepted ``project_assignment`` values for read_importable_agent_session_rows.
 PROJECT_ASSIGNMENT_FILTERS = frozenset({'assigned', 'unassigned'})
 

@@ -40,6 +40,7 @@ from api.workspace import get_last_workspace, _resolve_path, profile_home_resolv
 from api.usage import prompt_cache_hit_percent
 from api.agent_sessions import (
     _is_continuation_session,
+    continuation_edge_sql,
     is_cli_session_row,
     normalize_agent_session_source,
     open_state_db_readonly,
@@ -7782,12 +7783,14 @@ def agent_session_uncarried_pins(session_ids, *, profile=None) -> set[str] | Non
     def query(cur, cols):
         if not {"id", "pinned", "parent_session_id", "end_reason"} <= cols:
             return set()
+        # Only verified continuation edges: a fork/branch/delegate/reset child never inherits a pin.
+        edge = continuation_edge_sql("p", "c", cols).replace("{", "{{").replace("}", "}}")
         sql = (
             "WITH RECURSIVE anc(start, id) AS ("
             " SELECT c.id, p.id FROM sessions c JOIN sessions p ON p.id = c.parent_session_id"
-            " WHERE c.id IN ({ids}) AND NOT c.pinned AND p.end_reason = 'compression'"
+            f" WHERE c.id IN ({{ids}}) AND NOT c.pinned AND {edge}"
             " UNION SELECT a.start, p.id FROM anc a JOIN sessions c ON c.id = a.id"
-            " JOIN sessions p ON p.id = c.parent_session_id WHERE p.end_reason = 'compression')"
+            f" JOIN sessions p ON p.id = c.parent_session_id WHERE {edge})"
             " SELECT DISTINCT a.start FROM anc a JOIN sessions s ON s.id = a.id WHERE s.pinned"
         )
         return {str(row[0]).strip() for row in _pin_db_chunks(cur, sql, session_ids)}
@@ -7822,8 +7825,10 @@ def agent_session_pin_lineage_rows(session_ids, *, profile=None) -> list[dict] |
         parent, join = "NULL", ""
         if {"parent_session_id", "end_reason"} <= cols:
             parent = "parent.id"
+            edge = continuation_edge_sql("parent", "child", cols).replace("{", "{{").replace("}", "}}")
+            # A fork of a pinned lineage is its own conversation and takes its own slot.
             join = (" LEFT JOIN sessions parent ON parent.id = child.parent_session_id"
-                    " AND parent.end_reason = 'compression'")
+                    f" AND {edge}")
         sql = (f"SELECT child.id, {parent}, {col('session_source')}, {col('source')}, {col('archived')}"
                f" FROM sessions child{join} WHERE child.id IN ({{ids}})")
         out = []

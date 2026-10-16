@@ -175,7 +175,7 @@ def test_carry_fails_closed_when_parent_pin_unknown(tmp_path, monkeypatch):
     assert pins()["child"] is False
 
 
-def test_pin_fails_closed_when_state_db_exists_but_hermes_state_is_missing(tmp_path, monkeypatch):
+def test_pin_writes_existing_row_without_hermes_state_and_queues_absent_row(tmp_path, monkeypatch):
     import builtins
     import sqlite3
     import api.state_sync as state_sync
@@ -204,12 +204,16 @@ def test_pin_fails_closed_when_state_db_exists_but_hermes_state_is_missing(tmp_p
         def __init__(self, sid):
             self.session_id = sid
 
-    # The row exists, so the write must go to state.db; without hermes_state it fails closed.
+    # The row exists, so the pin goes to state.db (written with sqlite, no hermes_state needed)
+    # and any pin queued while it was absent is settled.
     assert state_sync.state_db_knows_session("sid") is True
-    assert routes._write_pin_to_state_db(S("sid"), True) is False
-    assert queued == []
+    assert routes._write_pin_to_state_db(S("sid"), True) is True
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT pinned FROM sessions WHERE id = 'sid'").fetchone() == (1,)
+    assert queued == [("sid", False, "default")]
     # A genuinely absent row is still queued for migration.
     assert state_sync.state_db_knows_session("other") is False
     assert routes._write_pin_to_state_db(S("other"), True) is True
+    assert queued[-1] == ("other", True, "default")
     db.write_bytes(b"not a database")
     assert state_sync.state_db_knows_session("sid") is None

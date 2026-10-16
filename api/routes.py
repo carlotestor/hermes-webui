@@ -442,6 +442,7 @@ def _session_row_lineage_root_id(session, sessions_by_id) -> str:
 # later state.db snapshot covers its committed outcome.
 _PIN_QUOTA_RESERVATIONS: dict[tuple, dict] = {}
 _PIN_QUOTA_COMMIT_SEQ = 0
+_PIN_QUOTA_SNAPSHOT_ATTEMPTS = 5
 
 
 def _pin_quota_reservation_rows(exclude_key: tuple, snapshot_seq: int) -> list[dict]:
@@ -2591,6 +2592,11 @@ def _reconcile_sidebar_pins_with_state_db(rows: list[dict]) -> None:
 
 _PIN_MIGRATION_MARKER_NAME = "_pin_state_db_migration.json"
 _PIN_MIGRATION_LOCK = threading.Lock()
+# Sidebar-build pin writes wait this long for an Agent writer; on contention the pin stays
+# pending (sidecar keeps it, reconciliation skips it) and the next build retries.
+_PIN_MIGRATION_WRITE_TIMEOUT_S = 0.25
+# Total time one sidebar build may spend writing migrated/carried pins.
+_PIN_MIGRATION_BUDGET_S = 1.0
 
 
 def _pin_migration_marker_path() -> Path:
@@ -2663,7 +2669,7 @@ def _migrate_pin_under_session_lock(sid: str, profile) -> bool | None:
         if flags is None or sid not in flags:
             return None
         if flags[sid] is not True:
-            sync_session_pinned(sid, True, profile=profile)
+            sync_session_pinned(sid, True, profile=profile, timeout=_PIN_MIGRATION_WRITE_TIMEOUT_S)
             flags = agent_session_pinned_flags([sid], profile=profile)
         return True if (flags or {}).get(sid) is True else None
 
@@ -2676,7 +2682,7 @@ def _carry_pin_under_session_lock(sid: str, profile) -> bool | None:
         if uncarried is None:
             return None
         if sid in uncarried:
-            sync_session_pinned(sid, True, profile=profile)
+            sync_session_pinned(sid, True, profile=profile, timeout=_PIN_MIGRATION_WRITE_TIMEOUT_S)
             uncarried = agent_session_uncarried_pins([sid], profile=profile)
         return None if uncarried is None else sid not in uncarried
 
@@ -2701,15 +2707,17 @@ def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] 
     if key not in migrated:
         todo |= {sid for sid, pinned in row_pins.items() if pinned}
     unresolved, resolved = set(), set()
+    deadline = time.monotonic() + _PIN_MIGRATION_BUDGET_S
     for sid in sorted(todo):
-        outcome = _migrate_pin_under_session_lock(sid, profile)
+        # Past the budget (a busy Agent writer) the rest stay pending for the next build.
+        outcome = _migrate_pin_under_session_lock(sid, profile) if time.monotonic() < deadline else None
         (unresolved if outcome is None else resolved).add(sid)
     # A compression child left unpinned under a pinned ancestor missed its carry.
     uncarried = agent_session_uncarried_pins(row_pins, profile=profile)
     if uncarried is None:
         return None
     for sid in sorted(uncarried):
-        if _carry_pin_under_session_lock(sid, profile) is True:
+        if time.monotonic() < deadline and _carry_pin_under_session_lock(sid, profile) is True:
             uncarried.discard(sid)
     with _PIN_MIGRATION_LOCK:
         state = _load_pin_migration_state()
@@ -17171,7 +17179,13 @@ def _write_pin_to_state_db(s, pinned: bool) -> bool:
             return False
         if known is False:
             return _queue_pin_for_absent_row(sid, pinned, profile)
-        return sync_session_pinned(sid, pinned, profile=profile)
+        if not sync_session_pinned(sid, pinned, profile=profile):
+            return False
+        # The row exists now and holds the confirmed pin: a pin queued while it was absent is
+        # settled, or the migration would later re-apply it over a Desktop/CLI unpin.
+        if not _queue_pin_for_absent_row(sid, False, profile):
+            logger.warning("Could not clear the settled pending pin of %s", sid)
+        return True
     except Exception:
         logger.debug("Failed to write pin to state.db for %s", sid, exc_info=True)
         return False
@@ -19512,11 +19526,6 @@ def handle_post(handler, parsed) -> bool:
                 nonroot_names = {str(p["name"]) for p in profiles or [] if p.get("name") and p.get("is_default") is False}
                 conflicts = (root_profile_names - {"default"}) & nonroot_names
                 known_nonroots = nonroot_names - conflicts - {"default"}
-                # TOCTOU guard (Opus stage-389): count and reserve under one LOCK; all_sessions()
-                # takes LOCK itself, so the persisted snapshot is read outside it.
-                with LOCK:
-                    snapshot_seq = _PIN_QUOTA_COMMIT_SEQ
-                    cached_rows = [existing.compact() for existing in SESSIONS.values()]
                 target_profile_row = {"session_id": "", "profile": getattr(s, "profile", None)}
                 # Read only the owner's quota scope: known foreign profiles never count, while
                 # root owners still read unclassified profiles for the unknown-owner guard below.
@@ -19528,45 +19537,58 @@ def handle_post(handler, parsed) -> bool:
                 else:
                     def keep_profile(key):
                         return key not in known_nonroots
-                quota_rows = _pin_quota_rows_from_state_db(
-                    list(all_sessions()) + cached_rows + [target_profile_row], keep_profile
-                )
-                if quota_rows is None:
-                    return bad(handler, "Could not read pins from state.db to check the pin limit", 503)
-                persisted_rows = [
-                    existing for existing in quota_rows
-                    if existing.get("session_id") and _session_counts_toward_pin_quota(existing)
-                ]
-                with LOCK:
-                    # state.db pins plus other in-flight reservations (which survive cache
-                    # eviction), counted as visible lineages.
-                    candidate_rows = list(persisted_rows)
-                    candidate_rows.extend(_pin_quota_reservation_rows(reservation_key, snapshot_seq))
-                    target_row = s.compact()
-                    candidate_rows.append(target_row)
-                    owner_profile = str(_session_field(s, "profile", None) or "default")
-                    uncertain_owner = owner_profile in conflicts or owner_profile not in root_profile_names | nonroot_names
-                    root_owner = owner_profile not in known_nonroots
-                    quota_profiles = root_profile_names - conflicts if root_owner else {owner_profile}
-                    pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
-                    if uncertain_owner:
-                        quota_profiles = {owner_profile, _pin_profile(owner_profile)}
-                    pinned_count = len(_visible_pinned_lineage_ids(candidate_rows, target_row, quota_profiles))
-                    if pinned_count >= pinned_sessions_limit:
-                        return bad(handler, f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.", 400)
-                    if root_owner:
-                        # Rows whose owner cannot be classified count against the root limit too.
-                        upper_profiles = {
-                            str(_session_field(row, "profile", None) or "default") for row in candidate_rows
-                        } - known_nonroots
-                        if len(_visible_pinned_lineage_ids(candidate_rows, target_row, upper_profiles)) >= pinned_sessions_limit:
-                            return bad(handler, "Session profile information is incomplete; please retry.", 503)
-                    s.pinned = True
-                    reserved_quota = True
-                    _PIN_QUOTA_RESERVATIONS[reservation_key] = {
-                        "row": dict(target_row, pinned=True),
-                        "committed_seq": None,
-                    }
+                # A commit that lands after our snapshot was read may also have its reservation
+                # pruned by a newer reader, so a stale snapshot is re-read rather than admitted.
+                for _attempt in range(_PIN_QUOTA_SNAPSHOT_ATTEMPTS):
+                    # TOCTOU guard (Opus stage-389): count and reserve under one LOCK; all_sessions()
+                    # takes LOCK itself, so the persisted snapshot is read outside it.
+                    with LOCK:
+                        snapshot_seq = _PIN_QUOTA_COMMIT_SEQ
+                        cached_rows = [existing.compact() for existing in SESSIONS.values()]
+                    quota_rows = _pin_quota_rows_from_state_db(
+                        list(all_sessions()) + cached_rows + [target_profile_row], keep_profile
+                    )
+                    if quota_rows is None:
+                        return bad(handler, "Could not read pins from state.db to check the pin limit", 503)
+                    persisted_rows = [
+                        existing for existing in quota_rows
+                        if existing.get("session_id") and _session_counts_toward_pin_quota(existing)
+                    ]
+                    with LOCK:
+                        # state.db pins plus other in-flight reservations (which survive cache
+                        # eviction), counted as visible lineages.
+                        if _PIN_QUOTA_COMMIT_SEQ != snapshot_seq:
+                            continue
+                        candidate_rows = list(persisted_rows)
+                        candidate_rows.extend(_pin_quota_reservation_rows(reservation_key, snapshot_seq))
+                        target_row = s.compact()
+                        candidate_rows.append(target_row)
+                        owner_profile = str(_session_field(s, "profile", None) or "default")
+                        uncertain_owner = owner_profile in conflicts or owner_profile not in root_profile_names | nonroot_names
+                        root_owner = owner_profile not in known_nonroots
+                        quota_profiles = root_profile_names - conflicts if root_owner else {owner_profile}
+                        pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
+                        if uncertain_owner:
+                            quota_profiles = {owner_profile, _pin_profile(owner_profile)}
+                        pinned_count = len(_visible_pinned_lineage_ids(candidate_rows, target_row, quota_profiles))
+                        if pinned_count >= pinned_sessions_limit:
+                            return bad(handler, f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.", 400)
+                        if root_owner:
+                            # Rows whose owner cannot be classified count against the root limit too.
+                            upper_profiles = {
+                                str(_session_field(row, "profile", None) or "default") for row in candidate_rows
+                            } - known_nonroots
+                            if len(_visible_pinned_lineage_ids(candidate_rows, target_row, upper_profiles)) >= pinned_sessions_limit:
+                                return bad(handler, "Session profile information is incomplete; please retry.", 503)
+                        s.pinned = True
+                        reserved_quota = True
+                        _PIN_QUOTA_RESERVATIONS[reservation_key] = {
+                            "row": dict(target_row, pinned=True),
+                            "committed_seq": None,
+                        }
+                        break
+                else:
+                    return bad(handler, "Pins changed concurrently; please retry.", 503)
             committed = False
             try:
                 if not _write_pin_to_state_db(s, pin_requested):

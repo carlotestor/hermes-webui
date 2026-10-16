@@ -38,8 +38,17 @@ class SqliteSessionDB:
 
 
 def install_sqlite_session_db(monkeypatch):
+    from api import state_sync
+
     monkeypatch.setitem(sys.modules, "hermes_state", SimpleNamespace(SessionDB=SqliteSessionDB))
     SqliteSessionDB.fail_writes = False
+    real_write = state_sync._write_pin_lineage
+
+    def write(*a, **kw):
+        # ``fail_writes`` models a state.db write that does not land.
+        return False if SqliteSessionDB.fail_writes else real_write(*a, **kw)
+
+    monkeypatch.setattr(state_sync, "_write_pin_lineage", write)
 
 
 class PinSess:
