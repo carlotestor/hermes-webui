@@ -613,6 +613,7 @@ def _render_messages_harness() -> str:
         function _compressionAnchorIndex() {{ return null; }}
         function _assistantTurnFinalVisibleContentMap() {{ return new Map(); }}
         function _assistantTurnVisibleContentMap() {{ return new Map(); }}
+        function _rawTurnBoundaryByRawIdx() {{ return new Map(); }}
         function _isPreservedCompressionTaskListMessage() {{ return false; }}
         function _preservedCompressionTaskListCardsHtml() {{ return ''; }}
         function _isContextCompactionMessage() {{ return false; }}
