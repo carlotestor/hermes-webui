@@ -422,7 +422,8 @@ _CANONICAL_BOT_CHAT_TITLE = "Bot Chat"
 def _continuation_lineage_cte(columns: set) -> str:
     """``lineage(id)`` over verified continuation edges only (forks/branches/delegates/resets excluded).
 
-    Binds the start id twice. Hermes Agent's ``set_session_pinned`` follows every child of a
+    Binds the start id once; descendants start from every ancestor so sibling continuations
+    of a shared parent are covered. Hermes Agent's ``set_session_pinned`` follows every child of a
     compression-ended parent, so a fork would share its parent's pin; this walk does not.
     """
     from api.agent_sessions import continuation_edge_sql
@@ -432,7 +433,7 @@ def _continuation_lineage_cte(columns: set) -> str:
         " ancestors(id) AS (SELECT ? UNION SELECT parent.id FROM ancestors a"
         " JOIN sessions child ON child.id = a.id JOIN sessions parent ON parent.id = child.parent_session_id"
         f" WHERE {edge}),"
-        " descendants(id) AS (SELECT ? UNION SELECT child.id FROM descendants d"
+        " descendants(id) AS (SELECT id FROM ancestors UNION SELECT child.id FROM descendants d"
         " JOIN sessions parent ON parent.id = d.id JOIN sessions child ON child.parent_session_id = parent.id"
         f" WHERE {edge}),"
         " lineage(id) AS (SELECT id FROM ancestors UNION SELECT id FROM descendants) "
@@ -466,7 +467,7 @@ def _write_pin_lineage(db_path: Path, session_id: str, pinned: bool, timeout: fl
                 return False
             if {"parent_session_id", "end_reason"} <= cols:
                 lineage = _continuation_lineage_cte(cols) + "SELECT id FROM lineage"
-                params = (session_id, session_id)
+                params = (session_id,)
             else:
                 lineage, params = "SELECT ?", (session_id,)
             conn.execute(f"UPDATE sessions SET pinned = ? WHERE id IN ({lineage})", (int(bool(pinned)), *params))

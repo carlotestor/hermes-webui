@@ -2687,6 +2687,28 @@ def _carry_pin_under_session_lock(sid: str, profile) -> bool | None:
         return None if uncarried is None else sid not in uncarried
 
 
+def _legacy_sidecar_pinned_ids(profile) -> set[str]:
+    """Ids of every saved sidecar of *profile* with ``pinned: true``, listed or not."""
+    out = set()
+    try:
+        paths = list(SESSION_DIR.glob("*.json"))
+    except OSError:
+        return out
+    for path in paths:
+        if path.name.startswith("_"):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("pinned") is not True:
+            continue
+        sid = str(data.get("session_id") or path.stem).strip()
+        if sid and _pin_profile(data.get("profile")) == profile:
+            out.add(sid)
+    return out
+
+
 def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] | None:
     """Copy sidecar pins into ``sessions.pinned``: all of them once per state.db, then pending ones.
 
@@ -2706,6 +2728,8 @@ def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] 
     todo = {sid for sid in pending if sid in row_pins}
     if key not in migrated:
         todo |= {sid for sid, pinned in row_pins.items() if pinned}
+        # Sidebar rows omit empty Untitled sessions; their saved pins must migrate too.
+        todo |= _legacy_sidecar_pinned_ids(profile)
     unresolved, resolved = set(), set()
     deadline = time.monotonic() + _PIN_MIGRATION_BUDGET_S
     for sid in sorted(todo):

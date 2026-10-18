@@ -119,12 +119,12 @@ CONTINUATION_STARTED_AT_TOLERANCE_SECONDS = 2.0
 def continuation_edge_sql(parent: str, child: str, columns: set[str]) -> str:
     """SQL truth of ``_is_continuation_session(parent, child)`` for joined ``sessions`` aliases.
 
-    Only a compression end continues; forks (``session_source='fork'``), tool rows,
+    Only a compression or cli_close end continues (the sidebar's segment boundary); forks (``session_source='fork'``), tool rows,
     ``_branched_from``/``_delegate_from``/``_reset_from`` children of this parent, cross-source
     children and children started before the boundary are lineage boundaries. Unparsable or
     non-string marker evidence is a boundary too. Missing columns drop their guard.
     """
-    clauses = [f"{parent}.end_reason = 'compression'"]
+    clauses = [f"{parent}.end_reason IN ('compression', 'cli_close')"]
     if 'session_source' in columns:
         clauses.append(f"LOWER(TRIM(COALESCE({child}.session_source, ''))) <> 'fork'")
     if 'source' in columns:
