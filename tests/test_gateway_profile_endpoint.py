@@ -73,11 +73,12 @@ def test_profile_owned_gateway_uses_its_api_server_key_over_the_process_key(home
     assert gateway_chat._gateway_endpoint_for_profile("work") == ("http://work-gw:9000", "work-key-0123456789")
 
 
-def test_profile_owned_gateway_without_key_falls_back_to_the_process_key(homes):
+def test_profile_owned_gateway_without_key_never_gets_the_launcher_key(homes):
     _, work = homes
     (work / ".env").write_text("HERMES_WEBUI_GATEWAY_BASE_URL=http://work-gw:9000\n")
 
-    assert gateway_chat._gateway_endpoint_for_profile("work") == ("http://work-gw:9000", "root-key-0123456789")
+    # the launcher's key is the shared Gateway's; it is never sent to a different Gateway
+    assert gateway_chat._gateway_endpoint_for_profile("work") == ("http://work-gw:9000", "")
 
 
 @pytest.mark.parametrize("profile_url,expected_key", [(SHARED, "root-secret"), ("http://work-gw:9000", "")])
