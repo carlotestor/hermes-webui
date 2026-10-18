@@ -380,6 +380,7 @@ before the session's named-profile Gateway ownership is known.
 - **Memory** -- view and edit MEMORY.md and USER.md inline
 - **Profiles** -- create, switch, delete agent profiles; clone config
 - **Todos** -- live task list from the current session; hidden while the in-chat task list toggle is on, which also disables the workspace-panel Todos tab
+- **Insights** -- token, cost, and skill-usage analytics; period presets (7/30/90/365 days) plus a **Custom range** with start/end date pickers
 - **Spaces** -- add, rename, remove workspaces; quick-switch from topbar
 
 ### Mobile responsive
@@ -764,6 +765,7 @@ The WebUI is still coupled to Hermes Agent internals for runtime execution, prov
 **Using & customizing**
 - [`THEMES.md`](THEMES.md) — theme + skin system, custom theme guide
 - [`docs/workspace-git.md`](docs/workspace-git.md) — the workspace Git controls
+- [`docs/kanban.md`](docs/kanban.md) — the Kanban board's status flow: who may set which column, how tasks enter and leave Scheduled, and the parent re-gating on Scheduled/Blocked → Ready
 - [`docs/EXTENSIONS.md`](docs/EXTENSIONS.md) — administrator-controlled WebUI extension injection
 
 **Deploying & operating**

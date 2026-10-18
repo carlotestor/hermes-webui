@@ -3318,6 +3318,166 @@ window.addEventListener('visibilitychange',()=>{
 // Dynamic model labels -- populated by populateModelDropdown(), fallback to static map
 let _dynamicModelLabels={};
 window._configuredModelBadges=window._configuredModelBadges||{};
+
+// ── Locale-independent model-id sort contract (#7528 round-3) ─────────────
+// Shared with api/config.py `_natural_model_id_key`: NO localeCompare, no
+// browser collation. Both sides run the identical token algorithm so ordering
+// is deterministic across Python/JS boundaries:
+//   1. lowercase the id;
+//   2. split into digit runs and text runs (/\d+|[^\d]+/g);
+//   3. digit vs digit: compare numeric value (strip leading zeros, compare
+//      core length then core text), tie-break on raw run text (007 vs 7);
+//   4. text vs text: compare Unicode code points;
+//   5. digit run sorts before text run at the same position;
+//   6. shorter run list sorts first when prefix-identical.
+function _modelPickerContractRuns(value){
+  return String(value==null?'':value).toLowerCase().match(/\d+|[^\d]+/g)||[];
+}
+function _modelPickerCompareRuns(a,b){
+  const ad=/^\d+$/.test(a), bd=/^\d+$/.test(b);
+  if(ad&&bd){
+    const ac=(a.replace(/^0+/,'')||'0'), bc=(b.replace(/^0+/,'')||'0');
+    if(ac.length!==bc.length) return ac.length<bc.length?-1:1;
+    if(ac!==bc) return ac<bc?-1:1;
+    if(a!==b) return a<b?-1:1;
+    return 0;
+  }
+  if(!ad&&!bd){
+    const la=[...a], lb=[...b];
+    const common=Math.min(la.length,lb.length);
+    for(let i=0;i<common;i++){
+      const ca=la[i].codePointAt(0), cb=lb[i].codePointAt(0);
+      if(ca!==cb) return ca<cb?-1:1;
+    }
+    if(la.length!==lb.length) return la.length<lb.length?-1:1;
+    return 0;
+  }
+  return ad?-1:1;
+}
+function _modelPickerCompareContract(a,b){
+  const ra=_modelPickerContractRuns(a), rb=_modelPickerContractRuns(b);
+  const common=Math.min(ra.length,rb.length);
+  for(let i=0;i<common;i++){
+    const c=_modelPickerCompareRuns(ra[i],rb[i]);
+    if(c!==0) return c;
+  }
+  if(ra.length!==rb.length) return ra.length<rb.length?-1:1;
+  return 0;
+}
+// Provider-routing prefix handling: when a provider context IS known, strip
+// ONLY the exact `@${provider}:` prefix (a bare split on ':' would eat a
+// legit model suffix such as `model-a:free`). When it isn't, the common
+// routing prefixes (@custom:, @provider:name:) are stripped once so named
+// custom IDs still sort on the underlying model id.
+function _modelPickerSortableId(entry,providerHint){
+  let value=String(entry&&entry.value!=null?entry.value:(entry&&entry.id!=null?entry.id:entry)||'');
+  const provider=String(
+    providerHint||
+    (entry&&entry.providerId)||
+    (entry&&entry.provider_id)||
+    (entry&&entry.parentElement&&entry.parentElement.dataset&&entry.parentElement.dataset.provider)||
+    ''
+  ).trim();
+  if(value.startsWith('@')){
+    if(provider){
+      const prefix=`@${provider}:`;
+      if(value.toLowerCase().startsWith(prefix.toLowerCase())) value=value.slice(prefix.length);
+      else{
+        // Known group provider but a different routed prefix (e.g. legacy
+        // alias) — drop the first routing segment conservatively.
+        const colon=value.indexOf(':');
+        if(colon>=0) value=value.slice(colon+1);
+      }
+    }else{
+      // No provider context: strip a single @...: routing segment so named
+      // custom ids (e.g. @custom:name:model-a:free → name:model-a:free) still
+      // compare on the part after the first colon, preserving model suffix
+      // colons. Mirrors _providerFromModelValue semantics.
+      const colon=value.indexOf(':');
+      if(colon>=0) value=value.slice(colon+1);
+    }
+  }
+  return value;
+}
+// Keep the historical name — populated by populateModelDropdown, fallback to static map
+function _modelPickerSortValue(entry,providerHint){
+  return _modelPickerSortableId(entry,providerHint);
+}
+function _compareModelPickerEntries(a,b,providerHint){
+  const av=_modelPickerSortableId(a,providerHint);
+  const bv=_modelPickerSortableId(b,providerHint);
+  const c=_modelPickerCompareContract(av,bv);
+  if(c!==0) return c;
+  // Deterministic tie-break on raw ids (provider-qualified included).
+  const rawA=String(a&&a.value!=null?a.value:(a&&a.id!=null?a.id:a)||'');
+  const rawB=String(b&&b.value!=null?b.value:(b&&b.id!=null?b.id:b)||'');
+  return _modelPickerCompareContract(rawA,rawB);
+}
+function _sortModelPickerEntries(items,providerHint){
+  return Array.from(items||[]).sort((a,b)=>_compareModelPickerEntries(a,b,providerHint));
+}
+function _sortModelPickerOptions(group){
+  if(!group||!group.children) return;
+  const select=group.closest?group.closest('select'):null;
+  // Moving <option> nodes re-parents them, and a <select> keeps its selection
+  // by VALUE, not by node. Reordering therefore resets `selectedIndex` to the
+  // first option whenever the selected value's node moves — so "Show all"
+  // followed by picking another model silently stayed on the old session model
+  // (the unchanged-selection early return then saw a different value). Restore
+  // by OBJECT, never by value: a value match can lose the provider identity of
+  // routed twins that share a bare model id.
+  let selectedOption=null;
+  if(select&&typeof select.selectedOptions!=='undefined'&&select.selectedOptions&&select.selectedOptions.length){
+    selectedOption=select.selectedOptions[0];
+  }
+  const options=Array.from(group.children).filter(option=>option&&option.tagName==='OPTION');
+  // #7528 owner option B: custom/aggregator groups (`custom`, `custom:<name>`)
+  // are natural-sorted whole. Built-in provider groups keep their curated
+  // catalog options in place and natural-sort only the appended `extra`
+  // options (live /v1/models rows, Show-more overflow) as one block after
+  // them. Mirrors api/config.py `_sort_picker_group_models`.
+  const _groupPid=String((group.dataset&&group.dataset.provider)||'').trim().toLowerCase();
+  const _isExtraOption=option=>!!(option.dataset&&option.dataset.extra);
+  const ordered=(_groupPid==='custom'||_groupPid.startsWith('custom:'))
+    ? _sortModelPickerEntries(options)
+    : options.filter(option=>!_isExtraOption(option)).concat(_sortModelPickerEntries(options.filter(_isExtraOption)));
+  if(typeof group.replaceChildren==='function'){
+    group.replaceChildren(...ordered);
+  }else if(Array.isArray(group.children)){
+    // Lightweight DOMs used by the picker regression driver expose children as
+    // an Array. Reorder that array directly so the fallback does not duplicate
+    // options by calling their simplified appendChild implementation.
+    group.children.splice(0,group.children.length,...ordered);
+    for(const option of ordered){
+      option.parentElement=group;
+      if('parentNode' in option) option.parentNode=group;
+    }
+  }else{
+    for(const option of ordered) group.appendChild(option);
+  }
+  if(select&&selectedOption){
+    // #7528 [CORE]: look the captured option up in the WHOLE select, not just
+    // this group. Sorting a second group re-orders its own <optgroup> and
+    // leaves the other groups' options in place, so a selection living in a
+    // different group is still in `select.options` but is no longer in
+    // `group.children` — the old membership check then cleared the selection.
+    const allOptions='options' in select?Array.from(select.options):Array.from(group.children);
+    if(allOptions.indexOf(selectedOption)>=0){
+      selectedOption.selected=true;
+      if('selectedIndex' in select) select.selectedIndex=allOptions.indexOf(selectedOption);
+    }else if('selectedIndex' in select){
+      select.selectedIndex=-1;
+    }
+  }else if(select&&'selectedIndex' in select){
+    // #7528 [SILENT]: a zero-add live refresh on an initially unselected
+    // picker must keep it unselected. `selectedOption` is null here, so the
+    // restore above is skipped entirely and the browser is free to keep (or
+    // adopt) whatever index the re-rendered options left behind — observed as
+    // selectedIndex=-1 becoming a real model, which a later Settings save then
+    // persists as the default. Master preserves the empty selection.
+    select.selectedIndex=-1;
+  }
+}
 const MODEL_STATE_KEY='hermes-webui-model-state';
 const PENDING_SESSION_MODEL_PREFIX='hermes-webui-pending-session-model:';
 const PENDING_SESSION_MODEL_MAX_AGE_MS=10*60*1000;
@@ -4133,6 +4293,52 @@ async function populateModelDropdown(opts={}){
     window._defaultModel=data.default_model||null;
     window._configuredModelBadges=data.configured_model_badges||{};
     window._modelEndpointErrors={};
+    const _sortModelEntries=(items,providerId)=>{
+      const values=Array.from(items||[]);
+      if(typeof _sortModelPickerEntries==='function') return _sortModelPickerEntries(values,providerId);
+      // Minimal self-contained fallback for bare single-function eval harnesses
+      // (test_4737) that lack module-level picker helpers: never reference them
+      // here, and keep the body short so contract-sniffing tests that window
+      // the first chars of populateModelDropdown still see extra_models (#1567).
+      // The fallback must stay locale-INDEPENDENT: no `localeCompare(numeric:true)`,
+      // because the browser collation would tokenize digits under the host
+      // locale and can disagree with the Python ``_natural_model_id_key``
+      // backend (review blocker 3, 2026-09-19). When the contract function
+      // is in scope, delegate to it; otherwise do a deterministic ASCII-aware
+      // [0-9] run split that matches the shared contract tokenization.
+      const _compare=(a,b)=>{
+        if(typeof _modelPickerCompareContract==='function'){
+          return _modelPickerCompareContract(String(a||''),String(b||''));
+        }
+        const _runs=(s)=>String(s||'').toLowerCase().match(/[0-9]+|[^0-9]+/g)||[];
+        const _cmpRuns=(x,y)=>{
+          const _xd=/^[0-9]+$/.test(x), _yd=/^[0-9]+$/.test(y);
+          if(_xd&&_yd){
+            const _xc=(x.replace(/^0+/,'')||'0'), _yc=(y.replace(/^0+/,'')||'0');
+            if(_xc.length!==_yc.length) return _xc.length<_yc.length?-1:1;
+            if(_xc!==_yc) return _xc<_yc?-1:1;
+            if(x!==y) return x<y?-1:1;
+            return 0;
+          }
+          if(!_xd&&!_yd){
+            if(x<y) return -1; if(x>y) return 1; return 0;
+          }
+          return _xd?-1:1;
+        };
+        const _ra=_runs(a), _rb=_runs(b);
+        const _common=Math.min(_ra.length,_rb.length);
+        for(let _i=0;_i<_common;_i++){
+          const _c=_cmpRuns(_ra[_i],_rb[_i]);
+          if(_c!==0) return _c;
+        }
+        if(_ra.length!==_rb.length) return _ra.length<_rb.length?-1:1;
+        return 0;
+      };
+      return values.sort((a,b)=>{
+        const _aid=String(a&&a.id!=null?a.id:a||''), _bid=String(b&&b.id!=null?b.id:b||'');
+        return _compare(_aid,_bid);
+      });
+    };
     // Keep g.extra_models label hydration in this function for /model and tail selections.
 
     const _synthGroupsFromConfigured=()=>{
@@ -4197,7 +4403,11 @@ async function populateModelDropdown(opts={}){
         og.dataset.modelsEndpointError=JSON.stringify(g.models_endpoint_error);
         if(errorKey) window._modelEndpointErrors[errorKey]=g.models_endpoint_error;
       }
-      for(const m of (Array.isArray(g.models)?g.models:[])){
+      // #7528 owner option B: only custom/aggregator groups are re-sorted;
+      // built-in groups keep the curated catalog order the API shipped.
+      const _gPid=String(g.provider_id||'').trim().toLowerCase();
+      const _gModels=Array.isArray(g.models)?g.models:[];
+      for(const m of ((_gPid==='custom'||_gPid.startsWith('custom:'))?_sortModelEntries(_gModels,g.provider_id):_gModels)){
         const opt=document.createElement('option');
         opt.value=m.id;
         opt.textContent=m.label;
@@ -4309,12 +4519,14 @@ function _addLiveModelsToSelect(provider, models, sel){
     }
     if(existingIds.has(mid)) continue;
     const identity=optionIdentity(mid,provider);
+    let twin=null;
     if(existingNorm.has(identity)){
       const sameGroup=Array.from(providerGroup.children||[]).find(o=>optionIdentity(o.value,_getOptionProviderId(o))===identity);
       if(sameGroup){
         const incomingRoutable=String(mid).startsWith('@');
         const existingRoutable=String(sameGroup.value||'').startsWith('@');
         if(!(!existingRoutable&&incomingRoutable)) continue; // let proxy replace catalog twin
+        twin=sameGroup;
       }
     }
     const opt=document.createElement('option');
@@ -4327,13 +4539,26 @@ function _addLiveModelsToSelect(provider, models, sel){
     }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
       opt.dataset.fast='0';
     }
-    providerGroup.appendChild(opt);
+    if(twin){
+      // A routed replacement for a catalog twin takes the twin's place and its
+      // curated/extra status (#7528 option B): dedup then drops the bare twin,
+      // so a built-in group keeps its curated order instead of the replacement
+      // being sorted into the extras block.
+      if(twin.dataset&&twin.dataset.extra) opt.dataset.extra='1';
+      providerGroup.insertBefore(opt,twin);
+    }else{
+      // Not part of the group's curated `models` list: _sortModelPickerOptions
+      // sorts these after the catalog rows of a built-in group (#7528 option B).
+      opt.dataset.extra='1';
+      providerGroup.appendChild(opt);
+    }
     existingIds.add(mid);
     existingNorm.add(identity);
     _dynamicModelLabels[mid]=m.label||m.id;
     added++;
   }
   if(typeof _deduplicateModelPickerOptions==='function') _deduplicateModelPickerOptions(sel,currentVal);
+  if(typeof _sortModelPickerOptions==='function') _sortModelPickerOptions(providerGroup);
   const currentState=(currentVal&&typeof _modelStateForSelect==='function')
     ? _modelStateForSelect(sel, currentVal)
     : {model:currentVal||'', model_provider:(S.session&&S.session.model_provider)||null};
@@ -4714,9 +4939,16 @@ function _positionModelDropdown(){
 
 function _readModelOverflowData(group){
   if(!group||!group.dataset||!group.dataset.extraModels) return [];
+  const _sortOverflowModels=(items)=>{
+    const providerId=(group.dataset&&group.dataset.provider)||'';
+    if(typeof _sortModelPickerEntries==='function') return _sortModelPickerEntries(items,providerId);
+    return Array.from(items||[]).sort((a,b)=>_modelPickerCompareContract(String(a&&a.id||''),String(b&&b.id||'')));
+  };
   try{
     const parsed=JSON.parse(group.dataset.extraModels);
-    return Array.isArray(parsed)?parsed.filter(m=>m&&m.id):[];
+    if(!Array.isArray(parsed)) return [];
+    const models=parsed.filter(m=>m&&m.id);
+    return _sortOverflowModels(models);
   }catch(_e){
     return [];
   }
@@ -4742,11 +4974,15 @@ function _appendOverflowOptionsToGroup(group, extraModels){
     if(existing){
       // Move the already-present option into this group rather than duplicating it.
       if(existing.parentNode!==group) group.appendChild(existing);
+      if(existing.dataset) existing.dataset.extra='1';
       continue;
     }
     const opt=document.createElement('option');
     opt.value=m.id;
     opt.textContent=m.label||m.id;
+    // Overflow rows come from `extra_models`, not the curated `models` list
+    // (#7528 option B: sorted after a built-in group's catalog rows).
+    if(opt.dataset) opt.dataset.extra='1';
     group.appendChild(opt);
     appended++;
   }
@@ -4754,6 +4990,7 @@ function _appendOverflowOptionsToGroup(group, extraModels){
     group.dataset.extraModels='[]';
     group.dataset.overflowExpanded='1';
   }
+  if(typeof _sortModelPickerOptions==='function') _sortModelPickerOptions(group);
   return appended;
 }
 
@@ -4903,6 +5140,78 @@ function renderModelDropdown(){
   const _groupMeta=new Map();
   const _groupOrder=[];
   const _badgeMap=window._configuredModelBadges||{};
+  const _sortPickerEntries=typeof _sortModelPickerEntries==='function'
+    ? _sortModelPickerEntries
+    : (items)=>Array.from(items||[]).sort((a,b)=>{
+        const valueOf=(entry)=>{
+          let value=String(entry&&entry.value!=null?entry.value:(entry&&entry.id!=null?entry.id:entry)||'');
+          const provider=String(entry&&entry.providerId||'').trim();
+          if(value.startsWith('@')){
+            const prefix=provider?`@${provider}:`:'';
+            if(prefix&&value.toLowerCase().startsWith(prefix.toLowerCase())) value=value.slice(prefix.length);
+            else if(value.includes(':')) value=value.slice(value.indexOf(':')+1);
+          }
+          return value;
+        };
+        const av=valueOf(a);
+        const bv=valueOf(b);
+        // Locale-INDEPENDENT comparator contract — no localeCompare(numeric:true)
+        // here, because the browser collation would tokenize digits under the
+        // host locale and could disagree with the Python backend
+        // ``_natural_model_id_key`` (review blocker 3, 2026-09-19). When the
+        // contract function is in scope, delegate to it; otherwise inline the
+        // shared [0-9] run split so an isolated eval harness still tokenizes
+        // identically to the Python side.
+        const _contract=typeof _modelPickerCompareContract==='function'
+          ? _modelPickerCompareContract
+          : null;
+        if(_contract){
+          const rawA=String(a&&a.value!=null?a.value:(a&&a.id!=null?a.id:a)||'');
+          const rawB=String(b&&b.value!=null?b.value:(b&&b.id!=null?b.id:b)||'');
+          return _contract(av,bv)||_contract(rawA,rawB);
+        }
+        const _runs=(s)=>String(s||'').toLowerCase().match(/[0-9]+|[^0-9]+/g)||[];
+        const _cmpRuns=(x,y)=>{
+          const _xd=/^[0-9]+$/.test(x), _yd=/^[0-9]+$/.test(y);
+          if(_xd&&_yd){
+            const _xc=(x.replace(/^0+/,'')||'0'), _yc=(y.replace(/^0+/,'')||'0');
+            if(_xc.length!==_yc.length) return _xc.length<_yc.length?-1:1;
+            if(_xc!==_yc) return _xc<_yc?-1:1;
+            if(x!==y) return x<y?-1:1;
+            return 0;
+          }
+          if(!_xd&&!_yd){
+            if(x<y) return -1; if(x>y) return 1; return 0;
+          }
+          return _xd?-1:1;
+        };
+        const _cmpStr=(p,q)=>{
+          const _rp=_runs(p), _rq=_runs(q);
+          const _common=Math.min(_rp.length,_rq.length);
+          for(let _i=0;_i<_common;_i++){
+            const _c=_cmpRuns(_rp[_i],_rq[_i]);
+            if(_c!==0) return _c;
+          }
+          if(_rp.length!==_rq.length) return _rp.length<_rq.length?-1:1;
+          return 0;
+        };
+        const rawA=String(a&&a.value!=null?a.value:(a&&a.id!=null?a.id:a)||'');
+        const rawB=String(b&&b.value!=null?b.value:(b&&b.id!=null?b.id:b)||'');
+        return _cmpStr(av,bv)||_cmpStr(rawA,rawB);
+      });
+  // #7528 owner option B — WHERE the comparator applies (mirrors
+  // _sortModelPickerOptions and api/config.py `_sort_picker_group_models`):
+  // custom/aggregator groups (`custom`, `custom:<name>`) are natural-sorted
+  // whole; built-in provider groups keep their curated rows in catalog order
+  // and natural-sort only their `extra` rows (Show-more overflow, live
+  // /v1/models additions) as one block after them.
+  const _sortsWholeGroup=(providerId)=>{
+    const pid=String(providerId||'').trim().toLowerCase();
+    return pid==='custom'||pid.startsWith('custom:');
+  };
+  const _orderGroupRows=(rows,providerId)=>_sortsWholeGroup(providerId)
+    ? _sortPickerEntries(rows)
+    : rows.filter(m=>!m.extra).concat(_sortPickerEntries(rows.filter(m=>m.extra)));
   const _ensureGroupMeta=(groupKey,groupLabel,providerId,optgroup)=>{
     if(!_groupMeta.has(groupKey)){
       _groupMeta.set(groupKey,{
@@ -4941,7 +5250,7 @@ function renderModelDropdown(){
         const displayName=rawValue.startsWith('@custom:')
           ? getModelLabel(rawValue)
           : (opt.textContent||getModelLabel(rawValue));
-        const entry={value:opt.value,name:esc(displayName),id:esc(opt.value),group:child.label||'',groupKey,providerId,modelsEndpointError,badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId),hiddenByDefault:false};
+        const entry={value:opt.value,name:esc(displayName),id:esc(opt.value),group:child.label||'',groupKey,providerId,modelsEndpointError,badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId),hiddenByDefault:false,extra:!!(opt.dataset&&opt.dataset.extra)};
         _modelData.push(entry);
         groupMeta.modelCount++;
       }
@@ -4959,6 +5268,7 @@ function renderModelDropdown(){
           modelsEndpointError,
           badge:_getConfiguredModelBadge(overflowModel.id,_badgeMap,providerId),
           hiddenByDefault:true,
+          extra:true,
         });
         groupMeta.modelCount++;
         groupMeta.hiddenCount++;
@@ -5144,6 +5454,62 @@ function renderModelDropdown(){
       // just asked to see more of it) regardless of any prior collapsed state.
       moreEl.remove();
       wrap.style.display='';
+      // Global group re-sort: the in-place reveal above appends overflow rows
+      // before the expander, but every already-visible row keeps its old slot
+      // — so a sorted visible head followed by a sorted overflow tail would
+      // not be globally ordered ([z-*] visible … [a-*] revealed). Re-position
+      // ALL `.model-opt` rows of the group in one picker-order pass so the
+      // fully expanded group follows the option-B order below (#7528).
+      // GUARD: a subgrouped group (OpenRouter/Nous with >= SUB_GROUP_MIN_MODELS
+      // visible rows) nests rows inside `.model-group-body.sub` wrappers. The
+      // in-place re-sort collects rows via `wrap.querySelectorAll('.model-opt')`
+      // and `wrap.appendChild(...)` MOVES them into the outer wrapper, emptying
+      // the subgroup bodies. Subgrouped groups need the full re-render path so
+      // the existing partition/renderer re-creates the per-prefix bodies
+      // (review blocker 1, 2026-09-19). Flat groups keep the in-place path
+      // because it's a cheap contiguous-ordering pass and preserves scroll
+      // position / group-open state across show-more.
+      const _hasSubgroupBodies=!!(wrap.querySelector&&wrap.querySelector('.model-group-body.sub'));
+      if(_hasSubgroupBodies){
+        // Persist the user's "show more" intent on the global cross-render
+        // force-open set BEFORE the full re-render. `_groupOpenState` is
+        // rebuilt per render and defaults to collapsed for a non-selected
+        // group, so without this add the re-render would re-collapse the
+        // just-revealed group and hide the overflow rows the user asked
+        // for (greptile P1 "Expanded group closes again", 2026-09-26).
+        _forceOpenGroups.add(groupKey);
+        _fullReRender();
+        return;
+      }
+      try{
+        const _allRows=Array.from(wrap.querySelectorAll('.model-opt'));
+        const _rowIds=[];
+        for(const _r of _allRows){
+          const _idEl=_r.querySelector('.model-opt-id');
+          const _id=_idEl?_idEl.textContent:'';
+          if(_id) _rowIds.push({row:_r,id:_id});
+        }
+        if(_rowIds.length>1){
+          const _groupProvider=(og.dataset&&og.dataset.provider)||'';
+          const _cmpRows=(x,y)=>{
+            const xKV=x.id.startsWith('@')?{id:x.id,providerId:_groupProvider}:{id:x.id};
+            const yKV=y.id.startsWith('@')?{id:y.id,providerId:_groupProvider}:{id:y.id};
+            return _compareModelPickerEntries(xKV,yKV,_groupProvider);
+          };
+          // #7528 owner option B: a built-in group keeps its curated rows in
+          // place and sorts only its extra rows (revealed overflow + live
+          // /v1/models rows) as one block after them; custom groups re-sort whole.
+          const _extraIds=new Set();
+          for(const _md of _modelData){
+            if(_md&&_md.groupKey===groupKey&&_md.extra){ _extraIds.add(_md.id); _extraIds.add(_md.value); }
+          }
+          const _isExtraRow=_pair=>_extraIds.has(_pair.id);
+          const _orderedRows=_sortsWholeGroup(_groupProvider)
+            ? _rowIds.sort(_cmpRows)
+            : _rowIds.filter(_pair=>!_isExtraRow(_pair)).concat(_rowIds.filter(_isExtraRow).sort(_cmpRows));
+          for(const _pair of _orderedRows) wrap.appendChild(_pair.row);
+        }
+      }catch(_se){ /* keep revealed rows even if re-sort fails */ }
       _forceOpenGroups.add(groupKey);
       const heading=wrap.previousElementSibling;
       if(heading&&heading.classList&&heading.classList.contains('model-group')){
@@ -5156,7 +5522,7 @@ function renderModelDropdown(){
       // not be reset to the top of the list and not have it jump unpredictably.
       if(firstNewRow && typeof firstNewRow.offsetTop==='number' && typeof requestAnimationFrame==='function'){
         const _targetTop=Math.max(0,firstNewRow.offsetTop-48);
-        const _doScroll=()=>{ try{ dd.scrollTop=_targetTop; }catch(_){} };
+        const _doScroll=()=>{ try{ dd.scrollTop=_targetTop;if(typeof _nudgeModelRowBelowStickyStack==='function') _nudgeModelRowBelowStickyStack(dd,firstNewRow); }catch(_){} };
         _doScroll();                                   // immediate
         requestAnimationFrame(()=>{ _doScroll(); requestAnimationFrame(_doScroll); });
         if(typeof setTimeout==='function') setTimeout(_doScroll,80); // after any refocus settles
@@ -5299,13 +5665,13 @@ function renderModelDropdown(){
       const meta=_groupMeta.get(groupKey);
       if(!meta) continue;
       const hiddenCount=_effectiveHiddenCount(groupKey);
-      const groupRows=_modelData.filter(m=>
+      const groupRows=_orderGroupRows(_modelData.filter(m=>
         m.groupKey===groupKey
         && !configuredIds.has(m.value)
         && !m.endpointErrorOnly
         && matches(m)
         && (!m.hiddenByDefault || !!term)
-      );
+      ),meta.providerId);
       const shouldRenderHeading=!!meta.label&&(groupRows.length||meta.endpointErrorOnly||(!term&&hiddenCount));
       if(shouldRenderHeading){
         const heading=document.createElement('div');
@@ -5369,6 +5735,7 @@ function renderModelDropdown(){
             return b[1].length-a[1].length;
           });
           for(const [pfx,pfxRows] of sorted){
+            const orderedPrefixRows=_orderGroupRows(pfxRows,meta.providerId);
             if(pfxRows.length>=2){
               const subKey=`${groupKey}::${pfx}`;
               if(!(subKey in _groupOpenState)) _groupOpenState[subKey]=true;
@@ -5391,9 +5758,9 @@ function renderModelDropdown(){
               });
               wrapper.appendChild(subHeading);
               wrapper.appendChild(subWrapper);
-              for(const m of pfxRows) subWrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
+              for(const m of orderedPrefixRows) subWrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
             } else {
-              for(const m of pfxRows) wrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
+              for(const m of orderedPrefixRows) wrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
             }
           }
         } else {
@@ -5457,6 +5824,7 @@ function renderModelDropdown(){
     const row=rows[idx];
     row.classList.add('is-highlighted');
     if(typeof row.scrollIntoView==='function') row.scrollIntoView({block:'nearest'});
+    if(typeof _nudgeModelRowBelowStickyStack==='function') _nudgeModelRowBelowStickyStack(dd,row);
   };
   _si.addEventListener('keydown',e=>{
     if(e.key==='Escape'){closeDropdown();return;}
@@ -5518,6 +5886,26 @@ async function selectModelFromDropdown(value){
   if(typeof sel.onchange==='function') await sel.onchange();
 }
 
+// The scope note and the search row are both sticky. Measure the live note
+// height (it wraps to two lines in longer locales / narrow sheets) so the
+// search row pins exactly under the note instead of a hard-coded 34px.
+function _syncModelDropdownStickyInsets(dd){
+  if(!dd||typeof dd.querySelector!=='function'||!dd.style) return;
+  const note=dd.querySelector('.model-scope-note');
+  const noteH=(note&&typeof note.getBoundingClientRect==='function')?Math.floor(note.getBoundingClientRect().height):0;
+  if(typeof dd.style.setProperty==='function') dd.style.setProperty('--model-scope-note-h',noteH+'px');
+}
+// scrollIntoView does not know about the pinned note + search stack, so a
+// nearest-scroll (arrow keys) or a clamped centre-scroll (open) can park the
+// row underneath it. Nudge the list so the row's top clears the stack; no-op
+// when it already does.
+function _nudgeModelRowBelowStickyStack(dd,row){
+  if(!dd||!row||typeof row.getBoundingClientRect!=='function'||typeof dd.querySelector!=='function') return;
+  const bottomOf=(el)=>(el&&typeof el.getBoundingClientRect==='function')?el.getBoundingClientRect().bottom:0;
+  const stack=Math.max(bottomOf(dd.querySelector('.model-scope-note')),bottomOf(dd.querySelector('.model-search-row')));
+  const top=row.getBoundingClientRect().top;
+  if(top<stack) dd.scrollTop-=Math.ceil(stack-top);
+}
 async function toggleModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
@@ -5537,8 +5925,10 @@ async function toggleModelDropdown(){
   renderModelDropdown();
   dd.classList.add('open');
   _positionModelDropdown();
+  _syncModelDropdownStickyInsets(dd);
   const activeRow=dd.querySelector('.model-opt.active');
-  if(activeRow&&typeof activeRow.scrollIntoView==='function') activeRow.scrollIntoView({block:'nearest'});
+  if(activeRow&&typeof activeRow.scrollIntoView==='function') activeRow.scrollIntoView({block:'center'});
+  _nudgeModelRowBelowStickyStack(dd,activeRow);
   chip.classList.add('active');
   const mobileAction=$('composerMobileModelAction');
   if(mobileAction) mobileAction.classList.add('active');
@@ -5667,7 +6057,12 @@ document.addEventListener('click',e=>{
 });
 window.addEventListener('resize',()=>{
   const dd=$('composerModelDropdown');
-  if(dd&&dd.classList.contains('open')) _positionModelDropdown();
+  if(dd&&dd.classList.contains('open')){
+    _positionModelDropdown();
+    // The scope note re-wraps at a new width, so its measured height (and the
+    // search row's sticky offset) must be recomputed on every resize.
+    if(typeof _syncModelDropdownStickyInsets==='function') _syncModelDropdownStickyInsets(dd);
+  }
   // Keep the reasoning dropdown aligned under its chip when the window
   // resizes while open — same pattern as the model dropdown above.
   const rdd=$('composerReasoningDropdown');
@@ -5688,7 +6083,12 @@ function _repositionOpenModelDropdown(){
   requestAnimationFrame(()=>{
     _modelDropdownRepositionScheduled=false;
     const openDd=$('composerModelDropdown');
-    if(openDd&&openDd.classList.contains('open')) _positionModelDropdown();
+    if(openDd&&openDd.classList.contains('open')){
+      _positionModelDropdown();
+      // A rotation / keyboard-open can also re-wrap the scope note, so refresh
+      // the sticky inset here too (same reason as the resize handler above).
+      if(typeof _syncModelDropdownStickyInsets==='function') _syncModelDropdownStickyInsets(openDd);
+    }
   });
 }
 if(window.visualViewport){
@@ -9835,10 +10235,16 @@ function copyToastText(btn){
   _copyText(text).then(done).catch(()=>{});
 }
 function showToast(msg,ms,type){
+  // A type name in the duration slot (showToast(msg,'error') or showToast(msg,'info',6000)) is a type, not a
+  // duration: setTimeout(fn,'error') fires at once, so those toasts vanished as soon as they appeared.
+  if(typeof ms==='string'&&/^(error|success|warning|info)$/.test(ms)&&(type==null||typeof type==='number')){
+    const swapped=type;type=ms;ms=(typeof swapped==='number')?swapped:null;
+  }
   const el=$('toast');if(!el)return;
   const s=String(msg==null?'':msg);let t=type;
   if(!t){const low=s.toLowerCase();if(/fail|error|denied|invalid|unavailable|no active|no workspace match|no model match|no personalities/.test(low))t='error';else if(/warn|queued|takes effect|skipped|fallback/.test(low))t='warning';else if(/saved|created|imported|restored|switched|set to|updated|duplicated|moved to|renamed|deleted|complete|pinned|archived|cleared|stopped/.test(low))t='success';else t='info';}
-  const duration=(ms==null)?(t==='error'?TOAST_ERROR_DEFAULT_MS:TOAST_DEFAULT_MS):ms;
+  // 0 (the old "use default" sentinel) and other non-positive or non-numeric values mean the default, not "hide now".
+  const duration=(ms==null||!(Number(ms)>0))?(t==='error'?TOAST_ERROR_DEFAULT_MS:TOAST_DEFAULT_MS):ms;
   el.className='toast show '+t;
   el.dataset.toastMessage=s;
   if(t==='error') el.innerHTML=`<span class="toast-message">${esc(s)}</span><button class="toast-copy" type="button" data-toast-copy="1" onclick="copyToastText(this);event.stopPropagation()">Copy</button><button class="toast-dismiss" type="button" aria-label="Dismiss error toast" data-toast-dismiss="1" onclick="dismissToast(this);event.stopPropagation()">Dismiss</button>`;
@@ -13535,6 +13941,116 @@ function _worklogDetailScrollableBody(el){
   if(!el||!el.querySelector) return null;
   return el.querySelector('.thinking-card-body,.tool-card-detail');
 }
+// Live thinking tail-follow: reasoning text that streams into an expanded
+// thinking card should keep scrolling into view the way the message pane
+// follows its bottom, while a reader who scrolls up inside the card is held
+// in place. Tail-follow state is EXPLICIT to live thinking rows: a settled
+// card is never seeded or pinned, so it keeps master's open-at-top reading
+// behavior. The latch below records per-body follow intent on live bodies
+// only (true at stream start, flipped by the passive scroll listener as the
+// reader moves: hold away from the tail, resume at the tail), and the detail
+// capture/restore path carries it across DOM rebuilds via the atBottom
+// snapshot field, which is recorded only for bodies that participate.
+const _THINKING_TAIL_STICK_PX=24;
+function _thinkingRowIsLive(row){
+  if(!row||!row.getAttribute) return false;
+  if(row.getAttribute('data-live-thinking-row')==='1') return true;
+  if(row.getAttribute('data-live-thinking')==='1') return true;
+  if(row.getAttribute('data-thinking-active')==='1') return true;
+  return !!(row.closest&&row.closest('[data-live-anchor-scene-owner="1"],[data-live-tool-call-group="1"],[data-live-assistant-turn="1"]'));
+}
+function _bindThinkingTailFollow(body, atTail){
+  if(!body||typeof body.addEventListener!=='function') return;
+  // atTail===undefined: a live body's own write seeds follow=true only when
+  // the latch is unset. An explicit atTail is AUTHORITATIVE (restore replaying
+  // captured intent onto a rebuilt body): it overrides the latch, or a body
+  // recreated mid-hold would be re-seeded true by its creation write and yank
+  // the reader to the bottom on the next rebuild.
+  if(atTail===undefined){
+    if(body._thinkingTailFollow===undefined) body._thinkingTailFollow=true;
+  }else{
+    body._thinkingTailFollow=!!atTail;
+  }
+  if(body._thinkingTailFollowBound) return;
+  body._thinkingTailFollowBound=true;
+  body.addEventListener('scroll',()=>{
+    const room=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+    body._thinkingTailFollow=room-(Number(body.scrollTop)||0)<=_THINKING_TAIL_STICK_PX;
+  },{passive:true});
+}
+function _thinkingCardOpened(card){
+  // Shared by _toggleThinkingCard and _setTransparentCardOpen. The open
+  // transition animates the body height from zero, so measuring immediately
+  // classifies even a card that will fit when fully open as away from the tail
+  // (#7988 review) — settle the follow state once the layout is stable. Until
+  // then the latch stays unset and no write may pin (follow requires ===true).
+  const body=card&&card.querySelector?card.querySelector('.thinking-card-body'):null;
+  if(!body) return;
+  // Settled history must never acquire follow state: capture trusts the latch
+  // over the real position, so binding here makes a persisted card jump to the
+  // bottom on any later re-render (e.g. a 1280->390 reflow) (#7988 review).
+  const row=body.closest?body.closest('.msg,.thinking-row,[data-live-thinking-row]'):null;
+  if(typeof _thinkingRowIsLive==='function'&&!_thinkingRowIsLive(row||card)) return;
+  let done=false;
+  // Published so both tail writers can exclude a body whose open animation is
+  // still running: a delta landing inside the settle window must not pin a
+  // reader who is holding at the top (#7988 review).
+  // Each open supersedes the previous one's settle window. Without this, a
+  // stale timer from an earlier open (quick close+reopen) fires mid-animation
+  // of the current open and strands a card that will fit on HOLD (#7988
+  // review). A stale settle is a complete no-op: it must not clear the new
+  // settling flag or seed anything.
+  body._thinkingTailSettleGen=(Number(body._thinkingTailSettleGen)||0)+1;
+  const gen=body._thinkingTailSettleGen;
+  body._thinkingTailSettling=true;
+  const settle=(ev)=>{
+    if(gen!==body._thinkingTailSettleGen){
+      if(typeof body.removeEventListener==='function') body.removeEventListener('transitionend', settle);
+      return;
+    }
+    // Any transitionend on the body fires this, but opacity finishes well
+    // before max-height — measuring then reads a mid-animation height and
+    // seeds HOLD on a card that actually fits (#7988 review).
+    if(ev&&ev.propertyName&&ev.propertyName!=='max-height') return;
+    if(ev&&ev.target&&ev.target!==body) return;
+    if(done) return;
+    done=true;
+    body._thinkingTailSettling=false;
+    if(typeof body.removeEventListener==='function') body.removeEventListener('transitionend', settle);
+    // Closed again before the transition finished (quick re-toggle): leave the
+    // latch untouched so the reopen re-arms and seeds from a real layout,
+    // instead of stranding a live card on a collapsed-body measurement.
+    if(card&&card.classList&&!card.classList.contains('open')) return;
+    // Re-check at fire time, not at arm time: a scroll between open and
+    // settle (or a refresh that re-armed this on an already-open card) must
+    // not yank the reader (#7988 review). Seed only if still unset, pin only
+    // if still following.
+    if(body._thinkingTailFollow===undefined&&typeof _bindThinkingTailFollow==='function'){
+      _bindThinkingTailFollow(body, _worklogDetailBodyAtTail(body));
+    }
+    if(body._thinkingTailFollow===true){
+      body.scrollTop=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+    }
+  };
+  if(typeof body.addEventListener==='function') body.addEventListener('transitionend', settle);
+  // Fallback when no transition runs (reduced motion, no CSS transition).
+  if(typeof setTimeout==='function') setTimeout(settle, 350);
+}
+function _toggleThinkingCard(card){
+  if(!card||!card.classList) return;
+  const opening=!card.classList.contains('open');
+  card.classList.toggle('open', opening);
+  if(opening) _thinkingCardOpened(card);
+}
+function _worklogDetailBodyAtTail(body){
+  if(!body) return true;
+  if(body._thinkingTailFollow===true) return true;
+  if(body._thinkingTailFollow===false) return false;
+  // Unbound body (e.g. a settled card that never streamed): fall back to the
+  // literal scroll position.
+  const room=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+  return room-(Number(body.scrollTop)||0)<=_THINKING_TAIL_STICK_PX;
+}
 function _setWorklogDetailDisclosureOpen(el, open){
   if(!el||!el.classList) return;
   // #5966 (Codex F2 r2): restoring an OPEN state on a settled Transparent Stream
@@ -13575,10 +14091,21 @@ function _captureWorklogDetailDisclosureState(root){
     const key=_worklogDetailDisclosureKeyForElement(el, counts);
     if(!key) return;
     const body=_worklogDetailScrollableBody(el);
-    state.set(key,{
+    // atBottom is tail-follow state and is recorded ONLY for live thinking
+    // bodies that participate in tail-follow. Tool-card details and settled
+    // thinking cards keep master's plain absolute-offset restore. Liveness is
+    // part of the gate: a completed card keeps its streaming latch, and
+    // trusting that latch in capture would jump settled history on any later
+    // re-render (#7988 review).
+    const rowForLiveness=el.closest?el.closest('.agent-activity-thinking,.thinking-card-row,.thinking-row'):null;
+    const rowLive=typeof _thinkingRowIsLive==='function'?_thinkingRowIsLive(rowForLiveness):true;
+    const participates=!!(body&&body.classList&&body.classList.contains('thinking-card-body')&&body._thinkingTailFollow!==undefined&&rowLive);
+    const snap={
       open:_worklogDetailDisclosureIsOpen(el),
       scrollTop:body?Math.max(0,Number(body.scrollTop)||0):0,
-    });
+    };
+    if(participates) snap.atBottom=_worklogDetailBodyAtTail(body);
+    state.set(key,snap);
   });
   return state;
 }
@@ -13594,9 +14121,58 @@ function _restoreWorklogDetailDisclosureState(root, state){
     const open=(saved&&typeof saved==='object'&&'open' in saved)?saved.open:saved;
     _setWorklogDetailDisclosureOpen(el, open);
     const scrollTop=(saved&&typeof saved==='object')?Number(saved.scrollTop):0;
-    if(open&&Number.isFinite(scrollTop)&&scrollTop>0){
-      const body=_worklogDetailScrollableBody(el);
-      if(body) body.scrollTop=Math.min(scrollTop, Math.max(0, body.scrollHeight-body.clientHeight));
+    // Only snapshots that carried tail-follow state (participating live
+    // thinking bodies) bind the rebuilt body; everything else — tool details,
+    // settled cards, legacy boolean snapshots — keeps master's plain
+    // absolute-offset restore with no follow latch. The DESTINATION row must
+    // be live too: a settled destination ignores atBottom and restores its
+    // saved absolute offset (#7988 review).
+    const destRow=el.closest?el.closest('.agent-activity-thinking,.thinking-card-row,.thinking-row'):null;
+    const destLive=typeof _thinkingRowIsLive==='function'?_thinkingRowIsLive(destRow):true;
+    const hasFollow=!!(destLive&&saved&&typeof saved==='object'&&'atBottom' in saved);
+    const atBottom=hasFollow&&saved.atBottom===true;
+    const body=_worklogDetailScrollableBody(el);
+    // Follow intent is restored for live destinations whether or not the card
+    // is open: a collapsed following card must resume follow on reopen, not be
+    // re-measured at its top and put on hold (#7988 review). Nothing scrolls
+    // while closed — only the latch is carried.
+    if(body&&hasFollow&&typeof _bindThinkingTailFollow==='function') _bindThinkingTailFollow(body, atBottom);
+    if(open){
+      if(body){
+        // Carry the captured follow/hold intent across the rebuild (seeded
+        // WITH its scroll listener so later reader movement still counts) and
+        // re-pin tail readers to the NEW bottom — content may have grown while
+        // the DOM was rebuilt. Readers who had scrolled up get their absolute
+        // offset replayed.
+        // The re-pin reads scrollHeight; skip it on a collapsed card (the tail
+        // read forces a layout) — _toggleThinkingCard re-pins on open.
+        const elOpen=!el.classList||el.classList.contains('open');
+        if(atBottom&&elOpen){
+          body.scrollTop=Math.max(0, body.scrollHeight-body.clientHeight);
+        }else if(Number.isFinite(scrollTop)&&scrollTop>0){
+          body.scrollTop=Math.min(scrollTop, Math.max(0, body.scrollHeight-body.clientHeight));
+        }
+        // A live body whose follow state was never established — the first
+        // open was interrupted by this very rebuild and its settle window died
+        // with the old body — must finish opening, or it stays follow-less
+        // forever (#7988 review).
+        if(destLive&&body.classList&&body.classList.contains('thinking-card-body')&&body._thinkingTailFollow===undefined){
+          // A body that is inserted and opened in the same task runs no
+          // transition, so it is already at final layout and can be seeded
+          // immediately. This is the common case in compact_worklog, where
+          // every delta recreates the row and a replacement body would be
+          // discarded before its settle window ever fires (#7988 review).
+          if(elOpen&&!body._thinkingTailSettling&&(Number(body.clientHeight)||0)>0&&typeof _bindThinkingTailFollow==='function'){
+            _bindThinkingTailFollow(body, _worklogDetailBodyAtTail(body));
+            if(body._thinkingTailFollow===true) body.scrollTop=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+          }else if(typeof _thinkingCardOpened==='function'){
+            // Mid-transition replacement (clientHeight still 0): arm the
+            // settle window on the REPLACEMENT body so it seeds from its real
+            // position once the open finishes.
+            _thinkingCardOpened(el);
+          }
+        }
+      }
     }
   });
 }
@@ -13605,15 +14181,19 @@ function _thinkingCardHtml(text, open){
   const copyBtn=`<button class="thinking-copy-btn" onclick="event.stopPropagation();_copyThinkingText(this)" title="${t('copy')}" aria-label="${t('copy')}">${li('copy',12)}</button>`;
   const shouldOpen=!!open||_worklogDetailsExpandedDefault();
   const classes=`thinking-card${shouldOpen?' open':''}`;
-  return `<div class="${classes}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
+  return `<div class="${classes}"><div class="thinking-card-header" onclick="_toggleThinkingCard(this.parentElement)"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
 }
 function isSimplifiedToolCalling(){
   return window._simplifiedToolCalling!==false;
 }
-function _thinkingActivityNode(text, open, disclosureKey){
+function _thinkingActivityNode(text, open, disclosureKey, live){
   const row=document.createElement('div');
   row.className='agent-activity-thinking';
   row.setAttribute('data-worklog-thinking-card','1');
+  // Mark live rows BEFORE the creation write: the row is still detached here,
+  // and tail-follow must know this body is allowed to follow while settled
+  // cards are not.
+  if(live) row.setAttribute('data-live-thinking-row','1');
   if(disclosureKey) row.setAttribute('data-thinking-key', String(disclosureKey));
   row.innerHTML=_thinkingCardHtml(text, open);
   _renderThinkingInto(row,text);
@@ -13954,7 +14534,13 @@ function _setTransparentCardOpen(card, open){
   if(expanded&&row&&row.getAttribute('data-transparent-detail-deferred')==='1'){
     _materializeTransparentToolDetail(row);
   }
+  const wasOpen=!!(card.classList&&card.classList.contains('open'));
   card.classList.toggle('open',expanded);
+  // Arm follow-state settling only on a real closed→open transition. The
+  // rehydrate path re-applies the current open state on every refresh; arming
+  // there would schedule a delayed pin on an already-open card that can fire
+  // after the reader scrolled up (#7988 review).
+  if(expanded&&!wasOpen&&typeof _thinkingCardOpened==='function') _thinkingCardOpened(card);
   if(row) row.setAttribute('data-expanded',expanded?'1':'0');
   const header=card.querySelector('.tool-card-header,.thinking-card-header');
   if(header) header.setAttribute('aria-expanded',expanded?'true':'false');
@@ -14990,7 +15576,7 @@ function _appendWorklogStep(group, anchor, cards, thinkingText, opts){
     const thinkingKey=(opts&&opts.thinkingKey)||`reason:${String(thinkingText).trim()}`;
     const thinkingDisclosureKey=(opts&&opts.thinkingDisclosureKey)||thinkingKey;
     if(!seenReasons||!seenReasons.has(thinkingKey)){
-      const thinking=_thinkingActivityNode(thinkingText, false, thinkingDisclosureKey);
+      const thinking=_thinkingActivityNode(thinkingText, false, thinkingDisclosureKey, !!(opts&&opts.live));
       if(thinking){
         list.appendChild(thinking);
         wroteProse=true;
@@ -15182,7 +15768,7 @@ function _anchorSceneNodeForRow(row, opts){
     if(window._showThinking===false) return null;
     const text=String(row.text||row.thinking&&row.thinking.text||'').trim();
     if(!text) return null;
-    node=_thinkingActivityNode(text, false, row.row_id||row.local_id||'anchor-thinking');
+    node=_thinkingActivityNode(text, false, row.row_id||row.local_id||'anchor-thinking', !settled);
   }else if(row.role==='tool'){
     node=buildToolCard(_anchorSceneToolCallFromRow(row,opts));
   }else if(row.role==='lifecycle'){
@@ -15257,7 +15843,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
     if(window._showThinking===false) return null;
     const text=String(row.text||row.thinking&&row.thinking.text||'').trim();
     if(!text) return null;
-    node=_decorateTransparentEventRow(_thinkingActivityNode(text,false,row.row_id||row.local_id||'anchor-thinking'),{
+    node=_decorateTransparentEventRow(_thinkingActivityNode(text,false,row.row_id||row.local_id||'anchor-thinking', live),{
       type:'thinking',
       text,
       preview:text,
@@ -15861,8 +16447,23 @@ function _refreshTransparentThinkingLiveRow(existing, node){
   const existingPre = existing.querySelector('.thinking-card-body pre');
   const nodePre = node.querySelector('.thinking-card-body pre');
   if(!existingPre || !nodePre) return false;
+  const thinkingBody = existingPre.closest ? existingPre.closest('.thinking-card-body') : null;
+  // Same tail-follow rule as _renderThinkingInto: only LIVE, OPEN thinking
+  // rows may seed the follow latch or move their body to the tail (a
+  // collapsed body's tail read would force a layout per delta).
+  const thinkingLive = typeof _thinkingRowIsLive==='function'?_thinkingRowIsLive(existing):true;
+  const thinkingCard = thinkingBody&&thinkingBody.closest?thinkingBody.closest('.thinking-card'):null;
+  const thinkingOpen = !thinkingCard||(thinkingCard.classList&&thinkingCard.classList.contains('open'));
+  // A body still running its open animation is excluded: seeding or pinning
+  // inside that window yanks a reader holding at the top (#7988 review).
+  const thinkingSettling = !!(thinkingBody&&thinkingBody._thinkingTailSettling);
+  if(thinkingBody&&thinkingLive&&thinkingOpen&&!thinkingSettling&&typeof _bindThinkingTailFollow==='function') _bindThinkingTailFollow(thinkingBody);
+  const thinkingFollow = thinkingBody&&thinkingLive&&thinkingOpen&&!thinkingSettling&&thinkingBody._thinkingTailFollow===true;
   const nextText = String(nodePre.textContent || '');
-  if(existingPre.textContent !== nextText) existingPre.textContent = nextText;
+  if(existingPre.textContent !== nextText){
+    existingPre.textContent = nextText;
+    if(thinkingFollow) thinkingBody.scrollTop=Math.max(0,(Number(thinkingBody.scrollHeight)||0)-(Number(thinkingBody.clientHeight)||0));
+  }
   const nodePreview = node.querySelector('.transparent-event-thinking-preview');
   const previewText = nodePreview ? String(nodePreview.textContent || '') : nextText;
   if(typeof _decorateTransparentEventRow === 'function'){
@@ -20501,7 +21102,7 @@ function renderMessages(options){
             // Echoed reasoning already rendered for this turn — skip the duplicate.
           }else{
             if(_thinkKey)_seen.add(_thinkKey);
-            const thinkingRow=_decorateTransparentEventRow(_thinkingActivityNode(event.thinkingText,false),{
+            const thinkingRow=_decorateTransparentEventRow(_thinkingActivityNode(event.thinkingText,false,null,false),{
               type:'thinking',
               text:event.thinkingText,
               preview:event.thinkingText,
@@ -22409,6 +23010,25 @@ function addCopyButtons(container){
 let _mermaidLoading=false;
 let _mermaidReady=false;
 
+function _mediaPreviewErrorKey(error,fallbackKey){
+  const status=Number(error&&error.status);
+  if(status===401) return 'media_preview_unauthorized';
+  if(status===403) return 'media_preview_forbidden';
+  if(status===404) return 'media_preview_not_found';
+  return fallbackKey;
+}
+
+function _mediaPreviewAllowsDownload(errorKey){
+  return errorKey!=='media_preview_unauthorized'&&errorKey!=='media_preview_forbidden'&&errorKey!=='media_preview_not_found';
+}
+
+function _requireMediaResponse(response){
+  if(response.ok) return response;
+  const error=new Error(String(response.status));
+  error.status=response.status;
+  throw error;
+}
+
 function loadDiffInline(container){
   const DIFF_MAX_SIZE=512*1024; // 512 KB cap for inline diff rendering
   const root=container||document;
@@ -22417,7 +23037,7 @@ function loadDiffInline(container){
     const path=el.dataset.path;
     const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
     fetch(_mediaPreviewUrl(path,{snap:snap||undefined}))
-      .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
+      .then(r=>_requireMediaResponse(r).text())
       .then(text=>{
         if(text.length>DIFF_MAX_SIZE){
           el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('diff_too_large')}</span></div>`;
@@ -22432,8 +23052,8 @@ function loadDiffInline(container){
         }).join('\n');
         el.outerHTML=`<div class="diff-inline"><div class="pre-header">${esc(path.split('/').pop())}</div><pre class="diff-block"><code>${lines}</code></pre></div>`;
       })
-      .catch(()=>{
-        el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('diff_error')}</span></div>`;
+      .catch(error=>{
+        el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t(_mediaPreviewErrorKey(error,'diff_error'))}</span></div>`;
       });
   });
 }
@@ -22492,7 +23112,10 @@ function buildCsvTablePreview(path, text, downloadUrl=''){
 
 function _csvPreviewErrorHtml(path, errorKey, downloadUrl=_csvMediaUrl(path,{download:true})){
   const fname=path.split('/').pop()||path;
-  return `<div class="diff-inline-error">${esc(fname)}<br><a class="msg-media-link" href="${esc(downloadUrl)}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
+  const downloadHtml=_mediaPreviewAllowsDownload(errorKey)
+    ? `<br><a class="msg-media-link" href="${esc(downloadUrl)}" download="${esc(fname)}">📎 ${esc(fname)}</a>`
+    : '';
+  return `<div class="diff-inline-error">${esc(fname)}${downloadHtml}<br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
 }
 
 function loadCsvInline(container){
@@ -22504,13 +23127,13 @@ function loadCsvInline(container){
     const mediaUrl=_csvMediaUrl(path,{snap:snap||undefined});
     const downloadUrl=_csvMediaUrl(path,{download:true,snap:snap||undefined});
     fetch(mediaUrl)
-      .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
+      .then(r=>_requireMediaResponse(r).text())
       .then(text=>{
         const preview=buildCsvTablePreview(path, text, downloadUrl);
         el.outerHTML=preview.html||_csvPreviewErrorHtml(path, preview.errorKey||'csv_error', downloadUrl);
       })
-      .catch(()=>{
-        el.outerHTML=_csvPreviewErrorHtml(path, 'csv_error', downloadUrl);
+      .catch(error=>{
+        el.outerHTML=_csvPreviewErrorHtml(path, _mediaPreviewErrorKey(error,'csv_error'), downloadUrl);
       });
   });
 }
@@ -22524,7 +23147,7 @@ function loadExcalidrawInline(container){
     const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
     const downloadUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
     fetch(_mediaPreviewUrl(path,{snap:snap||undefined}))
-      .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
+      .then(r=>_requireMediaResponse(r).text())
       .then(text=>{
         if(text.length>EXCALIDRAW_MAX_SIZE){
           el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('excalidraw_too_large')}</span></div>`;
@@ -22551,8 +23174,8 @@ function loadExcalidrawInline(container){
         // Lazy-init Excalidraw render after DOM insertion
         requestAnimationFrame(()=>_renderExcalidrawCanvases());
       })
-      .catch(()=>{
-        el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('excalidraw_error')}</span></div>`;
+      .catch(error=>{
+        el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t(_mediaPreviewErrorKey(error,'excalidraw_error'))}</span></div>`;
       });
   });
 }
@@ -22656,7 +23279,7 @@ function loadPdfInline(container){
     const dlUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
     const loadPdf=(pdfjsLib)=>{
       fetch(mediaUrl)
-        .then(r=>{if(!r.ok) throw new Error(r.status); return r.arrayBuffer();})
+        .then(r=>_requireMediaResponse(r).arrayBuffer())
         .then(buf=>{
           if(buf.byteLength>PDF_MAX_SIZE){
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_too_large')}</span></div>`;
@@ -22703,8 +23326,13 @@ function loadPdfInline(container){
           };
           renderPage(1);
         })
-        .catch(()=>{
-          el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_error')}</span></div>`;
+        .catch(error=>{
+          const errorKey=_mediaPreviewErrorKey(error,'pdf_error');
+          const fileHtml=_mediaPreviewAllowsDownload(errorKey)
+            ? `<a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a>`
+            : esc(fname);
+          const errorClass=_mediaPreviewAllowsDownload(errorKey)?'pdf-preview-fallback':'diff-inline-error';
+          el.outerHTML=`<div class="${errorClass}">${fileHtml}<br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
         });
     };
     if(_pdfjsReady){
@@ -22747,7 +23375,7 @@ function loadHtmlInline(container){
     const openUrl=_mediaPreviewUrl(path,{inline:true,snap:snap||undefined});
     const dlUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
     fetch(mediaUrl, {cache:'no-store'})
-      .then(r=>{if(!r.ok) throw new Error(r.status); return r.text();})
+      .then(r=>_requireMediaResponse(r).text())
       .then(html=>{
         if(html.length>HTML_MAX_SIZE){
           el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${openUrl}" target="_blank" rel="noopener">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_too_large')}</span></div>`;
@@ -22756,8 +23384,13 @@ function loadHtmlInline(container){
         const safeHtml=html.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
         el.outerHTML=`<div class="html-preview-wrap"><div class="html-preview-header"><span>${t('html_sandbox_label')}</span><a href="${openUrl}" target="_blank" rel="noopener" class="html-open-link">${t('html_open_full')} ↗</a></div><iframe srcdoc="${safeHtml}" sandbox="allow-scripts" class="html-preview-iframe" loading="lazy"></iframe></div>`;
       })
-      .catch(()=>{
-        el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_error')}</span></div>`;
+      .catch(error=>{
+        const errorKey=_mediaPreviewErrorKey(error,'html_error');
+        const fileHtml=_mediaPreviewAllowsDownload(errorKey)
+          ? `<a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a>`
+          : esc(fname);
+        const errorClass=_mediaPreviewAllowsDownload(errorKey)?'html-preview-fallback':'diff-inline-error';
+        el.outerHTML=`<div class="${errorClass}">${fileHtml}<br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
       });
   });
 }
@@ -22893,7 +23526,7 @@ function _thinkingMarkup(text=''){
   const clean=_sanitizeThinkingDisplayText(text);
   const openClass=_worklogDetailsExpandedDefault()?' open':'';
   return (clean&&String(clean).trim())
-    ? `<div class="thinking-card${openClass}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(String(clean).trim())}</pre></div></div>`
+    ? `<div class="thinking-card${openClass}"><div class="thinking-card-header" onclick="_toggleThinkingCard(this.parentElement)"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(String(clean).trim())}</pre></div></div>`
     : `<div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
 }
 function _renderThinkingInto(row,text=''){
@@ -22905,7 +23538,26 @@ function _renderThinkingInto(row,text=''){
   }
   const pre=row.querySelector('.thinking-card-body pre');
   if(pre){
+    const body=pre.closest?pre.closest('.thinking-card-body'):null;
+    // Tail-follow applies to LIVE thinking rows only. A settled card (or any
+    // body whose reader has scrolled up) keeps its scroll position: a creation
+    // write must never seed the follow latch or the next rebuild would jump a
+    // settled top-of-card reader to the bottom.
+    const live=typeof _thinkingRowIsLive==='function'?_thinkingRowIsLive(row):true;
+    // Collapsed cards neither bind nor pin: the tail read forces a layout on
+    // every delta (#7988 review) and the reader cannot see the stream anyway.
+    // A body that opens later seeds its follow state from its real position
+    // in _toggleThinkingCard.
+    const card=body&&body.closest?body.closest('.thinking-card'):null;
+    const open=!card||(card.classList&&card.classList.contains('open'));
+    // A body still running its open animation is excluded: seeding or pinning
+    // inside that window yanks a reader holding at the top (#7988 review).
+    const settling=!!(body&&body._thinkingTailSettling);
+    if(body&&live&&open&&!settling&&typeof _bindThinkingTailFollow==='function') _bindThinkingTailFollow(body);
+    const follow=body&&live&&open&&!settling&&body._thinkingTailFollow===true;
+    const changed=pre.textContent!==clean;
     pre.textContent=clean;
+    if(follow&&changed) body.scrollTop=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
     return;
   }
   row.innerHTML=_thinkingMarkup(text);
@@ -22923,6 +23575,7 @@ function finalizeThinkingCard(){
       row.removeAttribute('id');
       row.removeAttribute('data-thinking-active');
       row.removeAttribute('data-live-thinking');
+      row.removeAttribute('data-live-thinking-row');
     }
     return;
   }
@@ -22956,6 +23609,7 @@ function finalizeThinkingCard(){
     turn.querySelectorAll('.agent-activity-thinking[data-thinking-active="1"]').forEach(active=>{
       active.removeAttribute('data-thinking-active');
       active.removeAttribute('data-live-thinking');
+      active.removeAttribute('data-live-thinking-row');
     });
     _syncToolCallGroupSummary(group);
   }
@@ -23020,7 +23674,7 @@ function appendThinking(text='', options){
     if(isTransparentStream()){
       let row=blocks.querySelector(`.agent-activity-thinking[data-live-thinking="1"][data-live-thinking-key="${CSS.escape(thinkingKey)}"]`);
       if(!row){
-        row=_thinkingActivityNode(clean, false);
+        row=_thinkingActivityNode(clean, false, null, true);
         row.id='thinkingRow';
         row.setAttribute('data-live-thinking','1');
         row.setAttribute('data-live-thinking-key',thinkingKey);
@@ -23031,6 +23685,7 @@ function appendThinking(text='', options){
             el.removeAttribute('id');
             el.removeAttribute('data-thinking-active');
             el.removeAttribute('data-live-thinking');
+            el.removeAttribute('data-live-thinking-row');
           }
         });
         row.setAttribute('data-thinking-active','1');
@@ -23069,7 +23724,7 @@ function appendThinking(text='', options){
     if(list){
       let row=list.querySelector(`.agent-activity-thinking[data-live-thinking="1"][data-live-thinking-key="${CSS.escape(thinkingKey)}"]`);
       if(!row){
-        row=_thinkingActivityNode(clean, false, thinkingKey);
+        row=_thinkingActivityNode(clean, false, thinkingKey, true);
         row.setAttribute('data-live-thinking','1');
         row.setAttribute('data-live-thinking-key',thinkingKey);
         if(segmentSeq) row.setAttribute('data-live-segment-seq',segmentSeq);
@@ -23078,6 +23733,7 @@ function appendThinking(text='', options){
           if(el!==row){
             el.removeAttribute('data-thinking-active');
             el.removeAttribute('data-live-thinking');
+            el.removeAttribute('data-live-thinking-row');
           }
         });
         row.setAttribute('data-thinking-active','1');
@@ -23100,6 +23756,7 @@ function removeThinking(){
       row.removeAttribute('id');
       row.removeAttribute('data-thinking-active');
       row.removeAttribute('data-live-thinking');
+      row.removeAttribute('data-live-thinking-row');
     });
     if(liveTurn&&blocks&&!blocks.children.length) liveTurn.remove();
     return;
