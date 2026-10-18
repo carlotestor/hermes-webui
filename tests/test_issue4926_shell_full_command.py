@@ -200,6 +200,7 @@ def test_real_command_keeps_shell_label_over_display_command(driver_path):
     ("curl -u alice:pa\\ ss https://x", "curl -u alice:[redacted] https://x"),
     ('curl -sS --user "alice:pa ss" https://x', 'curl -sS --user "alice:[redacted]" https://x'),
     ("curl \\\n  -u alice:s3cretPW https://x", "curl \\\n  -u alice:[redacted] https://x"),
+    ("curl -u alice:first https://a --next -u bob:second https://b", "curl -u alice:[redacted] https://a --next -u bob:[redacted] https://b"),
     ("curl -sS \\\n  --user alice:s3cretPW \\\n  https://x", "curl -sS \\\n  --user alice:[redacted] \\\n  https://x"),
 ])
 def test_curl_basic_auth_password_redacted_username_kept(driver_path, cmd, kept):

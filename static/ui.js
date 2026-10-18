@@ -21617,11 +21617,11 @@ function _redactToolTargetLabel(value){
     .replace(/(password(?:=|\s+))(?:"[^"]*"|'[^']*'|\S+)/gi,'$1[redacted]')
     // curl basic auth `-u user:pass` / `--user[=]user:pass`, curl only (across `\` line continuations): mask the password
     // through the end of the whole shell word (quotes, `\ ` escapes), keep the user.
-    .replace(/(\bcurl\b(?:[^\n;|&\\]|\\[^])*?(?:\s|\\\n))(-u\s*|--user(?:=|\s+))((?:[^\s"'\\]|\\.|"(?:[^"\\]|\\.)*"|'[^']*')+)/gi,(m,pre,flag,word)=>{
+    .replace(/\bcurl\b(?:[^\n;|&\\]|\\[^])*/gi,seg=>seg.replace(/(\s)(-u\s*|--user(?:=|\s+))((?:[^\s"'\\]|\\.|"(?:[^"\\]|\\.)*"|'[^']*')+)/g,(m,pre,flag,word)=>{
       const i=word.indexOf(':'); if(i<0) return m;
       const q=(word[0]==='"'||word[0]==="'")&&word.length>1&&word.endsWith(word[0])?word[0]:'';
       return pre+flag+word.slice(0,i)+':[redacted]'+q;
-    })
+    }))
     // Env-assignment / flag secrets, masked across the full (multi-line) text so
     // the expanded shell card can't leak a key on a non-first line (#4926). Keys
     // matched case-insensitively: *(TOKEN|API_KEY|APIKEY|SECRET|PASSWD|PASSWORD|
