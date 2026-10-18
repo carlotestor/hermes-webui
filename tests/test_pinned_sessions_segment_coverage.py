@@ -4,7 +4,9 @@ import json
 import sqlite3
 
 from tests._pin_helpers import db_pins, install_sqlite_session_db
-from tests.test_pinned_sessions_upgrade_migration import _sidebar_build, upgrade_env  # noqa: F401
+from tests import test_pinned_sessions_upgrade_migration as upgrade
+
+upgrade_env = upgrade.upgrade_env
 
 
 def _db(path, rows):
@@ -57,4 +59,4 @@ def test_migration_copies_pin_of_an_unlisted_empty_sidecar(upgrade_env):
     env.routes._reconcile_sidebar_pins_with_state_db(rows)
     assert db_pins(env.db) == {"listed": False, "empty": True}
     # Once it gains a message and is listed, state.db keeps the pin.
-    assert _sidebar_build(env) == {"listed": False, "empty": True}
+    assert upgrade._sidebar_build(env) == {"listed": False, "empty": True}
