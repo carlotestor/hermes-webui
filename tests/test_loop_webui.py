@@ -97,6 +97,32 @@ def test_webui_loop_greptile_regressions(tmp_path, monkeypatch):
         assert s.status == "active" and s.ticks_fired == 1 and not s.awaiting_response
 
 
+@requires_agent_modules
+def test_isolated_profile_loop_launches_without_scanning_siblings(tmp_path, monkeypatch):
+    from hermes_cli import goals, loops as agent
+    from api import background_process, loops, models, profiles, routes
+    (tmp_path / "profiles" / "bob").mkdir(parents=True)
+    homes, started = [], []
+    monkeypatch.setattr(goals, "_DB_CACHE", {})
+    monkeypatch.setattr(profiles, "_is_isolated_profile_mode", lambda: True)
+    monkeypatch.setattr(profiles, "_isolated_profile_name", lambda: "alice")
+    monkeypatch.setattr(profiles, "_profiles_root", lambda: tmp_path / "profiles")
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda p: homes.append(p) or tmp_path)
+    monkeypatch.setattr(models, "get_session", lambda sid, **kw: NS(profile="alice", messages=[]))
+    monkeypatch.setattr(background_process, "_session_has_active_turn", lambda sid: False)
+    monkeypatch.setattr(routes, "start_session_turn", lambda sid, m, source: started.append(m) or {})
+    loops.run_loop_command("s1", "5m check")
+    with loops._home("alice"):
+        s = agent.load_loop("s1")
+        s.next_due_at = 0
+        agent.save_loop("s1", s)
+    homes.clear()
+    loops.run_due_loops()
+    with loops._home("alice"):
+        assert agent.load_loop("s1").status == "active"
+    assert len(started) == 1 and homes[0] == "alice" and None not in homes and "bob" not in homes
+
+
 def test_loop_controls_bypass_busy_routing():
     from pathlib import Path
     src = (Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text(encoding="utf-8")

@@ -226,10 +226,14 @@ def _run_one(profile, sid):
 
 
 def run_due_loops():
-    from api.profiles import _profiles_root
+    from api.profiles import _is_isolated_profile_mode, _isolated_profile_name, _profiles_root
     from hermes_cli.loops import list_active_loops
     root = _profiles_root()
-    for profile in [None] + (sorted(p.name for p in root.iterdir() if p.is_dir()) if root.is_dir() else []):
+    if _is_isolated_profile_mode():  # only the pinned profile, under its real name, or _run_one clears its loops
+        profiles = [_isolated_profile_name()]
+    else:
+        profiles = [None] + (sorted(p.name for p in root.iterdir() if p.is_dir()) if root.is_dir() else [])
+    for profile in profiles:
         with _home(profile):
             for sid, state in list_active_loops():
                 if (state.route or {}).get("platform") != "webui":
