@@ -1923,6 +1923,7 @@ def test_gateway_worker_skips_runs_api_when_opt_in_absent():
 
 
 def test_gateway_tool_full_args_and_result_supersede_preview():
+    # Optional fields: /api/sessions/{id}/chat/stream sends args; result is used only if present.
     _, started = _gateway_tool_progress_event({
         "event": "tool.started", "tool": "terminal", "preview": "npm ci + 1 command",
         "args": {"command": "cd /repo && npm ci && npm test"},
@@ -1965,8 +1966,9 @@ def test_runs_api_live_snapshot_keeps_completed_result_snippet():
             {"event": "tool.started", "tool": "terminal", "preview": "pytest", "tool_call_id": "c1"})
         gateway_chat._note_live_gateway_event(stream_id, name, started)
         name, completed = _gateway_tool_progress_event(
+            # Upstream /v1/runs tool.completed wire shape: bounded result preview, no args/result.
             {"event": "tool.completed", "tool": "terminal", "tool_call_id": "c1", "error": True,
-             "result": {"output": "boom " * 200, "exit_code": 1}})
+             "duration": 0.1, "preview": ("boom " * 200)[:497] + "..."})
         gateway_chat._note_live_gateway_event(stream_id, name, completed)
         [tc] = STREAM_LIVE_TOOL_CALLS[stream_id]
         assert tc["done"] and tc["is_error"] and tc["display_command"] == "pytest"
