@@ -60,3 +60,66 @@ def test_migration_copies_pin_of_an_unlisted_empty_sidecar(upgrade_env):
     assert db_pins(env.db) == {"listed": False, "empty": True}
     # Once it gains a message and is listed, state.db keeps the pin.
     assert upgrade._sidebar_build(env) == {"listed": False, "empty": True}
+
+
+def _pending(env):
+    with env.routes._PIN_MIGRATION_LOCK:
+        state = env.routes._load_pin_migration_state()
+    return state, set((state.get("pending_pins") or {}).get(str(env.db)) or [])
+
+
+def _unlisted_empty_under_held_writer(env, sidecar):
+    _db(env.db, [("listed", 0, None, None), ("empty", 0, None, None)])
+    (env.session_dir / "empty.json").write_text(json.dumps(sidecar))
+    env.sidecars.update({"listed": False, "empty": True})
+    rows = [{"session_id": "listed", "pinned": False, "profile": "default"}]
+    writer = sqlite3.connect(str(env.db), isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")  # a concurrent Agent writer holds the lock
+    try:
+        env.routes._reconcile_sidebar_pins_with_state_db(rows)
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+    state, pending = _pending(env)
+    assert str(env.db) in state.get("migrated_state_dbs", [])
+    assert pending == {"empty"} and env.sidecars["empty"] is True
+    assert db_pins(env.db) == {"listed": False, "empty": False}
+    return rows
+
+
+def test_pending_unlisted_pin_retries_before_it_is_listed(upgrade_env):
+    env = upgrade_env
+    sidecar = {"session_id": "empty", "title": "Untitled", "pinned": True, "messages": []}
+    rows = _unlisted_empty_under_held_writer(env, sidecar)
+    # Writer released; ``empty`` is still unlisted, yet its pending pin lands.
+    env.routes._reconcile_sidebar_pins_with_state_db(rows)
+    assert db_pins(env.db) == {"listed": False, "empty": True}
+    assert _pending(env)[1] == set()
+
+
+def test_pending_unlisted_pin_is_dropped_after_an_authoritative_unpin(upgrade_env):
+    env = upgrade_env
+    sidecar = {"session_id": "empty", "title": "Untitled", "pinned": True, "messages": []}
+    rows = _unlisted_empty_under_held_writer(env, sidecar)
+    env.sidecars["empty"] = False  # /api/session/pin unpinned it meanwhile
+    env.routes._reconcile_sidebar_pins_with_state_db(rows)
+    assert db_pins(env.db) == {"listed": False, "empty": False}
+    assert _pending(env)[1] == set()
+
+
+def test_pending_unlisted_pin_of_another_profile_is_not_applied(upgrade_env, monkeypatch):
+    env = upgrade_env
+    sidecar = {"session_id": "empty", "title": "Untitled", "pinned": True, "messages": []}
+    rows = _unlisted_empty_under_held_writer(env, sidecar)
+    # The sidecar now belongs to another profile: this state.db must not take its pin.
+    get = env.routes.get_session
+
+    def _other(sid, *a, **kw):
+        sess = get(sid, *a, **kw)
+        sess.profile = "work"
+        return sess
+
+    monkeypatch.setattr(env.routes, "get_session", _other)
+    env.routes._reconcile_sidebar_pins_with_state_db(rows)
+    assert db_pins(env.db) == {"listed": False, "empty": False}
+    assert _pending(env)[1] == set()

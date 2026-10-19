@@ -2679,14 +2679,32 @@ def _sidecar_pin_intent(sid: str) -> bool | None:
         return None
 
 
-def _migrate_pin_under_session_lock(sid: str, profile) -> bool | None:
+def _unlisted_pin_intent(sid: str, profile) -> bool | None:
+    """Pin intent of an unlisted sidecar, revalidated against *profile*. Caller holds the session lock.
+
+    False when the sidecar is gone or now belongs to another profile, None when it cannot be loaded.
+    """
+    if not (SESSION_DIR / f"{sid}.json").exists():
+        return False
+    try:
+        session = _ensure_full_session_before_mutation(sid, get_session(sid))
+    except Exception:
+        logger.debug("Could not load sidecar pin for %s", sid, exc_info=True)
+        return None
+    if _pin_profile(getattr(session, "profile", None)) != _pin_profile(profile):
+        return False
+    return bool(getattr(session, "pinned", False))
+
+
+def _migrate_pin_under_session_lock(sid: str, profile, *, listed: bool = True) -> bool | None:
     """Copy the sidecar pin of *sid* into state.db, serialized with ``/api/session/pin``.
 
     True when state.db holds the pin, False when the sidecar no longer wants it, None if unresolved.
+    Unlisted ids (no sidebar row vouching for their profile) are revalidated under the lock.
     """
     from api.state_sync import sync_session_pinned
     with _get_session_agent_lock(sid):
-        intent = _sidecar_pin_intent(sid)
+        intent = _sidecar_pin_intent(sid) if listed else _unlisted_pin_intent(sid, profile)
         if intent is not True:
             return None if intent is None else False
         flags = agent_session_pinned_flags([sid], profile=profile)
@@ -2749,7 +2767,9 @@ def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] 
     migrated = set(state.get("migrated_state_dbs") or [])
     pending = set((state.get("pending_pins") or {}).get(key) or [])
     row_pins = {str(r.get("session_id")).strip(): r.get("pinned") is True for r in profile_rows}
-    todo = {sid for sid in pending if sid in row_pins}
+    # Pending ids retry whether or not the sidebar lists them (empty Untitled sidecars are unlisted);
+    # only ids already queued retry, so a later Desktop/CLI unpin of a stale legacy pin stands.
+    todo = set(pending)
     if key not in migrated:
         todo |= {sid for sid, pinned in row_pins.items() if pinned}
         # Sidebar rows omit empty Untitled sessions; their saved pins must migrate too.
@@ -2758,7 +2778,10 @@ def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] 
     deadline = time.monotonic() + _PIN_MIGRATION_BUDGET_S
     for sid in sorted(todo):
         # Past the budget (a busy Agent writer) the rest stay pending for the next build.
-        outcome = _migrate_pin_under_session_lock(sid, profile) if time.monotonic() < deadline else None
+        outcome = (
+            _migrate_pin_under_session_lock(sid, profile, listed=sid in row_pins)
+            if time.monotonic() < deadline else None
+        )
         (unresolved if outcome is None else resolved).add(sid)
     # A compression child left unpinned under a pinned ancestor missed its carry.
     uncarried = agent_session_uncarried_pins(row_pins, profile=profile)
