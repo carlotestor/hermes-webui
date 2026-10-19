@@ -2496,6 +2496,8 @@ def _run_gateway_chat_streaming(
     final user/assistant turn back into the WebUI session.
     """
     cancel_event = threading.Event()
+    _turn_started_at = time.time()
+    _detached_goal_continuation_prompt = ""
     q = peek_stream(stream_id)
     if q is not None:
         # A snapshot lookup is not admission. A concurrent chat/start can classify
@@ -3084,22 +3086,39 @@ def _run_gateway_chat_streaming(
                 logger.debug("Failed to append completed turn journal event", exc_info=True)
             success_writeback_committed = True
         try:
-            from api.goals import evaluate_goal_after_turn, has_active_goal
+            from api.goals import (
+                evaluate_goal_after_turn,
+                gateway_evaluated_goal_in_turn,
+                has_active_goal,
+                stream_channel_has_subscribers,
+            )
             from api.profiles import get_hermes_home_for_profile
 
             profile_home = get_hermes_home_for_profile(getattr(s, "profile", None))
-            if goal_related and has_active_goal(session_id, profile_home=profile_home):
+            _gateway_evaluated = gateway_evaluated_goal_in_turn(
+                session_id,
+                min_evaluated_at=_turn_started_at,
+                profile_home=profile_home,
+            )
+            if _gateway_evaluated or (
+                goal_related and has_active_goal(session_id, profile_home=profile_home)
+            ):
                 put_gateway_event("goal", {
                     "session_id": session_id,
                     "state": "evaluating",
                     "message": "Evaluating goal progress…",
                     "message_key": "goal_evaluating_progress",
                 })
+                _eval_kwargs: dict[str, Any] = {
+                    "user_initiated": True,
+                    "profile_home": profile_home,
+                }
+                if _gateway_evaluated:
+                    _eval_kwargs["min_evaluated_at"] = _turn_started_at
                 decision = evaluate_goal_after_turn(
                     session_id,
                     assistant_text,
-                    user_initiated=True,
-                    profile_home=profile_home,
+                    **_eval_kwargs,
                 ) or {}
                 goal_message = str(decision.get("message") or "").strip()
                 if goal_message:
@@ -3126,6 +3145,8 @@ def _run_gateway_chat_streaming(
                             "message_args": decision.get("message_args") or [],
                             "decision": decision,
                         })
+                        if not stream_channel_has_subscribers(q):
+                            _detached_goal_continuation_prompt = continuation_prompt
         except Exception as goal_exc:
             logger.debug(
                 "Gateway goal continuation hook failed for session %s: %s",
@@ -3193,3 +3214,16 @@ def _run_gateway_chat_streaming(
         # the process lifetime (compare-and-clear: only clears if still owned by
         # this stream, mirroring the local streaming teardown).
         clear_session_writeback_owner_if_owned(session_id, stream_id)
+        if _detached_goal_continuation_prompt and not cancel_event.is_set():
+            try:
+                from api.goals import start_detached_goal_continuation
+
+                start_detached_goal_continuation(
+                    session_id, _detached_goal_continuation_prompt
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to start detached gateway goal continuation for %s",
+                    session_id,
+                    exc_info=True,
+                )

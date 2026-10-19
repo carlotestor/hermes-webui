@@ -28007,6 +28007,20 @@ def start_session_turn(
                 }
     if _paused_wakeup_response is not None:
         return _paused_wakeup_response
+    wakeup_goal_related = False
+    if turn_source in ("process_wakeup", "delegation_wakeup", "goal_wakeup"):
+        try:
+            from api.goals import has_active_goal
+            from api.profiles import get_hermes_home_for_profile
+
+            wakeup_goal_related = bool(
+                has_active_goal(
+                    s.session_id,
+                    profile_home=get_hermes_home_for_profile(getattr(s, "profile", None)),
+                )
+            )
+        except Exception:
+            wakeup_goal_related = False
     resp = _start_run(
         s,
         msg=msg,
@@ -28017,6 +28031,7 @@ def start_session_turn(
         normalized_model=normalized_model,
         source=turn_source,
         route="start_session_turn",
+        goal_related=wakeup_goal_related,
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
@@ -28411,6 +28426,12 @@ def _handle_goal_command(handler, body):
         else:
             status = 409 if payload.get("error") == "agent_running" else 400
         return j(handler, payload, status=status)
+
+    action_taken = str(payload.get("action") or "").strip().lower()
+    if action_taken == "resume":
+        PENDING_GOAL_CONTINUATION.add(s.session_id)
+    elif action_taken in ("pause", "clear"):
+        PENDING_GOAL_CONTINUATION.discard(s.session_id)
 
     def _rollback_goal_after_failed_kickoff() -> None:
         restore_goal_state(s.session_id, previous_goal_state, profile_home=profile_home)

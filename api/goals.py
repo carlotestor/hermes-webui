@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -651,12 +653,221 @@ def has_active_goal(
         return False
 
 
+def _gather_goal_turn_background_state(
+    session_id: str,
+    *,
+    profile_home: str | Path | None = None,
+) -> tuple[Any, int]:
+    """Return ``(background_processes, active_delegations)`` for *session_id*."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None, 0
+    try:
+        from hermes_cli.goals import (  # type: ignore
+            count_active_delegations,
+            gather_background_processes,
+        )
+    except Exception:
+        return None, 0
+    context_api = _native_profile_context_api(profile_home) if profile_home else None
+    token = None
+    if context_api is not None:
+        try:
+            token = context_api[0](Path(profile_home).expanduser().resolve())
+        except Exception:
+            token = None
+    try:
+        bg_procs = None
+        active_deleg = 0
+        try:
+            bg_procs = gather_background_processes(owner_task_id=sid)
+        except Exception:
+            bg_procs = None
+        try:
+            active_deleg = int(count_active_delegations(sid) or 0)
+        except Exception:
+            active_deleg = 0
+        return bg_procs, active_deleg
+    finally:
+        if token is not None and context_api is not None:
+            try:
+                context_api[1](token)
+            except Exception:
+                pass
+
+
+def gateway_evaluated_goal_in_turn(
+    session_id: str,
+    *,
+    min_evaluated_at: float | None,
+    profile_home: str | Path | None = None,
+) -> bool:
+    """Return True when the Gateway already evaluated *session_id*'s goal in this turn."""
+    if min_evaluated_at is None or GoalManager is None or GoalManager is not _NativeGoalManager:
+        return False
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    if profile_home is not None:
+        try:
+            db_file = Path(profile_home).expanduser().resolve() / "state.db"
+            if not db_file.is_file():
+                return False
+        except Exception:
+            return False
+    mgr = _manager(sid, profile_home=profile_home)
+    if mgr is None:
+        return False
+    state = getattr(mgr, "state", None)
+    if state is None:
+        return False
+    try:
+        last_turn_at = float(getattr(state, "last_turn_at", 0.0) or 0.0)
+        return last_turn_at > 0.0 and last_turn_at >= float(min_evaluated_at)
+    except Exception:
+        return False
+
+
+def _decision_from_evaluated_state(mgr: Any, state: Any) -> Dict[str, Any]:
+    """Reconstruct an evaluation decision dict from a GoalState already updated in-turn."""
+    status = str(getattr(state, "status", "") or "").strip()
+    verdict = str(getattr(state, "last_verdict", "") or "continue").strip() or "continue"
+    reason = str(getattr(state, "last_reason", "") or "").strip()
+    paused_reason = str(getattr(state, "paused_reason", "") or "").strip()
+    turns_used = int(getattr(state, "turns_used", 0) or 0)
+    max_turns = int(getattr(state, "max_turns", 0) or 0)
+
+    if status == "done":
+        return {
+            "status": "done",
+            "should_continue": False,
+            "continuation_prompt": None,
+            "verdict": "done",
+            "reason": reason,
+            "message": f"✓ Goal achieved: {reason}" if reason else "✓ Goal achieved",
+        }
+
+    if status == "paused":
+        if verdict == "blocked" or paused_reason.startswith("judged unachievable"):
+            msg = (
+                f"🚫 Goal judged unachievable — paused: {reason or paused_reason} "
+                "Re-scope with /goal set, or override with /goal resume."
+            )
+        elif paused_reason.startswith("turn budget exhausted"):
+            msg = (
+                f"⏸ Goal paused — {turns_used}/{max_turns} turns used. "
+                "Use /goal resume to keep going, or /goal clear to stop."
+            )
+        else:
+            detail = paused_reason or reason
+            msg = f"⏸ Goal paused — {detail}" if detail else "⏸ Goal paused."
+        return {
+            "status": "paused",
+            "should_continue": False,
+            "continuation_prompt": None,
+            "verdict": verdict,
+            "reason": reason or paused_reason,
+            "message": msg,
+        }
+
+    is_waiting = verdict in ("wait", "waiting")
+    if not is_waiting and hasattr(mgr, "is_waiting"):
+        try:
+            is_waiting = bool(mgr.is_waiting())
+        except Exception:
+            is_waiting = False
+    if is_waiting:
+        if hasattr(mgr, "_waiting_decision"):
+            try:
+                wait_dec = dict(mgr._waiting_decision(state) or {})
+                wait_dec["verdict"] = verdict if verdict in ("wait", "waiting") else "waiting"
+                return wait_dec
+            except Exception:
+                pass
+        return {
+            "status": "active",
+            "should_continue": False,
+            "continuation_prompt": None,
+            "verdict": verdict if verdict in ("wait", "waiting") else "waiting",
+            "reason": reason,
+            "message": f"⏳ Goal parked — waiting: {reason}" if reason else "⏳ Goal parked",
+        }
+
+    prompt = None
+    if hasattr(mgr, "next_continuation_prompt"):
+        try:
+            prompt = mgr.next_continuation_prompt()
+        except Exception:
+            prompt = None
+    if not prompt and getattr(state, "goal", ""):
+        prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=state.goal)
+    if verdict == "gate_failed":
+        msg = f"✗ Quality gate failed ({turns_used}/{max_turns} turns): {reason}"
+    else:
+        msg = f"↻ Continuing toward goal ({turns_used}/{max_turns}): {reason}"
+    return {
+        "status": "active",
+        "should_continue": bool(prompt),
+        "continuation_prompt": prompt,
+        "verdict": verdict,
+        "reason": reason,
+        "message": msg,
+    }
+
+
+def stream_channel_has_subscribers(channel: Any) -> bool:
+    """Return True when at least one live SSE subscriber is attached to *channel*."""
+    if channel is None:
+        return False
+    snap_fn = getattr(channel, "diagnostic_snapshot", None)
+    if not callable(snap_fn):
+        return True
+    try:
+        snap = snap_fn() or {}
+        return int(snap.get("subscriber_count", 0) or 0) > 0
+    except Exception:
+        return True
+
+
+def start_detached_goal_continuation(
+    session_id: str,
+    continuation_prompt: str,
+) -> None:
+    """Start a goal continuation turn server-side when no browser SSE subscriber is attached."""
+    sid = str(session_id or "").strip()
+    prompt = str(continuation_prompt or "").strip()
+    if not sid or not prompt:
+        return
+
+    def _runner() -> None:
+        try:
+            from api.config import PENDING_GOAL_CONTINUATION
+            from api.routes import start_session_turn
+
+            if sid not in PENDING_GOAL_CONTINUATION:
+                return
+            start_session_turn(sid, prompt, source="goal_wakeup")
+        except Exception:
+            logger.debug(
+                "Detached goal continuation start failed for session %s",
+                sid,
+                exc_info=True,
+            )
+
+    threading.Thread(
+        target=_runner,
+        name=f"goal-continue-{sid[:12]}",
+        daemon=True,
+    ).start()
+
+
 def evaluate_goal_after_turn(
     session_id: str,
     last_response: str,
     *,
     user_initiated: bool = True,
     profile_home: str | Path | None = None,
+    min_evaluated_at: float | None = None,
 ) -> Dict[str, Any]:
     """Evaluate a completed turn against the standing goal, if any."""
     sid = str(session_id or "").strip()
@@ -680,16 +891,49 @@ def evaluate_goal_after_turn(
             "message": "",
         }
     try:
+        state = getattr(mgr, "state", None)
+        if (
+            min_evaluated_at is not None
+            and state is not None
+            and float(getattr(state, "last_turn_at", 0.0) or 0.0) >= float(min_evaluated_at)
+        ):
+            decision = _decision_from_evaluated_state(mgr, state)
+            return _goal_decision_payload(decision, state)
         if not mgr.is_active():
             return {
-                "status": getattr(getattr(mgr, "state", None), "status", None),
+                "status": getattr(state, "status", None),
                 "should_continue": False,
                 "continuation_prompt": None,
                 "verdict": "inactive",
                 "reason": "no active goal",
                 "message": "",
             }
-        decision = mgr.evaluate_after_turn(str(last_response or ""), user_initiated=user_initiated)
+        eval_kwargs: Dict[str, Any] = {"user_initiated": user_initiated}
+        target_eval = getattr(
+            getattr(mgr, "_manager", mgr),
+            "evaluate_after_turn",
+            mgr.evaluate_after_turn,
+        )
+        try:
+            params = inspect.signature(target_eval).parameters
+            accepts_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            if (
+                accepts_var_kw
+                or "background_processes" in params
+                or "active_delegations" in params
+            ):
+                bg_procs, active_deleg = _gather_goal_turn_background_state(
+                    sid, profile_home=profile_home
+                )
+                if accepts_var_kw or "background_processes" in params:
+                    eval_kwargs["background_processes"] = bg_procs
+                if accepts_var_kw or "active_delegations" in params:
+                    eval_kwargs["active_delegations"] = active_deleg
+        except Exception:
+            pass
+        decision = mgr.evaluate_after_turn(str(last_response or ""), **eval_kwargs)
     except Exception as exc:
         logger.debug("goal evaluation failed for session=%s: %s", sid, exc)
         return {

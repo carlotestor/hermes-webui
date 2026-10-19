@@ -17633,8 +17633,13 @@ def _run_agent_streaming(
             # a normal next user message so /queue and user input keep priority.
             # #1932: only evaluate when the turn was goal-related (set via
             # STREAM_GOAL_RELATED or goal_related parameter).
+            _detached_goal_continuation_prompt = ''
             try:
-                from api.goals import evaluate_goal_after_turn, has_active_goal
+                from api.goals import (
+                    evaluate_goal_after_turn,
+                    has_active_goal,
+                    stream_channel_has_subscribers,
+                )
 
                 if not goal_related or not has_active_goal(session_id, profile_home=_profile_home):
                     _goal_decision = {}
@@ -17693,6 +17698,8 @@ def _run_agent_streaming(
                             'message_args': decision.get('message_args') or [],
                             'decision': decision,
                         })
+                        if not stream_channel_has_subscribers(q):
+                            _detached_goal_continuation_prompt = continuation_prompt
             except Exception as _goal_exc:
                 logger.debug("Goal continuation hook failed for session %s: %s", session_id, _goal_exc)
             with _stream_writeback_stage(_writeback_timings, "done_payload"):
@@ -18494,6 +18501,19 @@ def _run_agent_streaming(
                 session_id,
                 exc_info=True,
             )
+        if _detached_goal_continuation_prompt and not cancel_event.is_set():
+            try:
+                from api.goals import start_detached_goal_continuation
+
+                start_detached_goal_continuation(
+                    session_id, _detached_goal_continuation_prompt
+                )
+            except Exception:
+                logger.debug(
+                    "turn-teardown detached-goal continuation failed for session %s",
+                    session_id,
+                    exc_info=True,
+                )
 
 # ============================================================
 # SECTION: HTTP Request Handler
