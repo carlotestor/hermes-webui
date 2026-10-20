@@ -36,10 +36,28 @@ let _pendingCarryForwardSnapshot = null;
 
 // Debounced save — prevents hammering the server on every keystroke.
 let _draftSaveTimer = null;
+let _draftSaveTimerSid = null;
+let _draftSaveTimerPayload = null;
+let _draftSaveTimerRev = 0;
 const _DRAFT_SAVE_DELAY_MS = 400;
 const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
 const _composerDraftKnownPayloadSessions = new Set();
 const _composerDraftRestoreSuppressedUntilBySid = new Map();
+// Bumped when a non-empty draft differing from the composer's last known
+// payload is saved, so callers can tell whether a newer draft exists. Re-saving
+// the same payload (e.g. an autosave of a restored draft) is not newer.
+const _composerDraftRevBySid = new Map();
+const _composerDraftLastPayloadBySid = new Map();
+function _composerDraftRevision(sid) { return _composerDraftRevBySid.get(sid) || 0; }
+function _noteComposerDraftPayload(sid, text, files) {
+  _composerDraftLastPayloadBySid.set(sid, _composerDraftPayloadSignature(String(text || ''), _composerDraftFilesForPersist(files)));
+}
+function _bumpComposerDraftRevision(sid, text, files) {
+  const sig = _composerDraftPayloadSignature(text, files);
+  if (_composerDraftLastPayloadBySid.get(sid) === sig) return;
+  _composerDraftLastPayloadBySid.set(sid, sig);
+  _composerDraftRevBySid.set(sid, _composerDraftRevision(sid) + 1);
+}
 const _composerDraftLocalFallbackBySid = new Map();
 const _composerDraftLatestIntentSequenceBySid = new Map();
 const _composerDraftPostPromisesBySid = new Map();
@@ -248,7 +266,13 @@ function _saveComposerDraft(sid, text, files) {
   if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
     _clearComposerDraftRestoreSuppression(sid);
     _composerDraftKnownPayloadSessions.add(sid);
+    _bumpComposerDraftRevision(sid, normalizedText, normalizedFiles);
+  } else {
+    _noteComposerDraftPayload(sid, '', []);
   }
+  _draftSaveTimerSid = sid;
+  _draftSaveTimerPayload = _composerDraftPayloadSignature(normalizedText, normalizedFiles);
+  _draftSaveTimerRev = _composerDraftRevision(sid);
   _draftSaveTimer = setTimeout(() => {
     _postComposerDraftPayload(sid, normalizedDraft, intent).catch((error) => {
       _handleComposerDraftPostFailure(error, sid, normalizedText, liveFiles, intent);
@@ -431,6 +455,9 @@ function _saveComposerDraftNow(sid, text, files) {
   const normalizedDraft = { text: normalizedText, files: normalizedFiles };
   if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
     _clearComposerDraftRestoreSuppression(sid);
+    _bumpComposerDraftRevision(sid, normalizedText, normalizedFiles);
+  } else {
+    _noteComposerDraftPayload(sid, '', []);
   }
   // Most chat switches leave an empty composer. Avoid putting the switch path
   // behind a network POST unless there is new local draft content or an existing
@@ -460,12 +487,18 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
   const current = ta.value || '';
   const preserveActiveInput = !!(opts && opts.preserveActiveInput);
   const restoreSid = targetSid || (S.session && S.session.session_id);
-  const localFallback = restoreSid && _composerDraftLocalFallbackBySid.get(restoreSid);
-  const useLocalFallback = !!localFallback;
-  if (useLocalFallback) {
+  let localFallback = restoreSid && _composerDraftLocalFallbackBySid.get(restoreSid);
+  if (localFallback) {
     text = localFallback.text;
     files = localFallback.files;
   }
+  // A delivered steer's exact draft (server or local fallback) is being
+  // compare-and-cleared: show the empty projection in place, without re-reading it.
+  if (restoreSid && _composerDraftHasPayload(text, files) && !_isComposerDraftRestoreSuppressed(restoreSid, text, files)
+      && typeof _steerDraftIsRetiring === 'function' && _steerDraftIsRetiring(restoreSid, text, files)) {
+    draft = null; localFallback = null; text = ''; files = [];
+  }
+  const useLocalFallback = !!localFallback;
   const hasServerDraftPayload = _composerDraftHasPayload(text, files);
   const serverDraftText = (draft && typeof draft.text === 'string') ? draft.text : '';
   const serverDraftFiles = (draft && Array.isArray(draft.files)) ? draft.files : [];
@@ -511,7 +544,8 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
 // Clear the saved draft for a session (called when message is sent).
 function _clearComposerDraft(sid, text, files) {
   if (!sid) return;
-  clearTimeout(_draftSaveTimer);
+  // The pending debounced save may belong to another session (e.g. after New Chat).
+  if (_draftSaveTimerSid === sid) clearTimeout(_draftSaveTimer);
   _clearRememberedNewChatDraftSession(sid);
   if (arguments.length >= 2) _suppressComposerDraftRestoreAfterSubmit(sid, text, files);
   else _suppressComposerDraftRestoreAfterSubmit(sid);
@@ -521,6 +555,41 @@ function _clearComposerDraft(sid, text, files) {
       _composerDraftLocalFallbackBySid.delete(sid);
     }
   });
+}
+
+// Clear sid's saved draft only if it still equals text/files (server-side
+// compare-and-clear), so a newer draft saved meanwhile is kept.
+// maxRev: a pending debounced save of this same payload scheduled at or before
+// that draft revision would land after the clear and write it back, so cancel
+// it; a later save (re-typed by the user) or a different payload is newer.
+function _clearComposerDraftIfUnchanged(sid, text, files, maxRev) {
+  if (!sid) return Promise.resolve(false);
+  if (_draftSaveTimerSid === sid && _draftSaveTimerRev <= Number(maxRev)
+      && _draftSaveTimerPayload === _composerDraftPayloadSignature(text, files)) clearTimeout(_draftSaveTimer);
+  const ifFiles = _composerDraftFilesForPersist(files);
+  const ifSig = _composerDraftPayloadSignature(String(text || ''), ifFiles);
+  // Join the per-session draft write chain so an earlier queued save cannot
+  // land after this compare-and-clear and resurrect the retired draft.
+  const previous = _composerDraftPostPromisesBySid.get(sid);
+  const dispatch = () => api('/api/session/draft', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sid, text: '', files: [], if_text: String(text || ''), if_files: ifFiles }),
+  });
+  const write = previous ? Promise.resolve(previous).then(dispatch, dispatch) : dispatch();
+  const pending = write.finally(() => {
+    if (_composerDraftPostPromisesBySid.get(sid) === pending) _composerDraftPostPromisesBySid.delete(sid);
+  });
+  _composerDraftPostPromisesBySid.set(sid, pending);
+  return pending.then((r) => {
+    if (r && r.mismatch) return false;
+    // A failed-save local fallback holding exactly the retired payload is now stale.
+    const fallback = _composerDraftLocalFallbackBySid.get(sid);
+    if (fallback && _composerDraftPayloadSignature(fallback.text, _composerDraftFilesForPersist(fallback.files)) === ifSig) {
+      _forgetComposerDraftLocalFallback(sid);
+    }
+    _rememberComposerDraftPayloadState(sid, '', []);
+    return true;
+  }).catch(() => false);
 }
 
 const SESSION_VIEWED_COUNTS_KEY = 'hermes-session-viewed-counts';
@@ -5651,8 +5720,11 @@ function _renderBatchActionBar(){
     if(!ok)return;
     try{
       const results=await Promise.all(ids.map(async sid=>{
-        const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:sid,archived:true})});
-        return {response,session:sessionsById.get(sid)||null};
+        const _batchPayload={session_id:sid,archived:true};
+        const _snap=sessionsById.get(sid);
+        if(typeof _showAllProfiles!=='undefined'&&_showAllProfiles&&_snap&&_snap.profile){_batchPayload.all_profiles=true;_batchPayload.profile=_snap.profile;}
+        const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify(_batchPayload)});
+        return {response,session:_snap||null};
       }));
       const retainedCount=_worktreeResponseCount(results);
       showToast(retainedCount?t('session_archived_worktree'):t('session_archived'));exitSessionSelectMode();await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
@@ -5665,44 +5737,60 @@ function _renderBatchActionBar(){
   // Delete
   const deleteBtn=document.createElement('button');deleteBtn.className='batch-action-btn batch-action-btn-danger';
   deleteBtn.textContent=t('session_batch_delete');
-  deleteBtn.onclick=async()=>{
-    const ids=[..._selectedSessions];
-    const wtCount=_worktreeSessionCount(ids);
-    const sessionsById=new Map(ids.map(sid=>[sid,_sessionSnapshotById(sid)]));
-    const ok=await showConfirmDialog({
-      message:wtCount?t('session_batch_delete_worktree_confirm',ids.length,wtCount):t('session_batch_delete_confirm',ids.length),
-      confirmLabel:t('delete_title'),
-      danger:true
-    });
-    if(!ok)return;
-    const modelPickAtDelete=typeof _readComposerModelPick==='function'
-      ? _readComposerModelPick()
-      : null;
-    const modelPickRevisionAtDelete=Number(modelPickAtDelete&&modelPickAtDelete.revision||0)||0;
-    try{
-      const results=await Promise.all(ids.map(async sid=>{
-        const response=await api('/api/session/delete',{method:'POST',body:JSON.stringify({session_id:sid})});
-        return {response,session:sessionsById.get(sid)||null};
-      }));
-      ids.forEach(_forgetComposerDraftLocalFallback);
-      const retainedCount=_worktreeResponseCount(results);
-      const cleanupFailedCount=results.filter(result=>result.response&&result.response.state_db_cleanup_failed).length;
-      ids.forEach(_clearHandoffStorageForSession);
-      if(S.session&&ids.includes(S.session.session_id)){
-        S.session=null;S.messages=[];S.entries=[];localStorage.removeItem('hermes-webui-session');
-        if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(null);
-        const remaining=await api('/api/sessions'+_sessionListQueryString());
-        if(remaining.sessions&&remaining.sessions.length){await loadSession(remaining.sessions[0].session_id);}
-        else{
-          _settleEmptyComposerModelAfterFinalSessionDelete(modelPickRevisionAtDelete);
-          $('msgInner').innerHTML='';$('emptyState').style.display='';
-        }
-      }
-      if(cleanupFailedCount) showToast(t('delete_failed')+' ('+cleanupFailedCount+'/'+ids.length+')',0,'error');
-      else showToast((retainedCount?t('session_deleted_worktree'):t('session_delete'))+' ('+ids.length+')');
-      exitSessionSelectMode();await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
-    }catch(e){showToast('Delete failed: '+(e.message||e));}
-  };bar.appendChild(deleteBtn);
+  deleteBtn.onclick=()=>_deleteSelectedSessionsBatch();bar.appendChild(deleteBtn);
+}
+async function _deleteSelectedSessionsBatch(){
+  const ids=[..._selectedSessions];
+  if(!ids.length)return;
+  const wtCount=_worktreeSessionCount(ids);
+  const sessionsById=new Map(ids.map(sid=>[sid,_sessionSnapshotById(sid)]));
+  const ok=await showConfirmDialog({
+    message:wtCount?t('session_batch_delete_worktree_confirm',ids.length,wtCount):t('session_batch_delete_confirm',ids.length),
+    confirmLabel:t('delete_title'),
+    danger:true
+  });
+  if(!ok)return;
+  const modelPickAtDelete=typeof _readComposerModelPick==='function'
+    ? _readComposerModelPick()
+    : null;
+  const modelPickRevisionAtDelete=Number(modelPickAtDelete&&modelPickAtDelete.revision||0)||0;
+  // Settle each request on its own: a refused delete (409, live gateway work)
+  // must not discard the ones that already committed (#8323 review item 1).
+  const settled=await Promise.allSettled(ids.map(async sid=>{
+    const response=await api('/api/session/delete',{method:'POST',body:JSON.stringify({session_id:sid})});
+    return {response,session:sessionsById.get(sid)||null};
+  }));
+  const results=settled.filter(r=>r.status==='fulfilled').map(r=>r.value);
+  const deletedIds=ids.filter((sid,i)=>settled[i].status==='fulfilled');
+  const failures=ids.map((sid,i)=>({sid,error:settled[i].reason})).filter(f=>f.error);
+  deletedIds.forEach(_forgetComposerDraftLocalFallback);
+  const retainedCount=_worktreeResponseCount(results);
+  const cleanupFailedCount=results.filter(result=>result.response&&result.response.state_db_cleanup_failed).length;
+  deletedIds.forEach(_clearHandoffStorageForSession);
+  if(S.session&&deletedIds.includes(S.session.session_id)){
+    S.session=null;S.messages=[];S.entries=[];localStorage.removeItem('hermes-webui-session');
+    if(typeof _syncProviderQuotaForActiveContext==='function') _syncProviderQuotaForActiveContext();
+    if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(null);
+    const remaining=await api('/api/sessions'+_sessionListQueryString());
+    if(remaining.sessions&&remaining.sessions.length){await loadSession(remaining.sessions[0].session_id);}
+    else{
+      _settleEmptyComposerModelAfterFinalSessionDelete(modelPickRevisionAtDelete);
+      $('msgInner').innerHTML='';$('emptyState').style.display='';
+    }
+  }
+  if(failures.length){
+    // Keep the refused sessions selected with their drafts so the user can
+    // retry after stopping the work that blocked them.
+    showToast(_sessionDeleteErrorMessage(failures[0].error)+' ('+deletedIds.length+'/'+ids.length+')',0,'error');
+    _selectedSessions.clear();
+    failures.forEach(f=>_selectedSessions.add(f.sid));
+    await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
+    _updateBatchActionBar();
+    return;
+  }
+  if(cleanupFailedCount) showToast(t('delete_failed')+' ('+cleanupFailedCount+'/'+ids.length+')',0,'error');
+  else showToast((retainedCount?t('session_deleted_worktree'):t('session_delete'))+' ('+ids.length+')');
+  exitSessionSelectMode();await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
 }
 function _showBatchProjectPicker(openerEl){
   const ids=[..._selectedSessions];if(!ids.length)return;
@@ -6283,7 +6371,9 @@ async function _archiveSession(session, archived=true, beforeListRender=null){
   const reflowPositions=_captureSessionReflowPositions();
   const renderHold=beforeListRender?Promise.resolve().then(beforeListRender):null;
   try{
-    const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:session.session_id,archived})});
+    const _archivePayload={session_id:session.session_id,archived};
+    if(typeof _showAllProfiles!=='undefined'&&_showAllProfiles&&session.profile){_archivePayload.all_profiles=true;_archivePayload.profile=session.profile;}
+    const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify(_archivePayload)});
     session.archived=archived;
     const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
     if(cached) cached.archived=archived;
@@ -6490,7 +6580,9 @@ function _openSessionActionMenu(session, anchorEl){
       async()=>{
         closeSessionActionMenu();
         try{
-          await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:session.session_id,archived:true})});
+          const _hidePayload={session_id:session.session_id,archived:true};
+          if(typeof _showAllProfiles!=='undefined'&&_showAllProfiles&&session.profile){_hidePayload.all_profiles=true;_hidePayload.profile=session.profile;}
+          await api('/api/session/archive',{method:'POST',body:JSON.stringify(_hidePayload)});
           _optimisticallyArchiveSessionInList(session.session_id,true);
           session.archived=true;
           if(S.session&&S.session.session_id===session.session_id) S.session.archived=true;
@@ -8727,8 +8819,13 @@ function _sessionStateTooltip({isStreaming=false,hasUnread=false}={}){
   return '';
 }
 
-function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawReferenceSessions){
+function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawReferenceSessions, payloadRowsById){
   const referenceSessions=Array.isArray(rawReferenceSessions)?rawReferenceSessions:(rawSessions||[]);
+  let searchActive=false;
+  try{
+    const searchEl=typeof $==='function' ? $('sessionSearch') : null;
+    searchActive=Boolean(searchEl&&String(searchEl.value||'').trim());
+  }catch(_e){ searchActive=false; }
   const sessionIdsInList=new Set(referenceSessions.map(s=>s&&s.session_id).filter(Boolean));
   const rawSessionsById=new Map(referenceSessions.filter(s=>s&&s.session_id).map(s=>[s.session_id,s]));
   const cleanSidebarRow=(s)=>{
@@ -8776,6 +8873,23 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       parentRow._child_session_attention={...childAttention};
     }
   };
+  // Every payload row by id and by compression-lineage root, so a child naming its parent's
+  // pre-compression segment resolves to the row that represents that lineage in this payload.
+  const payloadById=new Map();
+  const payloadByLineageRoot=new Map();
+  const indexPayloadRow=(s)=>{
+    if(!s||!s.session_id) return;
+    if(!payloadById.has(s.session_id)) payloadById.set(s.session_id,s);
+    if(s._lineage_root_id&&!payloadByLineageRoot.has(s._lineage_root_id)) payloadByLineageRoot.set(s._lineage_root_id,s);
+  };
+  if(payloadRowsById instanceof Map) payloadRowsById.forEach(indexPayloadRow);
+  [...(rawSessions||[]),...referenceSessions].forEach(indexPayloadRow);
+  const payloadParentFor=(s)=>{
+    const pid=s&&s.parent_session_id;
+    if(!pid) return null;
+    return payloadById.get(pid)||payloadById.get(s._parent_lineage_tip_id)
+      ||payloadByLineageRoot.get(pid)||payloadByLineageRoot.get(s._parent_lineage_root_id)||null;
+  };
   const visibleBySid=new Map();
   const visibleBySegmentSid=new Map();
   const visibleByLineageKey=new Map();
@@ -8785,7 +8899,8 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     if(attachDepthCache.has(session.session_id)) return attachDepthCache.get(session.session_id);
     if(seen.has(session.session_id)) return 0;
     seen.add(session.session_id);
-    const parent=session.parent_session_id&&rawSessionsById.get(session.parent_session_id);
+    // A child of a compressed parent may name its pre-compression segment; order it by the tip.
+    const parent=session.parent_session_id&&payloadParentFor(session);
     let depth=0;
     if(parent&&(_isChildSession(session)||(_isForkWithResolvableParent(session, sessionIdsInList)&&!(session&&session.pinned)))){
       depth=1+attachDepthFor(parent, seen);
@@ -8826,6 +8941,32 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
   for(const candidate of [...(rawSessions||[]),...(referenceSessions||[])]){
     if(candidate&&candidate.session_id&&!attachQueueById.has(candidate.session_id)) attachQueueById.set(candidate.session_id,candidate);
   }
+  // Raw sources is_cli_session_row never files as CLI; 'desktop' etc. are ambiguous.
+  const nonCliParentSources=['webui','cron','webhook','kanban','tool','api','api_server'];
+  const subagentHostHiddenByScope=(leaf)=>{
+    const seen=new Set();
+    let cur=leaf;
+    while(cur&&!seen.has(cur.session_id)){
+      seen.add(cur.session_id);
+      const parent=payloadParentFor(cur);
+      if(!parent){
+        // A missing subagent parent is a child row, never a scope-hidden top-level host.
+        const ps=String(cur.parent_source||'').trim().toLowerCase();
+        if(ps==='subagent') return false;
+        if(typeof cur.parent_is_cli_session==='boolean') return !cur.parent_is_cli_session;
+        return nonCliParentSources.includes(ps)||(typeof _isMessagingSession==='function'&&_isMessagingSession({raw_source: ps}));
+      }
+      if(_isCliSession(parent)) return false;
+      if(cur!==leaf&&(visibleBySid.has(parent.session_id)||visibleBySegmentSid.has(parent.session_id))) return false;
+      if(!_isDelegatedSubagentRow(parent)){
+        // Only a top-level row can be a host hidden by scope; a non-subagent child (branch) never is.
+        if(_isChildSession(parent)) return false;
+        return !visibleBySid.has(parent.session_id);
+      }
+      cur=parent;
+    }
+    return false;
+  };
   const attachQueue=[...attachQueueById.values()].sort((a,b)=>attachDepthFor(a)-attachDepthFor(b));
   for(const child of attachQueue){
     const childRenderable=!!(child&&child.session_id&&renderableChildIds.has(child.session_id));
@@ -8840,7 +8981,9 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     const childLineageKey=child&&(child._lineage_root_id||child.lineage_root_id||child.parent_session_id);
     const isHiddenLineageReferenceChild=!!(child&&child.archived&&child.parent_session_id&&childLineageKey&&!child.pinned&&!childRenderable);
     if(!_isChildSession(child)&&!isForkChild&&!isHiddenLineageReferenceChild) continue;
-    const parentSid=child.parent_session_id;
+    const resolvedParent=payloadParentFor(child);
+    const parentSid=resolvedParent&&!visibleBySid.has(child.parent_session_id)&&!visibleBySegmentSid.has(child.parent_session_id)
+      ? resolvedParent.session_id : child.parent_session_id;
     let parentRow=visibleBySid.get(parentSid);
     let parentSegment=null;
     if(!parentRow&&visibleBySegmentSid.has(parentSid)){
@@ -8849,7 +8992,10 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       parentSegment=resolved.seg;
     }
     if(!parentRow&&child._parent_lineage_tip_id){
-      parentRow=visibleBySid.get(child._parent_lineage_tip_id)||null;
+      const tipSid=child._parent_lineage_tip_id;
+      const tipSeg=!visibleBySid.has(tipSid)&&visibleBySegmentSid.get(tipSid);
+      parentRow=visibleBySid.get(tipSid)||(tipSeg&&tipSeg.row)||null;
+      if(tipSeg) parentSegment=tipSeg.seg;
     }
     if(!parentRow&&child._parent_lineage_root_id){
       parentRow=visibleByLineageKey.get(child._parent_lineage_root_id)||null;
@@ -8908,7 +9054,12 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // trigger from archived to filtered-out. A cross-surface WebUI child of a
       // genuinely external (messaging/CLI) parent is handled by the parentIsExternal
       // branch above and still orphans as before.
-      if(child&&child._cross_surface_child_session&&_isChildSession(child)) continue;
+      // A flag-less subagent is suppressed only when its ancestor chain ends at a hidden, non-CLI
+      // top-level host (the partition's _isCliSession bucket). A CLI ancestor, a visible ancestor
+      // (the chain renders as an orphan) or an unresolvable link keeps the child an orphan.
+      const subagentParentKnown=childIsDelegatedSubagent&&subagentHostHiddenByScope(child);
+      const crossSurfaceChild=!!(child&&child._cross_surface_child_session&&_isChildSession(child));
+      if(!searchActive&&(subagentParentKnown||crossSurfaceChild)) continue;
       orphans.push({...child,_orphan_child_session:true});
     }
   }
@@ -9339,6 +9490,16 @@ function _isDelegatedSubagentRow(s){
 // every other row keeps its own. Memoized per render, so each lineage resolves once.
 function _sidebarProjectResolver(rowsById){
   const memo=new Map();
+  // Resolve the parent like the attach step does: a child of a compressed parent names its
+  // pre-compression segment, which the payload carries only as the tip's _lineage_root_id.
+  const byLineageRoot=new Map();
+  if(rowsById) rowsById.forEach(r=>{ if(r&&r._lineage_root_id&&!byLineageRoot.has(r._lineage_root_id)) byLineageRoot.set(r._lineage_root_id,r); });
+  const parentOf=(s)=>{
+    const pid=s.parent_session_id;
+    if(!rowsById||!pid) return null;
+    return rowsById.get(pid)||rowsById.get(s._parent_lineage_tip_id)
+      ||byLineageRoot.get(pid)||byLineageRoot.get(s._parent_lineage_root_id)||null;
+  };
   return function projectIdFor(s){
     if(!s) return null;
     const path=[];
@@ -9350,7 +9511,7 @@ function _sidebarProjectResolver(rowsById){
       if(cur.project_id||!_isDelegatedSubagentRow(cur)){ result=cur.project_id||null; if(sid) path.push(sid); break; }
       if(onPath.has(sid)) break;
       onPath.add(sid); path.push(sid);
-      cur=rowsById?rowsById.get(cur.parent_session_id):null;
+      cur=parentOf(cur);
     }
     for(const sid of path) memo.set(sid,result);
     return result;
@@ -9372,7 +9533,9 @@ function _sidebarHasUnprojectedRows(rows, projectIdFor){
 }
 
 function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
-  const projectIdFor=_sidebarProjectResolver(_sidebarRowsById([allMatched, typeof _sidebarReferenceSessions!=='undefined'?_sidebarReferenceSessions:null]));
+  // Every payload row, before bucket/project/archive scoping; the attach step classifies parents from it.
+  const rowsById=_sidebarRowsById([allMatched, typeof _sidebarReferenceSessions!=='undefined'?_sidebarReferenceSessions:null]);
+  const projectIdFor=_sidebarProjectResolver(rowsById);
   let cliSessionCount=0;
   const webuiProfileFiltered=[];
   const cliProfileFiltered=[];
@@ -9420,6 +9583,7 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
     webuiSessionsRaw,
     cliSessionsRaw,
     projectIdFor,
+    rowsById,
   };
 }
 
@@ -9447,9 +9611,9 @@ function _scopedSidebarReferenceRows(isCli, projectIdFor){
   });
 }
 
-function _renderSidebarRowsFromRawSessions(sessionsRaw, referenceSessionsRaw){
+function _renderSidebarRowsFromRawSessions(sessionsRaw, referenceSessionsRaw, payloadRowsById){
   const referenceRows=Array.isArray(referenceSessionsRaw)?referenceSessionsRaw:sessionsRaw;
-  return _attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw, referenceRows);
+  return _attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw, referenceRows, payloadRowsById);
 }
 
 // Apply the renderer's complete source/reference/lineage projection to an
@@ -9461,6 +9625,7 @@ function _renderSidebarRowsFromPartition(partition){
   return _renderSidebarRowsFromRawSessions(
     partition.sessionsRaw,
     [...referenceRaw, ..._scopedSidebarReferenceRows(isCliView, partition.projectIdFor)],
+    partition.rowsById,
   );
 }
 
@@ -9611,6 +9776,7 @@ function renderSessionListFromCache(){
     webuiSessionsRaw,
     cliSessionsRaw,
     projectIdFor,
+    rowsById,
   }=sidebarPartition;
   const sessions=_renderSidebarRowsFromPartition(sidebarPartition);
   // Server-provided source bucket counts are authoritative for the current
@@ -9618,10 +9784,10 @@ function renderSessionListFromCache(){
   // null is a deliberate "not computed" sentinel consumed only by
   // _sessionSourceTabCount's fallback path below.
   const renderedWebuiSessionCount=_serverWebuiSessionCount===null
-    ? _renderSidebarRowsFromRawSessions(webuiSessionsRaw, [...webuiReferenceRaw, ..._scopedSidebarReferenceRows(false, projectIdFor)]).length
+    ? _renderSidebarRowsFromRawSessions(webuiSessionsRaw, [...webuiReferenceRaw, ..._scopedSidebarReferenceRows(false, projectIdFor)], rowsById).length
     : null;
   const renderedCliSessionCount=_serverCliSessionCount===null
-    ? _renderSidebarRowsFromRawSessions(cliSessionsRaw, [...cliReferenceRaw, ..._scopedSidebarReferenceRows(true, projectIdFor)]).length
+    ? _renderSidebarRowsFromRawSessions(cliSessionsRaw, [...cliReferenceRaw, ..._scopedSidebarReferenceRows(true, projectIdFor)], rowsById).length
     : null;
   const webuiSessionTabCount=_sessionSourceTabCount('webui', renderedWebuiSessionCount, renderedCliSessionCount);
   const cliSessionTabCount=_sessionSourceTabCount('cli', renderedWebuiSessionCount, renderedCliSessionCount);
@@ -11262,6 +11428,17 @@ async function removeWorktree(session){
   }
 }
 
+// Wire codes from /api/session/delete are for clients, not for people: map the
+// bounded refusals to a sentence the user can act on (#8323 review item 3).
+function _sessionDeleteErrorMessage(err){
+  const code=err&&err.message?String(err.message):String(err||'');
+  if(code==='session_busy') return t('session_delete_busy');
+  if(code==='unknown_execution') return t('session_delete_unknown_execution');
+  if(code==='runtime_ledger_unavailable') return t('session_delete_ledger_unavailable');
+  if(code==='state_db_cleanup_failed') return t('session_delete_cleanup_failed');
+  return t('delete_failed')+code;
+}
+
 async function deleteSession(sid, beforeDelete=null){
   const session=_sessionSnapshotById(sid);
   const ok=await showConfirmDialog({
@@ -11298,7 +11475,7 @@ async function deleteSession(sid, beforeDelete=null){
       _repaintSidebarAfterSessionCompletion(sid);
     }
     const err=deleteResult.error;
-    setStatus(`Delete failed: ${err&&err.message?err.message:String(err)}`);
+    setStatus(_sessionDeleteErrorMessage(err));
     return false;
   }
   const response=deleteResult&&deleteResult.response;
@@ -11311,6 +11488,7 @@ async function deleteSession(sid, beforeDelete=null){
   }
   if(S.session&&S.session.session_id===sid){
     S.session=null;S.messages=[];S.entries=[];
+    if(typeof _syncProviderQuotaForActiveContext==='function') _syncProviderQuotaForActiveContext();
     if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(null);
     localStorage.removeItem('hermes-webui-session');
     // load the most recent remaining session, or show blank if none left
