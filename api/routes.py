@@ -987,10 +987,20 @@ def _request_session_visibility_exempt(method: str, path: str | None) -> bool:
     # Import routes create/claim sessions before normal ownership exists, and
     # chat/start has inline placeholder-retag rules that must run before the
     # generic request-session guard.
+    # #7731: /api/session/archive is exempt for the same reason, but for a
+    # different one. Archiving a session that lives in another profile publishes
+    # a sidecar owned by that profile, so the NEXT request (the restore) would
+    # hit the generic guard and be answered 409 session_profile_mismatch before
+    # the archive handler ever ran -- archiving a session would permanently
+    # brick its own restore. The archive handler therefore owns its profile
+    # boundary (see the /api/session/archive branch in handle_post): it accepts
+    # an explicitly supplied owning profile and keeps unqualified requests
+    # pinned to the active profile.
     return path in {
         "/api/session/import",
         "/api/session/import_cli",
         "/api/chat/start",
+        "/api/session/archive",
     }
 
 
@@ -2942,6 +2952,15 @@ def _build_session_list_cache_payload(
         key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
         reverse=True,
     )
+    # Each sidebar tab is loaded on its own, so a child can arrive without its parent's row.
+    # Stamp the parent's tab (the same classifier _filter_sidebar_source uses) on the child.
+    # Only within one profile: a parent in another profile is filtered out of this child's
+    # view, so its tab says nothing about where the child belongs — leave the hint unset.
+    _merged_by_id = {s.get("session_id"): s for s in merged if s.get("session_id")}
+    for s in merged:
+        _parent = _merged_by_id.get(s.get("parent_session_id"))
+        if _parent is not None and _profiles_match(_parent.get("profile"), s.get("profile")):
+            s["parent_is_cli_session"] = _is_cli_session_for_settings(_parent)
     # ── Profile scoping (#1611) ────────────────────────────────────────
     # Default: filter to the active profile. ?all_profiles=1 opts into
     # the aggregate view used by the "All profiles" sidebar toggle.
@@ -6294,8 +6313,13 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
     except KeyError:
         pass
 
-    # Fallback: try to materialize from CLI/agent session metadata
-    cli_meta = _lookup_cli_session_metadata(sid)
+    # Fallback: try to materialize from CLI/agent session metadata.
+    # Active-profile-only: this helper is the shared chokepoint for rename,
+    # regenerate, update, move, prompts, chat-start and anchor scenes.
+    # Opening all-profiles here would let profile A materialize and mutate
+    # profile B's sessions.  The archive handler has its own request-scoped
+    # all-profiles path (#7549, #7731).
+    cli_meta = _resolve_cli_import_metadata(sid)
 
     # Delegated subagent children (#5307) are view-only: their transcript lives
     # in state.db and ownership belongs to the delegate runner, not WebUI. They
@@ -6339,7 +6363,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
         # Messaging sessions: lightweight Session with no messages (state.db is source of truth)
         s = Session(
             session_id=sid,
-            title=cli_meta.get("title") or title_from(get_cli_session_messages(sid), "CLI Session"),
+            title=cli_meta.get("title") or title_from(get_cli_session_messages(sid, profile=cli_meta.get("profile")), "CLI Session"),
             workspace=get_last_workspace(),
             model=cli_meta.get("model") or "unknown",
             created_at=cli_meta.get("created_at"),
@@ -6349,7 +6373,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
         s.save(touch_updated_at=False)
     else:
         # Regular CLI/agent sessions: import full message history
-        msgs = get_cli_session_messages(sid)
+        msgs = get_cli_session_messages(sid, profile=cli_meta.get("profile"))
         if not msgs:
             raise KeyError(sid)
         s = import_cli_session(
@@ -12460,6 +12484,7 @@ from api.streaming import (
     _sse_set_write_deadline,
     _run_agent_streaming,
     _provider_routing_kwargs_for_agent,
+    _producer_committed_compression,
     cancel_stream,
     _materialize_pending_user_turn_before_error,
     generate_session_title_for_session,
@@ -18420,6 +18445,10 @@ def handle_post(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
         _draft_mark("after_get_session")
+        # Optional compare-and-clear: only write when the stored draft still equals
+        # if_text (and if_files when given), so a stale retire keeps newer drafts.
+        if_text = body.get("if_text")
+        if_files = body.get("if_files")
         unchanged = False
         request_sid = sid
         request_session = s
@@ -18514,6 +18543,11 @@ def handle_post(handler, parsed) -> bool:
                     )
 
                 current_draft = dict(getattr(request_session, "composer_draft", {}) or {})
+                if isinstance(if_text, str) and (
+                    str(current_draft.get("text") or "") != if_text
+                    or (isinstance(if_files, list) and list(current_draft.get("files") or []) != if_files)
+                ):
+                    return j(handler, {"ok": True, "draft": current_draft, "unchanged": True, "mismatch": True})
                 next_draft = dict(current_draft)
                 if text is not None:
                     next_draft["text"] = text
@@ -18706,6 +18740,17 @@ def handle_post(handler, parsed) -> bool:
         except Exception:
             logger.debug("Failed to resolve profile for deleted session %s", sid, exc_info=True)
             event_profile = None
+        try:
+            p = (SESSION_DIR / f"{sid}.json").resolve()
+            p.relative_to(SESSION_DIR.resolve())
+        except Exception:
+            return bad(handler, "Invalid session_id", 400)
+        # Evict outside the mutation lock: the lifecycle commit performs provider
+        # I/O (it can wait on another commit) and must not hold a per-session
+        # lock. It runs before the DB delete because that commit writes state.db
+        # and would otherwise recreate the session being deleted.
+        from api.config import _evict_session_agent
+        _evict_session_agent(sid)
         # Serialize with recovery, but bound contention so a browser timeout
         # cannot be followed by a delayed server-side delete.
         session_lock = _get_session_agent_lock(sid)
@@ -18713,11 +18758,70 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session busy, try again", 503)
         draft_delete_failed = False
         try:
+            # Delete state.db rows BEFORE any user-visible file. A refusal (live
+            # gateway work, unfenceable ledger) or a failed commit must leave the
+            # whole session intact instead of stranding an unrecoverable
+            # half-delete: the sidecar, index entry, backups and tombstone are
+            # not restored by the DB rollback.
+            state_db_cleanup_failed = False
+            delete_raised = False
+            if not is_messaging_session:
+                try:
+                    from api.models import SessionDeleteRefused, delete_cli_session
+
+                    state_db_cleanup_failed = not delete_cli_session(sid)
+                except SessionDeleteRefused as exc:
+                    return j(
+                        handler,
+                        {"ok": False, "error": exc.code, "action": "session_delete"},
+                        status=409,
+                    )
+                except Exception:
+                    state_db_cleanup_failed = True
+                    delete_raised = True
+                    logger.warning("Failed to delete CLI session %s", sid, exc_info=True)
+                if state_db_cleanup_failed:
+                    # A False return covers an aborted transaction and a commit
+                    # whose artifact cleanup is still pending (its manifest
+                    # retries it). Only a surviving row proves nothing was
+                    # committed; then user files must stay. Otherwise the
+                    # conversation is already gone and the remaining cleanup
+                    # must still run, or the sidecar, index entry and tombstone
+                    # would strand a deleted session. An exception proves
+                    # nothing either way, so it keeps failing closed.
+                    from api.models import state_db_session_presence
+
+                    if delete_raised or state_db_session_presence(sid) is not False:
+                        return j(
+                            handler,
+                            {
+                                "ok": False,
+                                "error": "state_db_cleanup_failed",
+                                "action": "session_delete",
+                            },
+                            status=500,
+                        )
+                    logger.warning(
+                        "Session %s committed; transcript cleanup is still pending",
+                        sid,
+                    )
+            # Runtime cleanup only after the delete is durable: closing the
+            # terminal of a refused delete would kill the very work that made
+            # the Agent refuse it.
+            # Prune the completion-dedup entry too. The reaper sweeps it once the
+            # completion is delivered (drained from PENDING); a session deleted
+            # while a completion is still pending would otherwise keep its entry.
             try:
-                p = (SESSION_DIR / f"{sid}.json").resolve()
-                p.relative_to(SESSION_DIR.resolve())
+                from api.background_process import forget_bg_task_completion_dedup
+
+                forget_bg_task_completion_dedup(sid)
             except Exception:
-                return bad(handler, "Invalid session_id", 400)
+                logger.debug("Failed to prune bg-task dedup entry for deleted session %s", sid)
+            try:
+                from api.terminal import close_terminal
+                close_terminal(sid)
+            except Exception:
+                logger.debug("Failed to close workspace terminal for deleted session %s", sid)
             sidecar_deleted = False
             with LOCK:
                 SESSIONS.pop(sid, None)
@@ -18747,10 +18851,6 @@ def handle_post(handler, parsed) -> bool:
                     logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
         finally:
             session_lock.release()
-        # Evict outside the mutation lock: lifecycle commit may perform provider
-        # I/O and must not hold a per-session Session lock.
-        from api.config import _evict_session_agent
-        _evict_session_agent(sid)
         try:
             from api.upload import _session_attachment_dir
 
@@ -18776,31 +18876,6 @@ def handle_post(handler, parsed) -> bool:
             logger.debug("Failed to delete run journal for deleted session %s", sid)
         # The weak lock registry releases this entry automatically after all
         # holders and waiters drop their strong references.
-        # Prune the completion-dedup entry too. The reaper sweeps it once the
-        # completion is delivered (drained from PENDING); a session deleted
-        # while a completion is still pending would otherwise keep its entry.
-        try:
-            from api.background_process import forget_bg_task_completion_dedup
-
-            forget_bg_task_completion_dedup(sid)
-        except Exception:
-            logger.debug("Failed to prune bg-task dedup entry for deleted session %s", sid)
-        try:
-            from api.terminal import close_terminal
-            close_terminal(sid)
-        except Exception:
-            logger.debug("Failed to close workspace terminal for deleted session %s", sid)
-        # Also delete from CLI state.db for CLI sessions shown in sidebar,
-        # but never erase external messaging channel memory via WebUI delete.
-        state_db_cleanup_failed = False
-        if not is_messaging_session:
-            try:
-                from api.models import delete_cli_session
-
-                state_db_cleanup_failed = not delete_cli_session(sid)
-            except Exception:
-                state_db_cleanup_failed = True
-                logger.warning("Failed to delete CLI session %s", sid, exc_info=True)
         _publish_session_list_changed("session_delete", profile=event_profile)
         response = {
             "state_db_cleanup_failed": state_db_cleanup_failed,
@@ -19865,6 +19940,77 @@ def handle_post(handler, parsed) -> bool:
         except ValueError as e:
             return bad(handler, str(e))
         sid = body["session_id"]
+        # ── Request-scoped profile boundary (#7731) ──
+        # This route is exempt from _guard_request_session_visibility (see
+        # _request_session_visibility_exempt) so an archived foreign session can
+        # be restored; that makes THIS handler the owner of the boundary, for
+        # both the resident-session path and the CLI materialize fallback.
+        #
+        # Normalize the caller's claim BEFORE anything reads it. ``None`` means
+        # absent and ``''`` means present-but-malformed; neither may stand in for
+        # an owner. Mirrors the invariant _handle_session_import_cli already
+        # enforces for cross-profile import, so ``all_profiles: true`` can never
+        # widen the search without a claimed, validated owner.
+        _arch_allow_all = _request_wants_all_profiles_import(body)
+        _arch_profile = _normalize_import_profile_value((body or {}).get("profile"))
+        if _arch_profile == "":
+            return bad(handler, "invalid profile", 400)
+        if _arch_allow_all and not _arch_profile:
+            return bad(handler, "profile is required for all_profiles archive", 400)
+        if _arch_allow_all and _is_isolated_profile_mode():
+            # Isolated mode exposes exactly one profile, so a cross-profile
+            # lookup is meaningless there. The browser can still restore a saved
+            # all-profiles toggle (#7731 greptile), so rather than stranding the
+            # pinned profile's OWN sessions behind a 403, confirm the claim names
+            # that pinned profile and degrade to an ordinary active-profile
+            # archive. A claim naming any other profile is refused outright.
+            if not _profiles_match(_arch_profile, _get_active_profile_name()):
+                return bad(handler, "all_profiles archive is not allowed in isolated profile mode", 403)
+            _arch_allow_all = False
+        # #7731: apply the profile boundary for a session that ALREADY has a
+        # WebUI sidecar, BEFORE get_session() runs. get_session() repairs legacy
+        # sidecar layouts in place (#8094), so a request that is about to be
+        # refused must not touch the bytes — the generic guard this route is
+        # exempt from used to guarantee exactly that. The probe is the same
+        # read-only ownership read the guard used, so it neither repairs nor
+        # publishes a cache entry.
+        #
+        # A scoped request that explicitly names the owning profile may reach
+        # the session (that is what makes an archived foreign session
+        # restorable); an unqualified request stays pinned to the active
+        # profile, keeping the #7710 contract: a known other profile is a 409 so
+        # the frontend can offer a profile switch, and only an unknown/legacy
+        # None-profile sidecar 404s, so its stale-URL self-heal keeps firing.
+        if is_safe_session_id(sid):
+            _arch_owner_profile = None
+            _arch_owner_known = False
+            try:
+                _arch_owner_profile = get_session_profile_readonly(sid)
+                _arch_owner_known = True
+            except KeyError:
+                # No sidecar yet — the CLI materialize fallback below decides.
+                _arch_owner_known = False
+            except (OSError, ValueError, TypeError):
+                return bad(handler, "Session not found", 404)
+            if _arch_owner_known:
+                _arch_mismatch = (
+                    not _profiles_match(_arch_owner_profile, _arch_profile)
+                    if _arch_allow_all
+                    else not _profiles_match(_arch_owner_profile, _get_active_profile_name())
+                )
+                if _arch_mismatch:
+                    if _arch_owner_profile:
+                        return j(handler, {
+                            "error": "Session belongs to another profile",
+                            "code": "session_profile_mismatch",
+                            "session_id": sid,
+                            "profile": _arch_owner_profile,
+                        }, 409)
+                    return bad(handler, "Session not found", 404)
+        # Runs AFTER the profile boundary above, not before: the check calls
+        # get_session(), which repairs legacy sidecar layouts in place (#8094),
+        # so a request already destined for a 409/404 must not reach it. The
+        # generic guard this route is exempt from used to refuse first.
         if _session_is_subagent_view_only(sid):
             return bad(handler, "Subagent sessions are view-only and cannot be archived from WebUI", 400)
         # #7776 Finding 2: capture the CLI source identity BEFORE the lock so
@@ -19872,6 +20018,9 @@ def handle_post(handler, parsed) -> bool:
         # new WebUI session without the pre-lock CLI metadata) cannot drop it
         # on the way back to disk. The materialize path below also uses it.
         _archive_cli_meta = _lookup_cli_session_metadata(sid) or {}
+        # Set by the materialize fallback below; empty on the resident path,
+        # where _archive_cli_meta already holds the active-profile identity.
+        _archive_resolved_meta = {}
         try:
             s = get_session(sid)
             # #1558: save() refuses metadata-only session stubs because their
@@ -19885,9 +20034,51 @@ def handle_post(handler, parsed) -> bool:
                 with LOCK:
                     SESSIONS[sid] = s
         except KeyError:
-            cli_meta = _archive_cli_meta
+            # #7776: reuse the CLI identity captured before the lock — the
+            # lock-held reload can drop it. #7549/#7731: cross-profile archive
+            # is only allowed when the request explicitly carried
+            # all_profiles=true AND a validated profile, both normalized and
+            # validated above, so the shared materializer chokepoint cannot
+            # leak profile isolation.
+            cli_meta = _archive_cli_meta or _resolve_cli_import_metadata(
+                sid,
+                requested_profile=_arch_profile,
+                allow_all_profiles=_arch_allow_all,
+            )
             if not cli_meta:
+                # #7731: an empty result is ambiguous on its own. When the
+                # request scoped itself to a profile, re-probe WITHOUT that
+                # filter to tell a profile conflict apart from a missing
+                # session: the resolver above prefilters a mismatched owner to
+                # ``{}``, so without this probe the caller cannot tell
+                # "wrong profile" from "no such session" and both answered 404.
+                # Only an all-profiles request may probe other profiles: a request that carries ``profile`` without
+                # ``all_profiles`` is an active-profile archive and keeps master's 404 for a foreign session.
+                if _arch_allow_all and _arch_profile:
+                    _owner_meta = _lookup_cli_session_metadata(sid, all_profiles=True)
+                    _owner_profile = (_owner_meta or {}).get("profile")
+                    if _owner_profile and not _profiles_match(_owner_profile, _arch_profile):
+                        return j(handler, {
+                            "error": "Session belongs to another profile",
+                            "code": "session_profile_mismatch",
+                            "session_id": sid,
+                            "profile": _owner_profile,
+                        }, 409)
                 return bad(handler, "Session not found", 404)
+            # When the request carries an explicit profile but the resolved
+            # session belongs to a different one, return the #7710 contract
+            # (409 session_profile_mismatch) so the frontend can surface the
+            # conflict rather than silently mutating a foreign session.
+            if _arch_allow_all and _arch_profile:
+                _resolved_profile = cli_meta.get("profile")
+                if _resolved_profile and not _profiles_match(_resolved_profile, _arch_profile):
+                    return j(handler, {"error": "Session belongs to another profile", "code": "session_profile_mismatch"}, 409)
+            # #7731: remember the resolved identity for the re-stamp after the
+            # lock-held reload below. ``_archive_cli_meta`` is captured from the
+            # ACTIVE profile only, so on the cross-profile path it is empty and
+            # the reload would persist a WebUI-native copy (is_cli_session=False
+            # plus null source fields) of a CLI-origin session.
+            _archive_resolved_meta = cli_meta
             if cli_meta.get("read_only"):
                 return bad(handler, "Read-only imported sessions cannot be archived from WebUI", 400)
             # Delegated subagent children (#5307) are view-only and owned by the
@@ -19901,7 +20092,7 @@ def handle_post(handler, parsed) -> bool:
                 _arch_profile = cli_meta.get("profile") or None
                 s = Session(
                     session_id=sid,
-                    title=cli_meta.get("title") or title_from(get_cli_session_messages(sid), "CLI Session"),
+                    title=cli_meta.get("title") or title_from(get_cli_session_messages(sid, profile=cli_meta.get("profile")), "CLI Session"),
                     workspace=get_last_workspace(profile=_arch_profile),
                     messages=[],
                     model=cli_meta.get("model") or "unknown",
@@ -19922,7 +20113,7 @@ def handle_post(handler, parsed) -> bool:
                 s.platform = cli_meta.get("platform")
                 s.save(touch_updated_at=False)
             else:
-                msgs = get_cli_session_messages(sid)
+                msgs = get_cli_session_messages(sid, profile=cli_meta.get("profile"))
                 if not msgs:
                     return bad(handler, "Session not found", 404)
                 s = import_cli_session(
@@ -19965,15 +20156,20 @@ def handle_post(handler, parsed) -> bool:
                 if latest is None:
                     return bad(handler, "Session not found", 404)
             s = _ensure_full_session_before_mutation(sid, latest)
-            # #7776 Finding 2: re-stamp CLI source identity on the freshly
-            # loaded session before mutating it. ``_archive_cli_meta`` was
-            # captured above (before the lock); for the regular CLI/agent
-            # materialize path the on-disk sidecar that Session.load(sid)
-            # just read is the import_cli_session save WITHOUT source meta,
-            # so without this re-stamp the save() below would persist a
-            # WebUI-native copy with is_cli_session=False + null source.
-            if _archive_cli_meta:
-                _apply_cli_source_meta_to_session(s, _archive_cli_meta)
+            # #7776 Finding 2 / #7731: re-stamp CLI source identity on the
+            # freshly loaded session before mutating it. ``_archive_cli_meta``
+            # was captured above (before the lock) from the ACTIVE profile;
+            # for the regular CLI/agent materialize path the on-disk sidecar
+            # that Session.load(sid) just read is the import_cli_session save
+            # WITHOUT source meta, so without this re-stamp the save() below
+            # would persist a WebUI-native copy with is_cli_session=False +
+            # null source. On the cross-profile path _archive_cli_meta is empty
+            # (the session is not in the active profile), so prefer the
+            # identity the fallback actually resolved — otherwise the archived
+            # foreign session is recorded as WebUI-native.
+            _archive_source_meta = _archive_cli_meta or _archive_resolved_meta
+            if _archive_source_meta:
+                _apply_cli_source_meta_to_session(s, _archive_source_meta)
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)
             with LOCK:
@@ -29096,6 +29292,13 @@ def _handle_chat_sync(handler, body):
                 s, "sync provider routing", logger_override=logger,
             ):
                 _routing_kwargs = _sync_routing_kwargs(_pp_cfg, _sync_routing_params)
+            # #7237 review round-N+2 finding 2 (nesquena-hermes 2026-10-05):
+            # the sync path must derive wholesale-replacement authority from
+            # the PRODUCER, exactly like the streaming path. Capture the
+            # session id this turn opened with so a post-run compression
+            # rotation (agent.session_id advancing to a fresh continuation) is
+            # visible to the settle below.
+            _sync_session_id = s.session_id
             agent = AIAgent(
                 model=_model,
                 provider=_provider,
@@ -29115,6 +29318,7 @@ def _handle_chat_sync(handler, body):
                 _active_turn_boundary,
                 _assign_stable_message_ids,
                 _dedupe_replayed_context_messages,
+                _deduplicate_context_messages,
                 _find_active_turn_checkpoint_index,
                 _merge_display_messages_after_agent_result,
                 _resolve_active_turn_authority,
@@ -29122,6 +29326,7 @@ def _handle_chat_sync(handler, body):
                 _restore_reasoning_metadata_before_boundary,
                 _settle_current_turn_boundary,
                 _sanitize_messages_for_agent,
+                _agent_replay_settle_projection,
                 _compact_session_image_parts_for_persistence,
                 _context_messages_for_new_turn,
                 _workspace_context_prefix,
@@ -29148,17 +29353,64 @@ def _handle_chat_sync(handler, body):
 
             _previous_messages = list(s.messages or [])
             _previous_context_messages = list(_context_messages_for_new_turn(s, msg))
+            # The EXACT projection handed to the Agent, threaded to the settle's
+            # replay dedupe. ``result["messages"]`` is the full conversation
+            # (this projection + the current turn), so without it the dedupe
+            # cannot prove which rows the current turn owns and could append
+            # sanitizer-rewritten historical rows beside the raw history
+            # (#7237 review data-regression finding, nesquena-hermes
+            # 2026-09-23).
+            # #7237 review round 3 finding 2 (nesquena-hermes 2026-10-06): the
+            # projection used to be passed BY REFERENCE and then reused for the
+            # prefix proof. The real Agent shallow-copies the list and performs
+            # its consecutive-user repair on the tail dict, so the same object
+            # the settle compares against had already been mutated. An
+            # unanswered-tail follow-up therefore lost its current user row.
+            #
+            # Take an INDEPENDENT deep snapshot here: the value handed to the
+            # Agent and the value compared at settle time must be two objects,
+            # or "what we sent" is a moving target.
+            #
+            # The sent projection keeps out-of-clock-order splice pairs
+            # separate (the boundary matrix pins the row-level prefix), so the
+            # settle proof compares the UNCONDITIONAL merge of the sent rows —
+            # the form the installed Agent actually returns.
+            _agent_replay_projection = _sanitize_messages_for_agent(
+                _previous_context_messages,
+                cfg=get_config(),
+                effective_model=_model,
+                effective_provider=_provider,
+                effective_base_url=_base_url,
+                # #7237 review round 3 finding 5 (nesquena-hermes
+                # 2026-10-06): same Agent-replay adjacency normalization the
+                # streaming path applies, so the sync settle models the
+                # Agent's merge of bare assistant rows instead of rejecting
+                # the changed prefix and dropping the exchange.
+                normalize_bare_assistant_adjacency=True,
+            )
+            _run_conversation_projected_history = _agent_replay_settle_projection(
+                _agent_replay_projection
+            )
 
             result = agent.run_conversation(
                 user_message=workspace_ctx + msg,
                 system_message=workspace_system_msg,
-                conversation_history=_sanitize_messages_for_agent(
-                    _previous_context_messages,
-                    cfg=get_config(),
-                    effective_model=_model,
-                    effective_provider=_provider,
-                    effective_base_url=_base_url,
-                ),
+                # Threaded to the settle's replay dedupe so only rows the
+                # current turn owns are appended when the replayed prefix
+                # diverges from the raw context (#7237 review
+                # data-regression finding).
+                # #7237 review blocker 1 (nesquena-hermes 2026-10-09): the
+                # proof snapshot above must stay an IMMUTABLE copy. The
+                # installed Agent shallow-copies the list it receives and
+                # performs its consecutive-user repair on the tail dict, so
+                # handing it the same object the settle compares against
+                # makes the prefix proof a moving target — the repair
+                # mutates the dict in place and the settle then rejects the
+                # changed prefix, dropping the follow-up's prompt and reply.
+                # A second deep copy here isolates the Agent's mutation. The
+                # Agent receives the SENT projection (splice pairs separate);
+                # only the settle proof uses the unconditional merge.
+                conversation_history=copy.deepcopy(_agent_replay_projection),
                 task_id=s.session_id,
                 persist_user_message=msg,
             )
@@ -29186,6 +29438,23 @@ def _handle_chat_sync(handler, body):
                 os.environ.pop("HERMES_SESSION_KEY", None)
             else:
                 os.environ["HERMES_SESSION_KEY"] = old_session_key
+    # #7237 review round-N+2 finding 2 (nesquena-hermes 2026-10-05): the sync
+    # path previously never passed ``compression_authorized`` to
+    # ``_dedupe_replayed_context_messages``, so every genuine compression was
+    # refused there and the persisted context kept only the old history. The
+    # producer signal is the same as the streaming path: the Agent rotating
+    # its own session_id inside this call proves the context layer really ran
+    # a compression turn.
+    # #7237 review round 3 (nesquena-hermes 2026-10-06): the installed Agent
+    # compresses IN PLACE by default — it keeps its session id and commits
+    # ``_last_compaction_in_place``. The previous proxy
+    # (``agent.session_id != _sync_session_id``) could only see a rotation, so
+    # the default case was treated as "no compression", the settle refused the
+    # compacted result, and the route kept the 24 old context rows without the
+    # current answer. Derive the authority from actual producer commitment via
+    # the shared predicate the streaming settle uses, so the two paths cannot
+    # drift apart again.
+    _compression_authorized = _producer_committed_compression(agent, _sync_session_id)
     with _get_session_agent_lock(s.session_id):
         _result_messages = result.get("messages") or _previous_context_messages
         # Active-turn boundary is fixed BEFORE any restoration (same as streaming),
@@ -29235,11 +29504,42 @@ def _handle_chat_sync(handler, body):
         _assign_stable_message_ids(
             _result_messages, _previous_messages, _previous_context_messages
         )
-        _next_context_messages = _dedupe_replayed_context_messages(
-            _previous_context_messages,
-            _next_context_messages,
-            msg,
-        )
+        if result.get("messages"):
+            # Call-scoped protection (#7237 review blocker 1,
+            # nesquena-hermes 2026-09-28): the dedupe RETURNS the protected
+            # rows it proved; the sync route consumes them in THIS call by
+            # passing them into the identity dedupe — the old module global
+            # was never read here, so a settle that proved current-turn rows
+            # could have them collapsed as duplicates on the sync path.
+            _next_context_messages, _proven_rows = _dedupe_replayed_context_messages(
+                _previous_context_messages,
+                _next_context_messages,
+                msg,
+                projected_history=_run_conversation_projected_history,
+                # #7237 review round-N+2 finding 2 (nesquena-hermes
+                # 2026-10-05): the sync path must grant wholesale-replacement
+                # authority when the producer actually rotated the session
+                # id, exactly like the streaming path — a genuine compression
+                # must persist the compacted list, not the old history.
+                compression_authorized=_compression_authorized,
+            )
+            s.context_messages = _deduplicate_context_messages(
+                _next_context_messages,
+                protected_rows=_proven_rows,
+            )
+        else:
+            # The Agent produced NO rows for this turn. The previous fallback
+            # (``result.get("messages") or _previous_context_messages``) left
+            # the raw pre-turn context substituted as the settle input; with
+            # the exact sent projection ``[]`` that whole substituted raw
+            # history was then treated as the current-turn output and the
+            # settle returned ``previous_context + previous_context``
+            # (#7237 review residual 2, nesquena-hermes 2026-09-27). Settle
+            # an empty Agent result as a no-op for model context — the same
+            # contract the streaming ``_settle_result_messages`` applies —
+            # keeping exactly one raw-history copy with no loss or
+            # duplication.
+            _next_context_messages = list(_previous_context_messages)
         if _active_turn_identity.get("token"):
             _next_context_messages = _settle_current_turn_boundary(
                 _previous_context_messages,
