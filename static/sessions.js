@@ -36,10 +36,28 @@ let _pendingCarryForwardSnapshot = null;
 
 // Debounced save — prevents hammering the server on every keystroke.
 let _draftSaveTimer = null;
+let _draftSaveTimerSid = null;
+let _draftSaveTimerPayload = null;
+let _draftSaveTimerRev = 0;
 const _DRAFT_SAVE_DELAY_MS = 400;
 const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
 const _composerDraftKnownPayloadSessions = new Set();
 const _composerDraftRestoreSuppressedUntilBySid = new Map();
+// Bumped when a non-empty draft differing from the composer's last known
+// payload is saved, so callers can tell whether a newer draft exists. Re-saving
+// the same payload (e.g. an autosave of a restored draft) is not newer.
+const _composerDraftRevBySid = new Map();
+const _composerDraftLastPayloadBySid = new Map();
+function _composerDraftRevision(sid) { return _composerDraftRevBySid.get(sid) || 0; }
+function _noteComposerDraftPayload(sid, text, files) {
+  _composerDraftLastPayloadBySid.set(sid, _composerDraftPayloadSignature(String(text || ''), _composerDraftFilesForPersist(files)));
+}
+function _bumpComposerDraftRevision(sid, text, files) {
+  const sig = _composerDraftPayloadSignature(text, files);
+  if (_composerDraftLastPayloadBySid.get(sid) === sig) return;
+  _composerDraftLastPayloadBySid.set(sid, sig);
+  _composerDraftRevBySid.set(sid, _composerDraftRevision(sid) + 1);
+}
 const _composerDraftLocalFallbackBySid = new Map();
 const _composerDraftLatestIntentSequenceBySid = new Map();
 const _composerDraftPostPromisesBySid = new Map();
@@ -248,7 +266,13 @@ function _saveComposerDraft(sid, text, files) {
   if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
     _clearComposerDraftRestoreSuppression(sid);
     _composerDraftKnownPayloadSessions.add(sid);
+    _bumpComposerDraftRevision(sid, normalizedText, normalizedFiles);
+  } else {
+    _noteComposerDraftPayload(sid, '', []);
   }
+  _draftSaveTimerSid = sid;
+  _draftSaveTimerPayload = _composerDraftPayloadSignature(normalizedText, normalizedFiles);
+  _draftSaveTimerRev = _composerDraftRevision(sid);
   _draftSaveTimer = setTimeout(() => {
     _postComposerDraftPayload(sid, normalizedDraft, intent).catch((error) => {
       _handleComposerDraftPostFailure(error, sid, normalizedText, liveFiles, intent);
@@ -431,6 +455,9 @@ function _saveComposerDraftNow(sid, text, files) {
   const normalizedDraft = { text: normalizedText, files: normalizedFiles };
   if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
     _clearComposerDraftRestoreSuppression(sid);
+    _bumpComposerDraftRevision(sid, normalizedText, normalizedFiles);
+  } else {
+    _noteComposerDraftPayload(sid, '', []);
   }
   // Most chat switches leave an empty composer. Avoid putting the switch path
   // behind a network POST unless there is new local draft content or an existing
@@ -460,12 +487,18 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
   const current = ta.value || '';
   const preserveActiveInput = !!(opts && opts.preserveActiveInput);
   const restoreSid = targetSid || (S.session && S.session.session_id);
-  const localFallback = restoreSid && _composerDraftLocalFallbackBySid.get(restoreSid);
-  const useLocalFallback = !!localFallback;
-  if (useLocalFallback) {
+  let localFallback = restoreSid && _composerDraftLocalFallbackBySid.get(restoreSid);
+  if (localFallback) {
     text = localFallback.text;
     files = localFallback.files;
   }
+  // A delivered steer's exact draft (server or local fallback) is being
+  // compare-and-cleared: show the empty projection in place, without re-reading it.
+  if (restoreSid && _composerDraftHasPayload(text, files) && !_isComposerDraftRestoreSuppressed(restoreSid, text, files)
+      && typeof _steerDraftIsRetiring === 'function' && _steerDraftIsRetiring(restoreSid, text, files)) {
+    draft = null; localFallback = null; text = ''; files = [];
+  }
+  const useLocalFallback = !!localFallback;
   const hasServerDraftPayload = _composerDraftHasPayload(text, files);
   const serverDraftText = (draft && typeof draft.text === 'string') ? draft.text : '';
   const serverDraftFiles = (draft && Array.isArray(draft.files)) ? draft.files : [];
@@ -511,7 +544,8 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
 // Clear the saved draft for a session (called when message is sent).
 function _clearComposerDraft(sid, text, files) {
   if (!sid) return;
-  clearTimeout(_draftSaveTimer);
+  // The pending debounced save may belong to another session (e.g. after New Chat).
+  if (_draftSaveTimerSid === sid) clearTimeout(_draftSaveTimer);
   _clearRememberedNewChatDraftSession(sid);
   if (arguments.length >= 2) _suppressComposerDraftRestoreAfterSubmit(sid, text, files);
   else _suppressComposerDraftRestoreAfterSubmit(sid);
@@ -521,6 +555,41 @@ function _clearComposerDraft(sid, text, files) {
       _composerDraftLocalFallbackBySid.delete(sid);
     }
   });
+}
+
+// Clear sid's saved draft only if it still equals text/files (server-side
+// compare-and-clear), so a newer draft saved meanwhile is kept.
+// maxRev: a pending debounced save of this same payload scheduled at or before
+// that draft revision would land after the clear and write it back, so cancel
+// it; a later save (re-typed by the user) or a different payload is newer.
+function _clearComposerDraftIfUnchanged(sid, text, files, maxRev) {
+  if (!sid) return Promise.resolve(false);
+  if (_draftSaveTimerSid === sid && _draftSaveTimerRev <= Number(maxRev)
+      && _draftSaveTimerPayload === _composerDraftPayloadSignature(text, files)) clearTimeout(_draftSaveTimer);
+  const ifFiles = _composerDraftFilesForPersist(files);
+  const ifSig = _composerDraftPayloadSignature(String(text || ''), ifFiles);
+  // Join the per-session draft write chain so an earlier queued save cannot
+  // land after this compare-and-clear and resurrect the retired draft.
+  const previous = _composerDraftPostPromisesBySid.get(sid);
+  const dispatch = () => api('/api/session/draft', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sid, text: '', files: [], if_text: String(text || ''), if_files: ifFiles }),
+  });
+  const write = previous ? Promise.resolve(previous).then(dispatch, dispatch) : dispatch();
+  const pending = write.finally(() => {
+    if (_composerDraftPostPromisesBySid.get(sid) === pending) _composerDraftPostPromisesBySid.delete(sid);
+  });
+  _composerDraftPostPromisesBySid.set(sid, pending);
+  return pending.then((r) => {
+    if (r && r.mismatch) return false;
+    // A failed-save local fallback holding exactly the retired payload is now stale.
+    const fallback = _composerDraftLocalFallbackBySid.get(sid);
+    if (fallback && _composerDraftPayloadSignature(fallback.text, _composerDraftFilesForPersist(fallback.files)) === ifSig) {
+      _forgetComposerDraftLocalFallback(sid);
+    }
+    _rememberComposerDraftPayloadState(sid, '', []);
+    return true;
+  }).catch(() => false);
 }
 
 const SESSION_VIEWED_COUNTS_KEY = 'hermes-session-viewed-counts';
@@ -5651,8 +5720,11 @@ function _renderBatchActionBar(){
     if(!ok)return;
     try{
       const results=await Promise.all(ids.map(async sid=>{
-        const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:sid,archived:true})});
-        return {response,session:sessionsById.get(sid)||null};
+        const _batchPayload={session_id:sid,archived:true};
+        const _snap=sessionsById.get(sid);
+        if(typeof _showAllProfiles!=='undefined'&&_showAllProfiles&&_snap&&_snap.profile){_batchPayload.all_profiles=true;_batchPayload.profile=_snap.profile;}
+        const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify(_batchPayload)});
+        return {response,session:_snap||null};
       }));
       const retainedCount=_worktreeResponseCount(results);
       showToast(retainedCount?t('session_archived_worktree'):t('session_archived'));exitSessionSelectMode();await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
@@ -6299,7 +6371,9 @@ async function _archiveSession(session, archived=true, beforeListRender=null){
   const reflowPositions=_captureSessionReflowPositions();
   const renderHold=beforeListRender?Promise.resolve().then(beforeListRender):null;
   try{
-    const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:session.session_id,archived})});
+    const _archivePayload={session_id:session.session_id,archived};
+    if(typeof _showAllProfiles!=='undefined'&&_showAllProfiles&&session.profile){_archivePayload.all_profiles=true;_archivePayload.profile=session.profile;}
+    const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify(_archivePayload)});
     session.archived=archived;
     const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
     if(cached) cached.archived=archived;
@@ -6506,7 +6580,9 @@ function _openSessionActionMenu(session, anchorEl){
       async()=>{
         closeSessionActionMenu();
         try{
-          await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:session.session_id,archived:true})});
+          const _hidePayload={session_id:session.session_id,archived:true};
+          if(typeof _showAllProfiles!=='undefined'&&_showAllProfiles&&session.profile){_hidePayload.all_profiles=true;_hidePayload.profile=session.profile;}
+          await api('/api/session/archive',{method:'POST',body:JSON.stringify(_hidePayload)});
           _optimisticallyArchiveSessionInList(session.session_id,true);
           session.archived=true;
           if(S.session&&S.session.session_id===session.session_id) S.session.archived=true;

@@ -82,6 +82,18 @@
 
 ### Fixed
 
+- **Test suite: no real DNS lookups.** The shared test network guard now blocks DNS as well as connections (IP literals and `localhost` still resolve). A real lookup in the custom-provider address check could take longer than the 4-second model-list limit on a slow CI resolver, which made `test_seeded_config_survives_a_stale_loaded_config_path` fail on unrelated PRs. (#8396)
+
+- **The finished reply stays on screen in Transparent Stream.** When a long Transparent Stream turn settles, the reply is finalized in place instead of re-rendering the whole transcript, so it no longer blanks for a moment at the end of a turn; disclosure choices, detail scroll and table sort/filter controls survive. (#7833, closes #7676, thanks @MuhammadUsamaMX)
+
+- **Steer goes to the live Gateway run.** With the Gateway backend, Steer now forwards your message to the running turn instead of queueing it as the next one. If the connection to the Gateway drops and the run finishes before it reads the steer text, the text is replayed instead of lost. (#7919, thanks @carlotestor)
+
+- **Long chats stop jumping while you scroll.** In long virtualized transcripts, rows measured during a scroll no longer pull the view back and forth or teleport it mid-gesture, the scrollbar thumb lands where you drop it, and jump-to-question lands on the answer. Older-row loading and streaming tail-follow keep their place. (#8122, closes #7591, thanks @MuhammadUsamaMX)
+
+- **Archiving a session from another profile works.** With All profiles on, archiving or restoring a CLI or imported session that belongs to another profile no longer fails with "Session not found", keeps the session's CLI source details, and never writes a copy into the wrong profile. A request that names the wrong owner gets a clear profile-mismatch error. (#7731, closes #7549, thanks @MuhammadUsamaMX)
+
+- **Long messages no longer show another message's text.** The render cache identified messages over 500 characters by their length plus their first and last 20 characters, so two equal-length messages from the same template (status reports, cron summaries, regenerated answers) shared an entry and the second displayed the first one's body. Long messages are now keyed on a hash of the whole text. Saved data was never affected. (#8387)
+
 - **Tool calls without a result no longer break a conversation.** An assistant tool call whose result never arrived (an interrupted run, a crash between call and result) is now repaired the same way the Agent repairs it, so the next reply stays in the saved model context instead of being dropped, including when an older tool call had empty or broken arguments. (#7237, thanks @happy5318)
 
 - **Subagent runs stay with their parent conversation in the sidebar.** With All profiles on and a project filter such as Unassigned, delegated subagent sessions whose parent was filed in another project, or belonged to another profile, or was itself a subagent, showed up as contextless top-level "Subagent Session" rows (18 on one real install). They now follow their parent: nested when the parent is visible, hidden with it when it is filtered out, and still listed as an openable orphan when the parent is missing, compressed, or a CLI conversation. (#7771, thanks @carlotestor)

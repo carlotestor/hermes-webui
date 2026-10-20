@@ -6523,6 +6523,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(_streamFinalized) return;
       _clearStreamEndRecovery();
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      if(typeof _steerSettleTerminal==='function') _steerSettleTerminal(activeSid);
       // Set _streamFinalized IMMEDIATELY — before any fade delay. Without this,
       // a stream_end event arriving during the fade window sees
       // _streamFinalized=false, calls _restoreSettledSession(), and overwrites
@@ -6797,9 +6798,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(typeof _disarmKeepSettledWorklogOpen==='function') _disarmKeepSettledWorklogOpen();
           const _collapsedInPlace=typeof _collapseJustSettledWorklogInPlace==='function'
             && _collapseJustSettledWorklogInPlace(_settledStreamId);
-          if(!_collapsedInPlace&&typeof _renderMessagesWithScrollSnapshot==='function'){
+          // #7676: in-place finalize; rebuild is fallback.
+          const _settledInPlace=_collapsedInPlace||(typeof _finalizeJustSettledTransparentScene==='function'&&_finalizeJustSettledTransparentScene(_settledStreamId));
+          if(!_settledInPlace&&typeof _renderMessagesWithScrollSnapshot==='function'){
             _renderMessagesWithScrollSnapshot({_prescrollSnapshot:_doneLiveScrollSnapshot});
-          }else if(!_collapsedInPlace){
+          }else if(!_settledInPlace){
             renderMessages({preserveScroll:true});
           }else if(_doneLiveScrollSnapshot&&typeof _restoreMessageScrollSnapshotSameFrame==='function'){
             _restoreMessageScrollSnapshotSameFrame(_doneLiveScrollSnapshot);
@@ -6907,6 +6910,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(typeof updateQueueBadge==='function') updateQueueBadge(sid);
           showToast(t('steer_leftover_queued'),3000);
         }
+        if(typeof _steerReconcileLeftover==='function') _steerReconcileLeftover(sid,txt);
       }catch(_){}
     });
 
@@ -6998,6 +7002,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     source.addEventListener('apperror',e=>{
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       _clearStreamEndRecovery();
+      if(typeof _steerSettleTerminal==='function') _steerSettleTerminal(activeSid);
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
       _cancelThrottledSnapshotTimer();
@@ -7264,6 +7269,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     source.addEventListener('cancel',e=>{
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       _clearStreamEndRecovery();
+      if(typeof _steerSettleTerminal==='function') _steerSettleTerminal(activeSid);
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
       _cancelThrottledSnapshotTimer();
