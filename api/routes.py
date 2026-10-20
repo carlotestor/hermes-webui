@@ -2602,12 +2602,45 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def _reconcile_sidebar_pins_with_state_db(rows: list[dict]) -> None:
-    """Adopt state.db's ``pinned`` into every sidebar row that has a state.db row, once per profile."""
+def _profiles_with_pending_pins(scope) -> list[str]:
+    """Profiles in *scope* (None = every configured profile) whose state.db has queued pins.
+
+    Pending pins retry even when their owner has no displayed row; a marker key is attributed
+    only to a profile whose own state.db resolves to it, so no foreign profile is touched.
+    """
+    from api.state_sync import _resolve_state_db_path
+    with _PIN_MIGRATION_LOCK:
+        queued = {k for k, ids in (_load_pin_migration_state().get("pending_pins") or {}).items() if ids}
+    if not queued:
+        return []
+    if scope is None:
+        names = {"default"}
+        try:
+            names.update(_pin_profile(p.get("name")) for p in list_profiles_api() if p.get("name"))
+        except Exception:
+            logger.debug("Could not list profiles for pending pins", exc_info=True)
+    else:
+        names = {_pin_profile(p) for p in scope}
+    out = []
+    for name in sorted(names):
+        db_path = _resolve_state_db_path(name)
+        if db_path is not None and str(db_path) in queued:
+            out.append(name)
+    return out
+
+
+def _reconcile_sidebar_pins_with_state_db(rows: list[dict], *, profiles=None) -> None:
+    """Adopt state.db's ``pinned`` into every sidebar row that has a state.db row, once per profile.
+
+    *profiles* bounds which owners without displayed rows may still retry pending pins
+    (None = every configured profile, i.e. the all-profiles sidebar).
+    """
     by_profile: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         if str(row.get("session_id") or "").strip():
             by_profile[_pin_profile(row.get("profile"))].append(row)
+    for profile in _profiles_with_pending_pins(profiles):
+        by_profile.setdefault(profile, [])
     for profile, profile_rows in by_profile.items():
         pending = _migrate_legacy_sidecar_pins(profile_rows, profile)
         if pending is None:
@@ -3125,7 +3158,9 @@ def _build_session_list_cache_payload(
     show_kanban_sessions = bool(show_kanban_sessions)
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
     diag_stage("reconcile_pins")
-    _reconcile_sidebar_pins_with_state_db(webui_sessions)
+    _reconcile_sidebar_pins_with_state_db(
+        webui_sessions, profiles=None if all_profiles else [active_profile]
+    )
     if show_cli_sessions:
         diag_stage("get_cli_sessions")
         if _callable_accepts_kwarg(get_cli_sessions, "include_claude_code"):

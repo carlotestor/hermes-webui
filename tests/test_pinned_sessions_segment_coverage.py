@@ -123,3 +123,52 @@ def test_pending_unlisted_pin_of_another_profile_is_not_applied(upgrade_env, mon
     env.routes._reconcile_sidebar_pins_with_state_db(rows)
     assert db_pins(env.db) == {"listed": False, "empty": False}
     assert _pending(env)[1] == set()
+
+
+def _released_pending_with_zero_owner_rows(env, monkeypatch, rows):
+    """Held writer → queue → release, then the owner has no displayed row left."""
+    work_home = env.db.parent.parent / "work_home"
+    work_home.mkdir()
+    homes = {"work": work_home}
+    monkeypatch.setattr(
+        "api.profiles._resolve_profile_home_for_name",
+        lambda n: homes.get(n, env.db.parent),
+        raising=False,
+    )
+    sidecar = {"session_id": "empty", "title": "Untitled", "pinned": True, "messages": []}
+    _unlisted_empty_under_held_writer(env, sidecar)
+    monkeypatch.setattr(
+        env.routes, "list_profiles_api", lambda: [{"name": "default"}, {"name": "work"}]
+    )
+    for _ in range(2):
+        env.routes._reconcile_sidebar_pins_with_state_db(rows)
+    assert db_pins(env.db) == {"listed": False, "empty": True}
+    assert _pending(env)[1] == set()
+
+
+def test_pending_pin_retries_when_owner_has_no_displayed_rows(upgrade_env, monkeypatch):
+    _released_pending_with_zero_owner_rows(upgrade_env, monkeypatch, [])
+
+
+def test_pending_pin_retries_when_only_foreign_profile_rows_are_displayed(upgrade_env, monkeypatch):
+    foreign = [{"session_id": "foreign", "pinned": False, "profile": "work"}]
+    _released_pending_with_zero_owner_rows(upgrade_env, monkeypatch, foreign)
+    assert foreign[0]["pinned"] is False
+
+
+def test_single_profile_scope_does_not_retry_another_profiles_pending_pins(upgrade_env, monkeypatch):
+    env = upgrade_env
+    sidecar = {"session_id": "empty", "title": "Untitled", "pinned": True, "messages": []}
+    _unlisted_empty_under_held_writer(env, sidecar)
+    work_home = env.db.parent.parent / "work_home"
+    work_home.mkdir()
+    monkeypatch.setattr(
+        "api.profiles._resolve_profile_home_for_name",
+        lambda n: work_home if n == "work" else env.db.parent,
+        raising=False,
+    )
+    env.routes._reconcile_sidebar_pins_with_state_db([], profiles=["work"])
+    assert db_pins(env.db) == {"listed": False, "empty": False}
+    assert _pending(env)[1] == {"empty"}
+    env.routes._reconcile_sidebar_pins_with_state_db([], profiles=["default"])
+    assert db_pins(env.db) == {"listed": False, "empty": True}

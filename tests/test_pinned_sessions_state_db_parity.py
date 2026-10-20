@@ -260,7 +260,7 @@ def test_sidebar_build_reconciles_pins_without_show_cli_sessions(monkeypatch):
     # And the sidebar payload builder invokes it on the show_cli_sessions=False path.
     src = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
     body = src.split("def _build_session_list_cache_payload", 1)[1]
-    assert body.index("_reconcile_sidebar_pins_with_state_db(webui_sessions)") < body.index("if show_cli_sessions:")
+    assert body.index("_reconcile_sidebar_pins_with_state_db(") < body.index("if show_cli_sessions:")
 
 
 def test_agent_session_pinned_flags_reads_state_db(tmp_path, monkeypatch):
