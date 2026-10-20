@@ -829,6 +829,66 @@ def stream_channel_has_subscribers(channel: Any) -> bool:
         return True
 
 
+def detached_goal_continuation_skip_reason(session_id: str) -> str:
+    """Return why a detached goal continuation must NOT start, or '' if safe.
+
+    Invariants (re-checked at fire time, not only at teardown):
+      1. never after a user cancel / pause / clear (pending marker gone, goal
+         inactive, or a cancel marker persisted on the transcript);
+      2. never races a queued user message or an active/pending turn;
+      3. stays inside the owning profile (goal state resolved from the
+         session's own profile home; isolated mode refuses foreign sessions).
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return "missing_session"
+    from api.config import PENDING_GOAL_CONTINUATION
+
+    if sid not in PENDING_GOAL_CONTINUATION:
+        return "not_pending"
+    try:
+        from api.models import get_session
+
+        s = get_session(sid)
+    except Exception:
+        return "session_unavailable"
+    owner = getattr(s, "profile", None)
+    try:
+        from api.profiles import (
+            _is_isolated_profile_mode,
+            _profiles_match,
+            get_active_profile_name,
+            get_hermes_home_for_profile,
+        )
+
+        if _is_isolated_profile_mode() and not _profiles_match(
+            owner, get_active_profile_name()
+        ):
+            return "foreign_profile"
+        profile_home = get_hermes_home_for_profile(owner or "default")
+    except Exception:
+        return "profile_unresolved"
+    try:
+        from api.streaming import _session_has_cancel_marker
+
+        if _session_has_cancel_marker(s):
+            return "cancelled"
+    except Exception:
+        return "cancel_state_unknown"
+    if getattr(s, "pending_user_message", None):
+        return "turn_pending"
+    try:
+        from api.background_process import _session_has_active_turn
+
+        if _session_has_active_turn(sid):
+            return "turn_active"
+    except Exception:
+        return "turn_state_unknown"
+    if not has_active_goal(sid, profile_home=profile_home):
+        return "goal_inactive"
+    return ""
+
+
 def start_detached_goal_continuation(
     session_id: str,
     continuation_prompt: str,
@@ -841,10 +901,15 @@ def start_detached_goal_continuation(
 
     def _runner() -> None:
         try:
-            from api.config import PENDING_GOAL_CONTINUATION
             from api.routes import start_session_turn
 
-            if sid not in PENDING_GOAL_CONTINUATION:
+            reason = detached_goal_continuation_skip_reason(sid)
+            if reason:
+                logger.debug(
+                    "Detached goal continuation skipped for session %s: %s",
+                    sid,
+                    reason,
+                )
                 return
             start_session_turn(sid, prompt, source="goal_wakeup")
         except Exception:

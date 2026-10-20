@@ -376,3 +376,139 @@ def test_gateway_worker_starts_detached_goal_continuation_when_no_sse_subscriber
         ]
     finally:
         PENDING_GOAL_CONTINUATION.discard(s.session_id)
+
+
+# ── Review 5578589772: teardown must survive error/cancel exits ─────────────
+
+
+@pytest.mark.parametrize("exit_kind", ["error", "cancel"])
+def test_run_agent_streaming_error_or_cancel_exit_does_not_unbound_continuation(
+    monkeypatch, exit_kind
+):
+    """An exit before the goal hook must not raise UnboundLocalError in teardown."""
+    from api import streaming
+
+    sid = f"sid-teardown-{exit_kind}"
+    stream_id = f"stream-teardown-{exit_kind}"
+    STREAMS[stream_id] = create_stream_channel()
+    started = []
+    monkeypatch.setattr(
+        webui_goals, "start_detached_goal_continuation", lambda *a, **k: started.append(a)
+    )
+
+    def _boom(*_a, **_kw):
+        if exit_kind == "cancel":
+            ev = streaming.CANCEL_FLAGS.get(stream_id)
+            if ev is not None:
+                ev.set()
+            raise InterruptedError("cancelled before goal hook")
+        raise RuntimeError("turn failed before goal hook")
+
+    monkeypatch.setattr(streaming, "get_session", _boom)
+    try:
+        streaming._run_agent_streaming(
+            session_id=sid, msg_text="hi", model="m", workspace="/tmp", stream_id=stream_id
+        )
+    except UnboundLocalError as exc:  # pragma: no cover - the regression
+        pytest.fail(f"teardown leaked UnboundLocalError: {exc}")
+    finally:
+        STREAMS.pop(stream_id, None)
+    assert started == []
+
+
+# ── Detached continuation invariants (cancel / queued turn / profile) ───────
+
+
+def _detached_env(monkeypatch, session, *, active_turn=False, isolated=False, active_profile="default"):
+    from api import background_process, profiles, streaming
+
+    PENDING_GOAL_CONTINUATION.add(session.session_id)
+    monkeypatch.setattr(models, "get_session", lambda _sid, *a, **k: session)
+    monkeypatch.setattr(background_process, "_session_has_active_turn", lambda _sid: active_turn)
+    monkeypatch.setattr(profiles, "_is_isolated_profile_mode", lambda: isolated)
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: active_profile)
+    homes = []
+    monkeypatch.setattr(
+        profiles, "get_hermes_home_for_profile", lambda name: homes.append(name) or f"/homes/{name}"
+    )
+    monkeypatch.setattr(webui_goals, "has_active_goal", lambda _sid, **kw: kw.get("profile_home") is not None)
+    return homes
+
+
+def _sess(**kw):
+    base = dict(session_id="sid-detached", profile="alice", messages=[], pending_user_message=None)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_detached_continuation_allowed_resolves_owning_profile(monkeypatch):
+    s = _sess()
+    homes = _detached_env(monkeypatch, s)
+    try:
+        assert webui_goals.detached_goal_continuation_skip_reason(s.session_id) == ""
+        assert homes == ["alice"]
+    finally:
+        PENDING_GOAL_CONTINUATION.discard(s.session_id)
+
+
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ("not_pending", "not_pending"),
+        ("cancel_marker", "cancelled"),
+        ("queued_message", "turn_pending"),
+        ("active_turn", "turn_active"),
+        ("foreign_profile", "foreign_profile"),
+        ("goal_inactive", "goal_inactive"),
+    ],
+)
+def test_detached_continuation_skip_reasons(monkeypatch, case, expected):
+    s = _sess()
+    kw = {}
+    if case == "cancel_marker":
+        s.messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "*Task cancelled.*"},
+        ]
+    elif case == "queued_message":
+        s.pending_user_message = "user typed next"
+    elif case == "active_turn":
+        kw["active_turn"] = True
+    elif case == "foreign_profile":
+        kw.update(isolated=True, active_profile="bob")
+    _detached_env(monkeypatch, s, **kw)
+    if case == "not_pending":
+        PENDING_GOAL_CONTINUATION.discard(s.session_id)
+    if case == "goal_inactive":
+        monkeypatch.setattr(webui_goals, "has_active_goal", lambda *_a, **_kw: False)
+    try:
+        assert webui_goals.detached_goal_continuation_skip_reason(s.session_id) == expected
+    finally:
+        PENDING_GOAL_CONTINUATION.discard(s.session_id)
+
+
+def test_start_detached_goal_continuation_does_not_start_when_skipped(monkeypatch):
+    import threading
+
+    started = []
+    monkeypatch.setattr(routes, "start_session_turn", lambda *a, **k: started.append(a))
+    monkeypatch.setattr(webui_goals, "detached_goal_continuation_skip_reason", lambda _sid: "cancelled")
+    threads = []
+    real_thread = threading.Thread
+
+    def _thread(*a, **k):
+        t = real_thread(*a, **k)
+        threads.append(t)
+        return t
+
+    monkeypatch.setattr(webui_goals.threading, "Thread", _thread)
+    webui_goals.start_detached_goal_continuation("sid-x", "continue")
+    for t in threads:
+        t.join(5)
+    assert started == []
+
+    monkeypatch.setattr(webui_goals, "detached_goal_continuation_skip_reason", lambda _sid: "")
+    webui_goals.start_detached_goal_continuation("sid-x", "continue")
+    for t in threads:
+        t.join(5)
+    assert started == [("sid-x", "continue")]

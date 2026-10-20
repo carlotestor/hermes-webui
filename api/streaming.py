@@ -13650,6 +13650,9 @@ def _run_agent_streaming(
     When ephemeral=True, session mutations are skipped — used by /btw to get
     a streaming answer without persisting to the parent session.
     """
+    # Read unconditionally by the outer-finally teardown, so it must be bound
+    # before any exit path (error/raise/cancel never reach the goal hook).
+    _detached_goal_continuation_prompt = ''
     _turn_route_model = model
     _turn_route_provider = model_provider
     cancel_event = threading.Event()
@@ -17633,7 +17636,6 @@ def _run_agent_streaming(
             # a normal next user message so /queue and user input keep priority.
             # #1932: only evaluate when the turn was goal-related (set via
             # STREAM_GOAL_RELATED or goal_related parameter).
-            _detached_goal_continuation_prompt = ''
             try:
                 from api.goals import (
                     evaluate_goal_after_turn,
