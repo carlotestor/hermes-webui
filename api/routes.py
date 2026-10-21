@@ -27516,8 +27516,14 @@ def _start_chat_stream_for_session(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    on_admitted=None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn.
+
+    ``on_admitted(session, stream_id)`` runs under the session lock once this
+    turn has won the active-stream check, before the pending state is saved, so
+    whatever it writes is published atomically with the admitted turn (and
+    rolled back with it if the launch fails).
 
     ``process_id``/``retry_attempt``/``rearm_deferred_wakeup`` are the
     process-wakeup delivery identity threaded down from
@@ -27747,6 +27753,8 @@ def _start_chat_stream_for_session(
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
                 try:
+                    if on_admitted is not None:
+                        on_admitted(s, stream_id)
                     _prepare_chat_start_session_for_stream(
                         s,
                         msg=msg,
@@ -28051,6 +28059,7 @@ def _start_run(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    on_admitted=None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -28139,6 +28148,7 @@ def _start_run(
                 process_id=process_id,
                 retry_attempt=retry_attempt,
                 rearm_deferred_wakeup=rearm_deferred_wakeup,
+                on_admitted=on_admitted,
             )
 
         def _legacy_adapter_factory():
@@ -28191,6 +28201,7 @@ def _start_run(
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
+        on_admitted=on_admitted,
     )
 
 
@@ -28253,10 +28264,12 @@ def start_session_turn(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    on_admitted=None,
     goal_continuation_id: str = "",
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
 
+    ``on_admitted`` is forwarded to ``_start_chat_stream_for_session``.
     ``source="goal_wakeup"`` is a detached goal continuation: it must carry the
     ``goal_continuation_id`` of its registered record, which admission consumes
     under the session lock (rejected with 409 if stale or the goal is inactive).
@@ -28479,6 +28492,7 @@ def start_session_turn(
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
+        on_admitted=on_admitted,
     )
 
     # ── Defect B: live-view of server-initiated turns ──────────────────────
