@@ -3289,8 +3289,22 @@ function _inlineMediaHtmlForRef(ref, sessionId, altText){
   if(/^file:\/\//i.test(ref)){
     try{
       const u=new URL(ref);
+      // #8033: file:///C:/Users/me/x parses to pathname '/C:/Users/me/x' —
+      // the file-URI grammar keeps the leading separator before the drive
+      // letter. The once-decoded pathname is forwarded to the backend AS-IS
+      // (no client-side strip): the server gates the drive-letter conversion
+      // on its own OS, so on a POSIX server '/C:/...' stays absolute and can
+      // never alias a cwd-relative drive-shaped path. Non-local file
+      // authorities (UNC: file://server/share/...) are explicitly rejected
+      // here — never silently rewired to a local path.
+      if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return '';
       ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
     }catch(_){
+      // Fail-closed on a parse failure (AGENTS.md): the raw string may hide
+      // a non-local authority that the URL parse above never got to check.
+      // Reject anything shaped like 'file://<authority>/...' rather than
+      // silently rendering a local media element from it.
+      if(/^file:\/\/[^/?#]+/i.test(ref)) return '';
       try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
       catch(__){ref=ref.replace(/^file:\/\//i,'');}
     }
@@ -9748,11 +9762,19 @@ function renderMd(raw){
       }
     }
     if(/^file:\/\//i.test(href)){
+      // #8033: same policy as the streaming converter (_smdLinkHref) and media refs (_inlineMediaHtmlForRef): only
+      // local authorities are served, a UNC 'file://server/share/...' link stays an inert file:// href, and the
+      // once-decoded pathname (with its '?…'/'#…' suffix) is forwarded with its leading separator.
       try{
-        const path=decodeURIComponent(href.replace(/^file:\/\//i,''));
+        const u=new URL(href);
+        if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return href;
+        const path=decodeURIComponent((u.pathname||'')+((href.match(/[?#][\s\S]*$/)||[''])[0]));
         return 'api/media?path='+encodeURIComponent(path)+'&inline=1';
       }catch(_){
-        return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1';
+        // Fail closed: an unparseable URI with an authority may hide a non-local host.
+        if(/^file:\/\/[^/?#]+/i.test(href)) return href;
+        try{ return 'api/media?path='+encodeURIComponent(decodeURIComponent(href.replace(/^file:\/\//i,'')))+'&inline=1'; }
+        catch(__){ return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1'; }
       }
     }
     return href;
@@ -10006,8 +10028,18 @@ function lockComposerForClarify(placeholderText){
   if (sid && typeof _saveComposerDraftNow === 'function') {
     const saveText = String(input.value || '');
     const saveFiles = Array.isArray(S && S.pendingFiles) ? [...S.pendingFiles] : [];
+    // #7855: an unchanged restored goal continuation keeps its token in this save. Without it the
+    // payload stores goal_continuation_id '' and the continuation sent after a reload is no longer
+    // goal-related, which stops the goal loop. Edited text carries no token (round-7 rule).
+    const restoredCont = (typeof _peekRestoredGoalContinuationDraft === 'function')
+      ? _peekRestoredGoalContinuationDraft()
+      : null;
+    const saveContId = (restoredCont && restoredCont.id
+      && String(restoredCont.text || '').trim() === saveText.trim()) ? restoredCont.id : '';
     try {
-      const saveResult = _saveComposerDraftNow(sid, saveText, saveFiles);
+      const saveResult = saveContId
+        ? _saveComposerDraftNow(sid, saveText, saveFiles, saveContId)
+        : _saveComposerDraftNow(sid, saveText, saveFiles);
       if (saveResult && typeof saveResult.catch === 'function') {
         saveResult.catch((error)=>_handleComposerDraftPostFailure(error,sid,saveText,saveFiles));
       }
@@ -10229,7 +10261,11 @@ function setBusy(v){
         }
         autoResize();
         renderTray();
-        send();
+        // #7855 (round 5): pass the queued entry's continuation ID straight
+        // into THIS send() invocation. Round 4 published it to a shared module
+        // slot that any concurrent send could read, letting a genuine user
+        // turn consume the goal. An argument cannot leak across calls.
+        send({goalContinuationId:next.goal_continuation_id||''});
       },120);
     }
   }
@@ -10333,7 +10369,12 @@ function _renderQueueChips(sid){
         const liveQ=_getSessionQueue(sid,false);
         const first=snapshot.find(e=>e)||{};
         const firstFiles=(snapshot.find(e=>e&&Array.isArray(e.files)&&e.files.length)||{files:[]}).files;
-        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,_queued_at:Date.now()});
+        // #7855: the combined entry keeps the FIRST continuation ID among the
+        // merged items. Combining a continuation with later user text still
+        // admits it (its ID is intact) — and a combine of pure user messages
+        // carries no ID, so it stays an ordinary turn.
+        const _contId=(snapshot.find(e=>e&&String(e.goal_continuation_id||'').trim())||{}).goal_continuation_id||'';
+        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,goal_continuation_id:_contId,_queued_at:Date.now()});
         SESSION_QUEUES[sid]=liveQ;
         _persistSessionQueueStorage(sid,liveQ);
         delete _queueRenderKeys[sid];
@@ -10414,7 +10455,11 @@ function _renderQueueChips(sid){
         const liveQ=_getSessionQueue(sid,false);
         const idx=_entryTs!=null?liveQ.findIndex(e=>e&&e._queued_at===_entryTs):i;
         if(idx!==-1){
+          // #7855: keep the continuation ID when the user edits the text — the
+          // queue may rewrite the message, but the admission token stays with
+          // the entry (spread preserves it explicitly).
           liveQ[idx]={...liveQ[idx],text:newText};
+          if(liveQ[idx].goal_continuation_id==null) liveQ[idx].goal_continuation_id='';
           _persistSessionQueueStorage(sid,liveQ);
           delete _queueRenderKeys[sid];
           updateQueueBadge(sid);
