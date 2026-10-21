@@ -19,7 +19,6 @@ from typing import Any
 from api.config import (
     AGENT_INSTANCES,
     CANCEL_FLAGS,
-    PENDING_GOAL_CONTINUATION,
     STREAM_GOAL_RELATED,
     STREAMS,
     STREAMS_LOCK,
@@ -1992,6 +1991,23 @@ def _gateway_route_error_classification(code, route_hint: str) -> dict:
     }
 
 
+def _gateway_config_for_profile(profile_name) -> dict | None:
+    """Config of a named non-root profile; None means the process default applies."""
+    from api import profiles as _profiles
+    from api.config import get_config_for_profile_home
+
+    name = str(profile_name or "").strip()
+    if not name or _profiles._is_root_profile(name):
+        return None
+    return get_config_for_profile_home(_profiles.get_hermes_home_for_profile(name))
+
+
+def _settle_delegation_reservation(session_id, stream_id, accepted: bool) -> None:
+    from api.gateway_delegation_wakeup import settle_reservation
+
+    settle_reservation(session_id, stream_id, accepted)
+
+
 def _resume_gateway_run_for_session(session) -> bool:
     from api.config import create_stream_channel, register_session_writeback_owner, register_stream_owner
 
@@ -2786,7 +2802,8 @@ def _run_gateway_chat_streaming(
         s = get_session(session_id)
         from api.config import get_config  # imported lazily to avoid config-cycle churn
 
-        cfg = get_config()
+        # Profile-bound like the endpoint below: the worker thread has no request profile TLS.
+        cfg = _gateway_config_for_profile(getattr(s, "profile", None)) or get_config()
         reasoning_effort = _gateway_reasoning_effort_for_request(
             cfg,
             model=model,
@@ -2864,11 +2881,15 @@ def _run_gateway_chat_streaming(
             # A replayed pre-upgrade record keeps its legacy routing so a later restart resolves it the same way.
             legacy = bool(reattach_run) and reattach_run.get("endpoint_routing") != _GATEWAY_ENDPOINT_ROUTING
             routing = {} if legacy else {"endpoint_routing": _GATEWAY_ENDPOINT_ROUTING, "base_url": base_url}
-            record_run = lambda run_id, request=None: _record_gateway_run(
-                session_id, stream_id, run_id, request=request,
-                regeneration=bool(regeneration), goal_related=bool(goal_related),
-                **routing,
-            )
+
+            def record_run(run_id, request=None):
+                _record_gateway_run(
+                    session_id, stream_id, run_id, request=request,
+                    regeneration=bool(regeneration), goal_related=bool(goal_related),
+                    **routing,
+                )
+                if run_id:  # the Gateway accepted the run: its delegation lease is delivered
+                    _settle_delegation_reservation(session_id, stream_id, accepted=True)
             try:
                 if reattach_run:
                     if endpoint_moved:
@@ -2884,6 +2905,7 @@ def _run_gateway_chat_streaming(
                             reattach_run["request"], stream_id,
                         )
                         record_run(run_id)
+                    _settle_delegation_reservation(session_id, stream_id, accepted=True)
                     final_text, usage = _await_gateway_run_result(
                         session_id, stream_id, run_id, base_url, api_key,
                         put_gateway_event=put_gateway_event,
@@ -2983,6 +3005,7 @@ def _run_gateway_chat_streaming(
             last_payload = {}
             sse_event = "message"
             with urllib.request.urlopen(req, timeout=_gateway_read_timeout_secs()) as resp:
+                _settle_delegation_reservation(session_id, stream_id, accepted=True)
                 for raw_line in _iter_sse_lines_cancellable(resp, cancel_event):
                     if cancel_event.is_set():
                         put_gateway_event("cancel", {"message": "Cancelled by user"})
@@ -3275,7 +3298,11 @@ def _run_gateway_chat_streaming(
                 logger.debug("Failed to append completed turn journal event", exc_info=True)
             success_writeback_committed = True
         try:
-            from api.goals import evaluate_goal_after_turn, has_active_goal
+            from api.goals import (
+                evaluate_goal_after_turn,
+                has_active_goal,
+                register_pending_goal_continuation,
+            )
             from api.profiles import get_hermes_home_for_profile
 
             profile_home = get_hermes_home_for_profile(getattr(s, "profile", None))
@@ -3306,11 +3333,22 @@ def _run_gateway_chat_streaming(
                     })
                 if decision.get("should_continue"):
                     continuation_prompt = str(decision.get("continuation_prompt") or "").strip()
+                    continuation_id = None
                     if continuation_prompt:
-                        PENDING_GOAL_CONTINUATION.add(session_id)
+                        # #1932 + #6885 + #7855: one record (marker + prompt +
+                        # continuation ID). The SSE event fires only when the
+                        # record landed so the frontend queue and the server
+                        # record cannot disagree. The ID — not the prompt text —
+                        # is what admits the turn later, so the browser can
+                        # edit or combine the queued entry freely.
+                        continuation_id = register_pending_goal_continuation(session_id, continuation_prompt)
+                        if not continuation_id:
+                            continuation_prompt = ""
+                    if continuation_prompt:
                         put_gateway_event("goal_continue", {
                             "session_id": session_id,
                             "continuation_prompt": continuation_prompt,
+                            "continuation_id": continuation_id,
                             "text": continuation_prompt,
                             "message": goal_message,
                             "message_key": decision.get("message_key") or "goal_continuing",
@@ -3380,6 +3418,7 @@ def _run_gateway_chat_streaming(
         # so both teardowns stay one implementation. ``runs_api_pending_marked``
         # keeps this call site's original finish-pending semantics.
         release_gateway_stream_state(stream_id, finish_pending=runs_api_pending_marked)
+        _settle_delegation_reservation(session_id, stream_id, accepted=False)  # no-op once committed
         unregister_stream_owner(stream_id)
         unregister_active_run(stream_id)
         # Release the writeback-owner entry the route layer registered for this
