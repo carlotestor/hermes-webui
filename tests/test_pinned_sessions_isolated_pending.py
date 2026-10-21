@@ -30,7 +30,7 @@ class _Handler:
 
 @pytest.fixture
 def isolated_work(tmp_path, monkeypatch):
-    from api import models, routes
+    from api import routes
 
     base = tmp_path / ".hermes"
     work = base / "profiles" / "work"

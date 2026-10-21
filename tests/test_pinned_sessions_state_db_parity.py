@@ -174,11 +174,28 @@ def test_write_pin_to_state_db_outcomes(monkeypatch, known, write_ok, expected, 
     from types import SimpleNamespace
 
     calls = []
+    monkeypatch.setattr(routes, "agent_session_pin_store_present", lambda **_kw: True)
     monkeypatch.setattr(state_sync, "state_db_knows_session", lambda *_a, **_kw: known)
     monkeypatch.setattr(state_sync, "sync_session_pinned", lambda *a, **kw: calls.append(a) or write_ok)
     s = SimpleNamespace(session_id="sid", profile="default")
     assert routes._write_pin_to_state_db(s, True) is expected
     assert len(calls) == writes
+
+
+@pytest.mark.parametrize("store, expected", [(False, True), (None, False)])
+def test_write_pin_to_state_db_checks_the_pin_column_first(monkeypatch, store, expected):
+    """No ``sessions.pinned`` (or no state.db) queues like master's sidecar path; unreadable fails closed."""
+    from api import routes, state_sync
+    from types import SimpleNamespace
+
+    calls = []
+    monkeypatch.setattr(routes, "agent_session_pin_store_present", lambda **_kw: store)
+    monkeypatch.setattr(routes, "_queue_pin_for_absent_row", lambda *a: calls.append(a) or True)
+    monkeypatch.setattr(state_sync, "state_db_knows_session", lambda *_a, **_kw: True)
+    monkeypatch.setattr(state_sync, "sync_session_pinned", lambda *a, **kw: calls.append(a) or False)
+    s = SimpleNamespace(session_id="sid", profile="default")
+    assert routes._write_pin_to_state_db(s, True) is expected
+    assert calls == ([("sid", True, "default")] if store is False else [])
 
 
 def test_reconcile_state_db_wins_over_sidecar_after_migration(monkeypatch):
