@@ -2622,11 +2622,27 @@ def _profiles_with_pending_pins(scope) -> list[str]:
     else:
         names = {_pin_profile(p) for p in scope}
     out = []
-    for name in sorted(names):
+    # Each queued key is claimed once; named profiles before the root alias.
+    for name in sorted(names, key=lambda n: (n == "default", n)):
+        if not _pin_profile_owns_state_db(name):
+            continue
         db_path = _resolve_state_db_path(name)
         if db_path is not None and str(db_path) in queued:
+            queued.discard(str(db_path))
             out.append(name)
     return out
+
+
+def _pin_profile_owns_state_db(profile) -> bool:
+    """Whether *profile* is the logical owner of the state.db it resolves to.
+
+    Isolated mode clamps every profile name to the isolated home; only the isolated
+    profile owns that state.db, so a foreign alias must not migrate or drain its pins.
+    """
+    if not _is_isolated_profile_mode():
+        return True
+    from api.profiles import _isolated_profile_name
+    return _profiles_match(_pin_profile(profile), _isolated_profile_name())
 
 
 def _reconcile_sidebar_pins_with_state_db(rows: list[dict], *, profiles=None) -> None:
@@ -2809,6 +2825,9 @@ def _migrate_legacy_sidecar_pins(profile_rows: list[dict], profile) -> set[str] 
         state = _load_pin_migration_state()
     migrated = set(state.get("migrated_state_dbs") or [])
     pending = set((state.get("pending_pins") or {}).get(key) or [])
+    if not _pin_profile_owns_state_db(profile):
+        # An isolated-mode alias of another owner's state.db: its queue belongs to the owner.
+        return pending
     row_pins = {str(r.get("session_id")).strip(): r.get("pinned") is True for r in profile_rows}
     # Pending ids retry whether or not the sidebar lists them (empty Untitled sidecars are unlisted);
     # only ids already queued retry, so a later Desktop/CLI unpin of a stale legacy pin stands.
@@ -17877,6 +17896,13 @@ def _write_pin_to_state_db(s, pinned: bool) -> bool:
     profile = _pin_profile(getattr(s, "profile", None))
     sid = s.session_id
     try:
+        store = agent_session_pin_store_present(profile=profile)
+        if store is None:
+            return False
+        if store is False:
+            # No state.db yet, or an Agent schema without ``sessions.pinned``: keep the
+            # sidecar pin (as before) and queue it for when the column appears.
+            return _queue_pin_for_absent_row(sid, pinned, profile)
         known = state_db_knows_session(sid, profile=profile)
         if known is None:
             return False
