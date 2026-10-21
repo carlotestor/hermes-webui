@@ -32,7 +32,6 @@ from api.config import (
     get_config,
     STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, STREAM_PARTIAL_TEXT,
     STREAM_REASONING_TEXT, STREAM_LIVE_TOOL_CALLS,
-    STREAM_GOAL_RELATED, PENDING_GOAL_CONTINUATION,
     STREAM_LAST_EVENT_ID,
     stream_owned_registries,
     release_stream_owned_registries,
@@ -13653,6 +13652,7 @@ def _run_agent_streaming(
     # Read unconditionally by the outer-finally teardown, so it must be bound
     # before any exit path (error/raise/cancel never reach the goal hook).
     _detached_goal_continuation_prompt = ''
+    _detached_goal_continuation_id = ''
     _turn_route_model = model
     _turn_route_provider = model_provider
     cancel_event = threading.Event()
@@ -17641,6 +17641,7 @@ def _run_agent_streaming(
                     evaluate_goal_after_turn,
                     has_active_goal,
                     stream_channel_has_subscribers,
+                    register_pending_goal_continuation,
                 )
 
                 if not goal_related or not has_active_goal(session_id, profile_home=_profile_home):
@@ -17687,21 +17688,36 @@ def _run_agent_streaming(
                     })
                 if decision.get('should_continue'):
                     continuation_prompt = str(decision.get('continuation_prompt') or '').strip()
+                    continuation_id = None
                     if continuation_prompt:
                         # #1932: mark this session as pending a goal continuation
                         # so the next /chat/start creates a goal-related stream.
-                        PENDING_GOAL_CONTINUATION.add(session_id)
-                        put('goal_continue', {
-                            'session_id': session_id,
-                            'continuation_prompt': continuation_prompt,
-                            'text': continuation_prompt,
-                            'message': _goal_message,
-                            'message_key': decision.get('message_key') or 'goal_continuing',
-                            'message_args': decision.get('message_args') or [],
-                            'decision': decision,
-                        })
-                        if not stream_channel_has_subscribers(q):
+                        # #6885 + #7855: register marker + prompt + continuation
+                        # ID as ONE record
+                        # (api/goals.register_pending_goal_continuation) so the
+                        # routes.py consumer can tell a genuine user turn from
+                        # the browser's continuation dispatch. Admission is by
+                        # ID, so the browser may edit or combine the queued
+                        # entry without losing the goal.
+                        continuation_id = register_pending_goal_continuation(session_id, continuation_prompt)
+                        if not continuation_id:
+                            continuation_prompt = ''
+                    if continuation_prompt:
+                        # ONE dispatcher: browser (subscriber) XOR detached server.
+                        if stream_channel_has_subscribers(q):
+                            put('goal_continue', {
+                                'session_id': session_id,
+                                'continuation_prompt': continuation_prompt,
+                                'continuation_id': continuation_id,
+                                'text': continuation_prompt,
+                                'message': _goal_message,
+                                'message_key': decision.get('message_key') or 'goal_continuing',
+                                'message_args': decision.get('message_args') or [],
+                                'decision': decision,
+                            })
+                        else:
                             _detached_goal_continuation_prompt = continuation_prompt
+                            _detached_goal_continuation_id = continuation_id
             except Exception as _goal_exc:
                 logger.debug("Goal continuation hook failed for session %s: %s", session_id, _goal_exc)
             with _stream_writeback_stage(_writeback_timings, "done_payload"):
@@ -18508,7 +18524,9 @@ def _run_agent_streaming(
                 from api.goals import start_detached_goal_continuation
 
                 start_detached_goal_continuation(
-                    session_id, _detached_goal_continuation_prompt
+                    session_id,
+                    _detached_goal_continuation_prompt,
+                    _detached_goal_continuation_id,
                 )
             except Exception:
                 logger.debug(

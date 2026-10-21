@@ -18,7 +18,6 @@ from typing import Any
 from api.config import (
     AGENT_INSTANCES,
     CANCEL_FLAGS,
-    PENDING_GOAL_CONTINUATION,
     STREAM_GOAL_RELATED,
     STREAMS,
     STREAMS_LOCK,
@@ -2599,6 +2598,7 @@ def _run_gateway_chat_streaming(
     cancel_event = threading.Event()
     _turn_started_at = time.time()
     _detached_goal_continuation_prompt = ""
+    _detached_goal_continuation_id = ""
     q = peek_stream(stream_id)
     if q is not None:
         # A snapshot lookup is not admission. A concurrent chat/start can classify
@@ -3192,6 +3192,7 @@ def _run_gateway_chat_streaming(
                 gateway_evaluated_goal_in_turn,
                 has_active_goal,
                 stream_channel_has_subscribers,
+                register_pending_goal_continuation,
             )
             from api.profiles import get_hermes_home_for_profile
 
@@ -3235,19 +3236,33 @@ def _run_gateway_chat_streaming(
                     })
                 if decision.get("should_continue"):
                     continuation_prompt = str(decision.get("continuation_prompt") or "").strip()
+                    continuation_id = None
                     if continuation_prompt:
-                        PENDING_GOAL_CONTINUATION.add(session_id)
-                        put_gateway_event("goal_continue", {
-                            "session_id": session_id,
-                            "continuation_prompt": continuation_prompt,
-                            "text": continuation_prompt,
-                            "message": goal_message,
-                            "message_key": decision.get("message_key") or "goal_continuing",
-                            "message_args": decision.get("message_args") or [],
-                            "decision": decision,
-                        })
-                        if not stream_channel_has_subscribers(q):
+                        # #1932 + #6885 + #7855: one record (marker + prompt +
+                        # continuation ID). The SSE event fires only when the
+                        # record landed so the frontend queue and the server
+                        # record cannot disagree. The ID — not the prompt text —
+                        # is what admits the turn later, so the browser can
+                        # edit or combine the queued entry freely.
+                        continuation_id = register_pending_goal_continuation(session_id, continuation_prompt)
+                        if not continuation_id:
+                            continuation_prompt = ""
+                    if continuation_prompt:
+                        # ONE dispatcher: browser (subscriber) XOR detached server.
+                        if stream_channel_has_subscribers(q):
+                            put_gateway_event("goal_continue", {
+                                "session_id": session_id,
+                                "continuation_prompt": continuation_prompt,
+                                "continuation_id": continuation_id,
+                                "text": continuation_prompt,
+                                "message": goal_message,
+                                "message_key": decision.get("message_key") or "goal_continuing",
+                                "message_args": decision.get("message_args") or [],
+                                "decision": decision,
+                            })
+                        else:
                             _detached_goal_continuation_prompt = continuation_prompt
+                            _detached_goal_continuation_id = continuation_id
         except Exception as goal_exc:
             logger.debug(
                 "Gateway goal continuation hook failed for session %s: %s",
@@ -3320,7 +3335,9 @@ def _run_gateway_chat_streaming(
                 from api.goals import start_detached_goal_continuation
 
                 start_detached_goal_continuation(
-                    session_id, _detached_goal_continuation_prompt
+                    session_id,
+                    _detached_goal_continuation_prompt,
+                    _detached_goal_continuation_id,
                 )
             except Exception:
                 logger.debug(

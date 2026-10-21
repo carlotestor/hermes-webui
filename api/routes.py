@@ -9662,6 +9662,62 @@ def _is_subagent_child_session_id(sid: str) -> bool:
     return _state_db_session_source(sid) == "subagent"
 
 
+def _project_session_draft_write(write: dict, current_draft: dict) -> dict:
+    """Apply a ``/api/session/draft`` write to the stored draft.
+
+    #7855 CORE (round 6): the goal-continuation token is PART of the draft, so
+    it is written and cleared by exactly the same rules as the text:
+
+    - a non-empty ``goal_continuation_id`` is stored alongside the text it
+      belongs to;
+    - an explicitly EMPTY string clears it (the draft was edited, abandoned or
+      submitted);
+    - an absent field (``None``) leaves the stored token alone, so a plain
+      keystroke auto-save does not drop it.
+
+    Persisting the text without this is what made a reload between a failed
+    continuation start and its retry restore the words and lose the token — the
+    retry then posted ``goal_continuation_id: None`` and start admission scored
+    it ``goal_related=false``.
+    """
+    next_draft = dict(current_draft or {})
+    text = write.get("text")
+    files = write.get("files")
+    token = write.get("goal_continuation_id")
+    if text is not None:
+        next_draft["text"] = text
+    if files is not None:
+        next_draft["files"] = files
+    if token is not None:
+        if token:
+            next_draft["goal_continuation_id"] = token
+        else:
+            next_draft.pop("goal_continuation_id", None)
+    else:
+        # #7855 CORE (round 7, MUST-FIX 1): a keystroke changes the text the
+        # token is bound to, so "the user has not touched the token" is not a
+        # reason to keep it. The keystroke autosave (static/boot.js -> static/
+        # sessions.js) and the session-switch save never send the field, and
+        # the old absent-field rule then stored the user's edited text next to
+        # the stale token. Restoring that pair on reload and sending it posted
+        # the edited text WITH the continuation id, so a genuine turn consumed
+        # the real continuation record (the #6885 bug this PR exists to fix).
+        #
+        # When the stored draft's text changed, the token no longer describes
+        # it: drop it. An unchanged text (a plain re-save of the same draft)
+        # keeps it, which is the case the absent-field rule was written for.
+        # Pending records have no TTL (api/goals.py), so nothing else expires
+        # the stale binding.
+        _stored_text = (current_draft or {}).get("text")
+        if (
+            "goal_continuation_id" in next_draft
+            and text is not None
+            and text != _stored_text
+        ):
+            next_draft.pop("goal_continuation_id", None)
+    return next_draft
+
+
 def _session_is_subagent_view_only(sid: str) -> bool:
     """Return True when ``sid`` is a delegated subagent child by ANY signal —
     state.db source OR a persisted WebUI sidecar tagged subagent.
@@ -14069,36 +14125,41 @@ def _handle_insights(handler, parsed) -> bool:
             with closing(open_state_db_readonly(db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 cur = conn.cursor()
-                # cache_read_tokens may not exist on older agent state DBs;
-                # fall back to a query without it if the column is missing.
-                try:
-                    cur.execute(f"""
-                        SELECT id, model, message_count, input_tokens, output_tokens,
-                               estimated_cost_usd,
-                               COALESCE(cache_read_tokens, 0) AS cache_read_tokens,
-                               started_at, ended_at,
-                               COALESCE(ended_at, started_at, 0) AS usage_ts
-                        FROM sessions
-                        WHERE COALESCE(ended_at, started_at, 0) >= ?
-                          AND COALESCE(ended_at, started_at, 0) {end_cmp} ?
-                          AND COALESCE(source, '') != 'webui'
-                    """, (cutoff, end_cutoff))
-                except sqlite3.OperationalError:
-                    cur.execute(f"""
-                        SELECT id, model, message_count, input_tokens, output_tokens,
-                               estimated_cost_usd,
-                               0 AS cache_read_tokens,
-                               started_at, ended_at,
-                               COALESCE(ended_at, started_at, 0) AS usage_ts
-                        FROM sessions
-                        WHERE COALESCE(ended_at, started_at, 0) >= ?
-                          AND COALESCE(ended_at, started_at, 0) {end_cmp} ?
-                          AND COALESCE(source, '') != 'webui'
-                    """, (cutoff, end_cutoff))
+                # Older agent state DBs may lack either cache column, so pick
+                # each one on its own: a DB with reads but no writes still has
+                # useful reads.
+                _session_cols = {
+                    r[1] for r in cur.execute("PRAGMA table_info(sessions)").fetchall()
+                }
+
+                def _optional_token_col(name: str) -> str:
+                    if name in _session_cols:
+                        return f"COALESCE({name}, 0) AS {name}"
+                    return f"0 AS {name}"
+
+                cur.execute(f"""
+                    SELECT id, model, message_count, input_tokens, output_tokens,
+                           estimated_cost_usd,
+                           {_optional_token_col("cache_read_tokens")},
+                           {_optional_token_col("cache_write_tokens")},
+                           started_at, ended_at,
+                           COALESCE(ended_at, started_at, 0) AS usage_ts
+                    FROM sessions
+                    WHERE COALESCE(ended_at, started_at, 0) >= ?
+                      AND COALESCE(ended_at, started_at, 0) {end_cmp} ?
+                      AND COALESCE(source, '') != 'webui'
+                """, (cutoff, end_cutoff))
                 for row in cur.fetchall():
-                    _input = _safe_usage_int(row["input_tokens"])
-                    _output = _safe_usage_int(row["output_tokens"])
                     _cache_read = _safe_usage_int(row["cache_read_tokens"])
+                    # state.db input_tokens is uncached input only, while WebUI
+                    # sessions store the full prompt. Add the cache tokens so
+                    # both sources mean the same thing before they are summed.
+                    _input = (
+                        _safe_usage_int(row["input_tokens"])
+                        + _cache_read
+                        + _safe_usage_int(row["cache_write_tokens"])
+                    )
+                    _output = _safe_usage_int(row["output_tokens"])
                     _cost = _safe_cost_float(row["estimated_cost_usd"])
                     _msgs = _safe_usage_int(row["message_count"])
                     total_sessions += 1
@@ -14150,13 +14211,13 @@ def _handle_insights(handler, parsed) -> bool:
         row_total_tokens = stats["input_tokens"] + stats["output_tokens"]
         row_cost = round(stats["cost"], 6)
         row_cache_read = stats["cache_read_tokens"]
-        # Bounded prompt-cache hit rate: cached reads over the FULL prompt total
-        # (ordinary input + cache reads), so it can never exceed 100%. Computing
-        # cache_read / input_tokens alone would overshoot 100% on cache-heavy
-        # sessions. prompt_cache_hit_percent clamps to [0,100] and returns None
-        # when there is nothing meaningful to display.
+        # Prompt-cache hit rate: cached reads over the full prompt total.
+        # input_tokens already includes cache reads and writes for both
+        # sources, so adding the reads again would cap the rate at 50%.
+        # prompt_cache_hit_percent clamps to [0,100] and returns None when
+        # there is nothing meaningful to display.
         row_cache_hit_percent = prompt_cache_hit_percent(
-            row_cache_read, stats["input_tokens"] + row_cache_read
+            row_cache_read, stats["input_tokens"]
         )
         models_breakdown.append({
             "model": model,
@@ -14220,9 +14281,9 @@ def _handle_insights(handler, parsed) -> bool:
         "total_output_tokens": total_output_tokens,
         "total_cache_read_tokens": total_cache_read_tokens,
         # Aggregate prompt-cache hit rate, bounded 0-100% via the shared helper
-        # (cache_read over input + cache_read).
+        # (cache_read over the full prompt total in input_tokens).
         "total_cache_hit_percent": prompt_cache_hit_percent(
-            total_cache_read_tokens, total_input_tokens + total_cache_read_tokens
+            total_cache_read_tokens, total_input_tokens
         ),
         "total_tokens": total_tokens,
         "total_cost": round(total_cost, 6),
@@ -18411,6 +18472,31 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Subagent sessions are view-only and cannot store a draft from WebUI", 400)
         text = body.get("text")
         files = body.get("files")
+        # #7855 CORE (round 6): the goal-continuation token travels with the draft
+        # it belongs to. Persisting the text alone meant a reload between a failed
+        # continuation start and its retry restored the words and dropped the
+        # token, so the retry posted goal_continuation_id: None and start
+        # admission scored it goal_related=false.
+        goal_continuation_id = body.get("goal_continuation_id")
+        if goal_continuation_id is not None and not isinstance(goal_continuation_id, str):
+            goal_continuation_id = ""
+        if isinstance(goal_continuation_id, str):
+            goal_continuation_id = goal_continuation_id.strip()
+        # #7855 P1 (Greptile, round 7): unlike draft text, this field had no
+        # size or shape limit before it was persisted into the session JSON.
+        # An authenticated client could submit a value approaching the
+        # request-body limit on every keystroke, consuming storage and
+        # slowing session operations. The producer mints uuid4().hex
+        # (api/goals.py) and admission itself requires exactly 32 lowercase
+        # hex characters, so anything else can never match a pending record
+        # anyway — drop it here rather than store it.
+        if isinstance(goal_continuation_id, str) and goal_continuation_id:
+            _looks_like_cont_id = (
+                len(goal_continuation_id) == 32
+                and all(c in "0123456789abcdef" for c in goal_continuation_id.lower())
+            )
+            if not _looks_like_cont_id:
+                goal_continuation_id = ""
         # Stage-326 hardening (per Opus advisor): size + type validation on
         # the draft inputs. Without this, a misbehaving or malicious client
         # can persist multi-MB strings into the session JSON on every keystroke
@@ -18527,17 +18613,24 @@ def handle_post(handler, parsed) -> bool:
                         status=409,
                     )
 
+                # #7855 CORE (round 6): the goal-continuation token is part of
+                # the draft. Apply the write through the shared projection so
+                # the token follows exactly the same rules as the text: stored
+                # with the exact text it belongs to, dropped when the text is
+                # edited, cleared by an explicit empty string, and left alone
+                # by an absent field on an unchanged re-save. Master's inline
+                # text/files mutation (merged 2026-10-17) would preserve the
+                # stored token next to edited text and re-bind them on restore.
                 current_draft = dict(getattr(request_session, "composer_draft", {}) or {})
                 if isinstance(if_text, str) and (
                     str(current_draft.get("text") or "") != if_text
                     or (isinstance(if_files, list) and list(current_draft.get("files") or []) != if_files)
                 ):
                     return j(handler, {"ok": True, "draft": current_draft, "unchanged": True, "mismatch": True})
-                next_draft = dict(current_draft)
-                if text is not None:
-                    next_draft["text"] = text
-                if files is not None:
-                    next_draft["files"] = files
+                next_draft = _project_session_draft_write(
+                    {"text": text, "files": files, "goal_continuation_id": goal_continuation_id},
+                    current_draft,
+                )
                 if next_draft == current_draft:
                     unchanged = True
                     saved_draft = current_draft
@@ -18802,6 +18895,15 @@ def handle_post(handler, parsed) -> bool:
                 forget_bg_task_completion_dedup(sid)
             except Exception:
                 logger.debug("Failed to prune bg-task dedup entry for deleted session %s", sid)
+            # #6885 round 2 lifecycle: session retirement is a terminal path — a
+            # deleted session's pending continuation record (marker + prompt +
+            # expiry) must not survive the session itself.
+            try:
+                from api.goals import clear_pending_goal_continuation
+
+                clear_pending_goal_continuation(sid)
+            except Exception:
+                logger.debug("Failed to clear pending goal continuation for deleted session %s", sid, exc_info=True)
             try:
                 from api.terminal import close_terminal
                 close_terminal(sid)
@@ -24062,6 +24164,43 @@ def _media_deny_reason(target: Path) -> str | None:
     return None
 
 
+# #8033: Windows drive-letter file:/// URIs arrive here as '/C:/Users/me/x' —
+# URL.pathname keeps the file-URI grammar's leading separator before the drive
+# letter, and Path('/C:/x') is root-relative on Windows (resolves to the wrong
+# location). Strip exactly that ONE URI-style separator when it sits
+# immediately before a drive letter — and ONLY on a Windows server. On a POSIX
+# server the conversion must never run: stripping '/C:/report.png' there turns
+# an absolute path into a cwd-relative 'C:/report.png' that can alias a file
+# inside an allowed workspace. Never a generic leading-slash removal: POSIX
+# ('/home/me/x') and UNC ('\\server\share\...') semantics differ and must stay
+# untouched.
+_WINDOWS_DRIVE_URI_LEAD_RE = re.compile(r"^[\\/]([A-Za-z]:[\\/])")
+
+
+def _is_windows_server() -> bool:
+    """True when this server resolves paths with Windows drive semantics."""
+    return os.name == "nt"
+
+
+def _normalize_media_request_path(raw_path: str) -> str:
+    """Return ``raw_path`` with the file-URI leading separator before a drive
+    letter removed (Windows drive-letter file:/// URIs), otherwise unchanged.
+
+    The drive-letter conversion is gated on the server being Windows
+    (``_is_windows_server``). On POSIX the leading separator is preserved so
+    ``/C:/report.png`` stays an absolute path and can never alias a
+    cwd-relative ``C:/report.png`` inside an allowed root.
+
+    Only a leading ``[\\/]`` immediately followed by ``[A-Za-z]:[\\/]``
+    matches; every other path (POSIX absolute, UNC, drive-relative ``C:foo``,
+    already-clean ``C:/x``) passes through untouched. Shape-only: no
+    percent-decoding, no existence checks.
+    """
+    if _is_windows_server() and _WINDOWS_DRIVE_URI_LEAD_RE.match(raw_path):
+        return raw_path[1:]
+    return raw_path
+
+
 def _handle_media(handler, parsed):
     """Serve a local file by absolute path for inline display in the chat.
 
@@ -24098,7 +24237,13 @@ def _handle_media(handler, parsed):
 
     # Resolve the path and check it is within an allowed root
     try:
-        target = Path(raw_path).resolve()
+        # #8033: Windows drive-letter file:/// URIs carry a URI-style leading
+        # separator ('/C:/Users/...'); the normalizer strips exactly that one
+        # separator, and ONLY on a Windows server. On POSIX it must not strip —
+        # '/C:/...' has to stay absolute so it can never alias a cwd-relative
+        # drive-shaped path inside an allowed workspace. POSIX and UNC paths
+        # are returned unchanged by the normalizer.
+        target = Path(_normalize_media_request_path(raw_path)).resolve()
     except Exception:
         return bad(handler, "Invalid path", 400)
 
@@ -27281,6 +27426,75 @@ def _agent_runtime_barrier_response(
     return None
 
 
+def _normalize_goal_continuation_id(raw) -> str:
+    """Coerce a client-supplied continuation ID to a safe token (#7855).
+
+    Rejects anything that is not a compact hex string so a malformed or
+    hostile value can never reach the matcher: returns "" (the "no ID"
+    signal, which keeps the turn a genuine user turn) for None, non-strings,
+    empty/whitespace, wrong length or non-hex characters.
+    """
+    if raw is None:
+        return ""
+    token = str(raw).strip().lower()
+    if not token:
+        return ""
+    if len(token) != 32 or any(c not in "0123456789abcdef" for c in token):
+        return ""
+    return token
+
+
+def _resolve_chat_start_goal_continuation_id(body: dict, session_id: str) -> str:
+    """Resolve the continuation ID for a /api/chat/start body (#7855).
+
+    Current clients always send the key: ``send()`` posts
+    ``goal_continuation_id: _goalContinuationId || ''``, so a genuine turn
+    carries the key with an EMPTY value and a continuation carries its ID. A
+    PRE-UPGRADE tab posts ``_goalContinuationId || undefined`` and
+    ``JSON.stringify`` drops the undefined key entirely, so its body has no
+    ``goal_continuation_id`` key at all. Those tabs must still get master's
+    marker admission: resolve the session's pending ID server-side and feed
+    it through the same ID admission (receipt/rollback intact). An explicit
+    empty string from a current client must NOT peek — that is the #6885
+    genuine-turn signal, and a key-presence legacy path would otherwise admit
+    every genuine turn again.
+    """
+    if "goal_continuation_id" not in body and body.get("regenerate") is not True:
+        from api.goals import peek_pending_goal_continuation_id
+
+        return _normalize_goal_continuation_id(peek_pending_goal_continuation_id(session_id))
+    return _normalize_goal_continuation_id(body.get("goal_continuation_id"))
+
+
+def _consume_pending_goal_continuation(session_id: str, msg: str) -> str | dict | bool | None:
+    """#7855 admission: consume the goal-continuation record only when the
+    incoming turn carries the matching continuation ID.
+
+    The marker is session-scoped (#1932) and set when goal_continue fires;
+    the ID is issued at the same moment and travels with the browser's queued
+    continuation. Without the ID match, a genuine user/queued turn arriving
+    before the browser's auto-dispatch would be misclassified as goal-related
+    and would inherit goal-continuation semantics. When the ID differs (or is
+    absent), the user turn keeps priority and the record is left in place for
+    the browser's actual continuation dispatch.
+
+    Admission is by ID, not text (#7855): the queue UI lets the user edit or
+    combine a queued entry, and there is no wall-clock expiry, so a late or
+    edited continuation is still admitted. Marker, prompt and ID are one
+    record in api.goals; the admission check delegates there so check + drop
+    stay atomic.
+
+    On a match the return value is the **rollback receipt**: the popped
+    record itself (marker + prompt + ID together). A rejected chat start must
+    restore both halves (#7249 rolls back rejected starts), so callers keep
+    the receipt rather than re-deriving what was consumed — restoring the
+    marker alone left the retry unmatchable (maintainer's #7862 repro).
+    """
+    from api.goals import consume_pending_goal_continuation
+
+    return consume_pending_goal_continuation(session_id, msg)
+
+
 def _start_chat_stream_for_session(
     s,
     *,
@@ -27294,6 +27508,7 @@ def _start_chat_stream_for_session(
     normalized_model: bool = False,
     diag=None,
     goal_related: bool = False,
+    goal_continuation_id: str = "",
     source: str = "webui",
     moa_config=None,
     external_runtime_owned: bool | None = None,
@@ -27345,20 +27560,86 @@ def _start_chat_stream_for_session(
 
     consumed_goal_continuation = False
     consumed_bg_task_completion = False
+    # #1932: this session may have a pending goal continuation. The streaming
+    # hook sets PENDING_GOAL_CONTINUATION when goal_continue fires, so the next
+    # chat/start for this session is automatically treated as goal-related.
+    # #6885 + #7855: the marker is consumed ONLY when the request carries the
+    # continuation ID the server issued at goal_continue time — a genuine
+    # user/queued turn (no ID) keeps priority and leaves the marker for the
+    # browser's auto-dispatch, while an edited / combined / late-sent
+    # continuation still carries its ID and keeps the goal.
+    #
+    # #7855 rebase compat (#7249): the admission runs INSIDE the session lock
+    # via consume_continuation_markers(), not up front. Admission pops BOTH
+    # halves (marker + prompt record, api/goals.py), so a rejected start must
+    # restore both; rolling back the marker alone left the retry unmatchable
+    # (maintainer's #7862 repro: consume -> rollback -> retry consume False).
+    # The popped record therefore travels as a rollback receipt and
+    # restore_consumed_continuation_markers() re-arms the pair — unless a
+    # newer continuation was armed for this session meanwhile.
+    consumed_goal_continuation_receipt = None
+
+    # Review 5593825504 Must fix 2/3: a server-side goal continuation
+    # (source="goal_wakeup") is admitted ONLY by consuming its own record by ID,
+    # under the session lock that /goal pause/clear also take, and only while
+    # the goal is still active. An invalid wakeup is rejected, never downgraded
+    # to an ordinary goal_related=False turn.
+    goal_wakeup_turn = str(source or "") == "goal_wakeup"
+    goal_wakeup_rejection = None
+
+    def _goal_wakeup_admission_error() -> str:
+        if not goal_continuation_id:
+            return "goal_continuation_missing"
+        try:
+            from api.goals import has_active_goal, pending_goal_continuation_matches
+            from api.profiles import get_hermes_home_for_profile
+
+            if not pending_goal_continuation_matches(s.session_id, goal_continuation_id):
+                return "goal_continuation_stale"
+            if not has_active_goal(
+                s.session_id,
+                profile_home=get_hermes_home_for_profile(getattr(s, "profile", None)),
+            ):
+                return "goal_inactive"
+        except Exception:
+            return "goal_state_unknown"
+        return ""
 
     def consume_continuation_markers() -> None:
         nonlocal goal_related, consumed_goal_continuation, consumed_bg_task_completion
-        if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
+        nonlocal consumed_goal_continuation_receipt, goal_wakeup_rejection
+        if goal_wakeup_turn:
+            reason = _goal_wakeup_admission_error()
+            receipt = None
+            if not reason:
+                receipt = _consume_pending_goal_continuation(s.session_id, goal_continuation_id)
+                if not receipt:
+                    reason = "goal_continuation_stale"
+            if reason:
+                goal_wakeup_rejection = {
+                    "error": "goal_continuation_rejected",
+                    "reason": reason,
+                    "_status": 409,
+                }
+                return
             goal_related = True
-            PENDING_GOAL_CONTINUATION.discard(s.session_id)
             consumed_goal_continuation = True
+            consumed_goal_continuation_receipt = receipt
+        elif not goal_related and goal_continuation_id:
+            receipt = _consume_pending_goal_continuation(s.session_id, goal_continuation_id)
+            if receipt:
+                goal_related = True
+                consumed_goal_continuation = True
+                consumed_goal_continuation_receipt = receipt
         if s.session_id in PENDING_BG_TASK_COMPLETIONS:
             PENDING_BG_TASK_COMPLETIONS.discard(s.session_id)
             consumed_bg_task_completion = True
 
     def restore_consumed_continuation_markers() -> None:
         if consumed_goal_continuation:
-            PENDING_GOAL_CONTINUATION.add(s.session_id)
+            from api.goals import restore_pending_goal_continuation
+
+            restore_pending_goal_continuation(s.session_id, consumed_goal_continuation_receipt)
         if consumed_bg_task_completion:
             PENDING_BG_TASK_COMPLETIONS.add(s.session_id)
 
@@ -27393,6 +27674,8 @@ def _start_chat_stream_for_session(
                 needs_stale_cleanup = False
                 if regeneration is not None:
                     consume_continuation_markers()
+                    if goal_wakeup_rejection is not None:
+                        return goal_wakeup_rejection
                     try:
                         regeneration_response = _start_regeneration_stream_locked(
                             s,
@@ -27458,6 +27741,9 @@ def _start_chat_stream_for_session(
                         sidecar_unknown,
                     )
                 consume_continuation_markers()
+                if goal_wakeup_rejection is not None:
+                    diag.stage("response_write") if diag else None
+                    return goal_wakeup_rejection
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
                 try:
@@ -27761,6 +28047,7 @@ def _start_run(
     gateway_chat_enabled: bool | None = None,
     regeneration=None,
     goal_related: bool = False,
+    goal_continuation_id: str = "",
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
@@ -27848,6 +28135,7 @@ def _start_run(
                 goal_related=goal_related,
                 external_runtime_owned=gateway_chat_enabled,
                 regeneration=regeneration,
+                goal_continuation_id=goal_continuation_id,
                 process_id=process_id,
                 retry_attempt=retry_attempt,
                 rearm_deferred_wakeup=rearm_deferred_wakeup,
@@ -27899,6 +28187,7 @@ def _start_run(
         goal_related=goal_related,
         external_runtime_owned=gateway_chat_enabled,
         regeneration=regeneration,
+        goal_continuation_id=goal_continuation_id,
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
@@ -27964,8 +28253,13 @@ def start_session_turn(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    goal_continuation_id: str = "",
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
+
+    ``source="goal_wakeup"`` is a detached goal continuation: it must carry the
+    ``goal_continuation_id`` of its registered record, which admission consumes
+    under the session lock (rejected with 409 if stale or the goal is inactive).
 
     Option Z primary wakeup entrypoint. This is the minimal, HTTP-handler-free
     core that ``/api/chat/start`` already reaches via ``_handle_chat_start`` →
@@ -28153,7 +28447,7 @@ def start_session_turn(
     if _paused_wakeup_response is not None:
         return _paused_wakeup_response
     wakeup_goal_related = False
-    if turn_source in ("process_wakeup", "delegation_wakeup", "goal_wakeup"):
+    if turn_source in ("process_wakeup", "delegation_wakeup"):
         try:
             from api.goals import has_active_goal
             from api.profiles import get_hermes_home_for_profile
@@ -28177,6 +28471,11 @@ def start_session_turn(
         source=turn_source,
         route="start_session_turn",
         goal_related=wakeup_goal_related,
+        goal_continuation_id=(
+            _normalize_goal_continuation_id(goal_continuation_id)
+            if turn_source == "goal_wakeup"
+            else ""
+        ),
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
@@ -28512,12 +28811,28 @@ def _handle_goal_command(handler, body):
         previous_goal_state = goal_state_snapshot(s.session_id, profile_home=profile_home)
 
     def _legacy_goal_update(session_id: str, _action: str, text: str) -> dict:
-        return goal_command_payload(
-            session_id,
-            text,
-            stream_running=stream_running,
-            profile_home=profile_home,
-        )
+        if _action not in ("pause", "resume", "clear"):
+            return goal_command_payload(
+                session_id,
+                text,
+                stream_running=stream_running,
+                profile_home=profile_home,
+            )
+        # Review 5593825504 Must fix 3: pause/resume/clear serialize with
+        # detached goal_wakeup admission on the session lock, so admission
+        # either sees the record + active goal before the change, or rejects.
+        with _get_session_agent_lock(session_id):
+            result = goal_command_payload(
+                session_id,
+                text,
+                stream_running=stream_running,
+                profile_home=profile_home,
+            )
+            if _action == "clear" and result.get("ok", True):
+                from api.goals import clear_pending_goal_continuation
+
+                clear_pending_goal_continuation(session_id)
+            return result
 
     goal_adapter = None
     if runner_goal_owned:
@@ -28572,17 +28887,62 @@ def _handle_goal_command(handler, body):
             status = 409 if payload.get("error") == "agent_running" else 400
         return j(handler, payload, status=status)
 
-    action_taken = str(payload.get("action") or "").strip().lower()
-    if action_taken == "resume":
-        PENDING_GOAL_CONTINUATION.add(s.session_id)
-    elif action_taken in ("pause", "clear"):
-        PENDING_GOAL_CONTINUATION.discard(s.session_id)
+    # #6885 round 2 lifecycle: the /goal command is the natural traffic hook
+    # for record upkeep. A cleared/paused goal has no continuation coming, so
+    # any pending record for this session must not outlive it (an abandoned
+    # browser dispatch would otherwise keep the pair resident until expiry);
+    # sweeping expired/orphaned records here bounds the rest without a
+    # background timer.
+    # #7855 rebase compat (#7249): this hook must not fire for runner-owned
+    # goals. The runner does not drive the browser's queued continuation, so
+    # there is no record to clear, and the sweep below runs on the runner's
+    # traffic for goals it owns locally.
+    # #7855 re-gate CORE: only a CLEARED goal has no continuation coming. PAUSE
+    # keeps the goal (and its pending continuation) alive: pausing then resuming a
+    # deferred continuation used to delete the admission record here, and the
+    # resume path restored the active goal WITHOUT replacing the token — so the
+    # retry launched with `goal_related=false` and the goal loop silently stopped.
+    # Verified through real HTTP with the installed native GoalManager: master
+    # launches the retry with `goal_related=true`, this branch with `false`.
+    if not runner_goal_owned:
+        if goal_adapter_action == "clear":
+            from api.goals import clear_pending_goal_continuation
+
+            try:
+                clear_pending_goal_continuation(s.session_id)
+            except Exception:
+                logger.debug(
+                    "Failed to clear pending goal continuation for %s", s.session_id, exc_info=True
+                )
+        from api.goals import sweep_expired_goal_continuations
+
+        try:
+            sweep_expired_goal_continuations()
+        except Exception:
+            logger.debug("Failed to sweep expired goal continuations", exc_info=True)
 
     def _rollback_goal_after_failed_kickoff() -> None:
-        restore_goal_state(s.session_id, previous_goal_state, profile_home=profile_home)
+        # A resume kickoff that cannot start leaves the goal resumed (the
+        # user's next turn still runs goal-related); only /goal <text>
+        # restores the prior goal on a failed kickoff.
+        if will_kickoff:
+            restore_goal_state(s.session_id, previous_goal_state, profile_home=profile_home)
 
     if runner_goal_owned:
         return j(handler, payload)
+
+    # Review 5593825504 Should fix 1: /goal resume re-arms the loop. An
+    # existing continuation record is kept as-is (its ID is still admitted
+    # goal-related); with none pending, resume kicks off a goal-related turn
+    # with the manager's next continuation prompt through the same kickoff
+    # path /goal <text> uses. No bare PENDING_GOAL_CONTINUATION writes.
+    if goal_adapter_action == "resume" and not stream_running and not payload.get("kickoff_prompt"):
+        from api.goals import peek_pending_goal_continuation_id, resume_kickoff_prompt
+
+        if peek_pending_goal_continuation_id(s.session_id) is None:
+            _resume_prompt = resume_kickoff_prompt(s.session_id, profile_home=profile_home)
+            if _resume_prompt:
+                payload["kickoff_prompt"] = _resume_prompt
 
     kickoff_prompt = str(payload.get("kickoff_prompt") or "").strip()
     if kickoff_prompt:
@@ -29002,6 +29362,20 @@ def _handle_chat_start(handler, body, diag=None):
             "diag": diag,
             "gateway_chat_enabled": gateway_chat_enabled,
             "regeneration": regeneration,
+            # #7855: the server-issued continuation ID travels with the browser's
+            # queued continuation through inline edits and combines; admission
+            # is by ID, never by text, so an edited/late/combined continuation
+            # keeps its goal semantics and a genuine user message (no ID) does
+            # not. Rejected as malformed here rather than by the matcher. A
+            # pre-upgrade tab omits the key entirely (its send() posts
+            # `_goalContinuationId || undefined` and JSON.stringify drops the
+            # undefined key), so the resolver peeks the session's pending ID
+            # for that wire shape — master's marker admission, receipt/rollback
+            # intact — while a current client's explicit empty string stays a
+            # genuine turn (#6885).
+            "goal_continuation_id": _resolve_chat_start_goal_continuation_id(
+                body, getattr(s, "session_id", "") or ""
+            ),
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config

@@ -7,11 +7,18 @@ import inspect
 import logging
 import re
 import threading
+import secrets
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+try:  # Older hermes-agent builds have no quality gates.
+    from hermes_cli.goals import CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE  # type: ignore
+except Exception:  # pragma: no cover - depends on installed hermes-agent
+    CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = ""  # type: ignore
 
 try:  # Exposed as a module attribute so tests can monkeypatch it directly.
     from hermes_cli.goals import (  # type: ignore
@@ -653,6 +660,34 @@ def has_active_goal(
         return False
 
 
+def resume_kickoff_prompt(
+    session_id: str,
+    *,
+    profile_home: str | Path | None = None,
+) -> str | None:
+    """Continuation prompt to kick off a just-resumed active goal, or None."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    mgr = _manager(sid, profile_home=profile_home)
+    if mgr is None:
+        return None
+    try:
+        if not mgr.is_active():
+            return None
+        prompt = None
+        if hasattr(mgr, "next_continuation_prompt"):
+            prompt = mgr.next_continuation_prompt()
+        if not prompt:
+            goal = str(getattr(getattr(mgr, "state", None), "goal", "") or "").strip()
+            if goal and CONTINUATION_PROMPT_TEMPLATE:
+                prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=goal)
+        return str(prompt or "").strip() or None
+    except Exception as exc:
+        logger.debug("resume kickoff prompt failed for session=%s: %s", sid, exc)
+        return None
+
+
 def _gather_goal_turn_background_state(
     session_id: str,
     *,
@@ -728,8 +763,12 @@ def gateway_evaluated_goal_in_turn(
         return False
 
 
-def _decision_from_evaluated_state(mgr: Any, state: Any) -> Dict[str, Any]:
-    """Reconstruct an evaluation decision dict from a GoalState already updated in-turn."""
+def _decision_from_evaluated_state(mgr: Any, state: Any) -> Optional[Dict[str, Any]]:
+    """Reconstruct the native decision from a GoalState already updated in-turn.
+
+    Returns ``None`` when the decision cannot be reconstructed faithfully;
+    the caller then does not adopt the persisted state.
+    """
     status = str(getattr(state, "status", "") or "").strip()
     verdict = str(getattr(state, "last_verdict", "") or "continue").strip() or "continue"
     reason = str(getattr(state, "last_reason", "") or "").strip()
@@ -770,27 +809,95 @@ def _decision_from_evaluated_state(mgr: Any, state: Any) -> Dict[str, Any]:
             "message": msg,
         }
 
-    is_waiting = verdict in ("wait", "waiting")
-    if not is_waiting and hasattr(mgr, "is_waiting"):
+    if status != "active":
+        # Cleared, inactive or an unknown status: no continuation may be
+        # derived from it (review 5593825504 Must fix 1). A goal cleared
+        # between the in-turn evaluation and this read must not restart.
+        return {
+            "status": status or None,
+            "should_continue": False,
+            "continuation_prompt": None,
+            "verdict": "inactive",
+            "reason": "no active goal",
+            "message": "",
+        }
+    try:
+        if not mgr.is_active():
+            return {
+                "status": status or None,
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "inactive",
+                "reason": "no active goal",
+                "message": "",
+            }
+    except Exception:
+        return None
+
+    # The manager's live barrier, not the persisted verdict, decides whether
+    # the goal is parked: native resume clears the barrier but leaves
+    # ``last_verdict="wait"`` behind (Must fix 4).
+    is_waiting = False
+    if hasattr(mgr, "is_waiting"):
         try:
             is_waiting = bool(mgr.is_waiting())
         except Exception:
-            is_waiting = False
+            return None
     if is_waiting:
         if hasattr(mgr, "_waiting_decision"):
             try:
-                wait_dec = dict(mgr._waiting_decision(state) or {})
-                wait_dec["verdict"] = verdict if verdict in ("wait", "waiting") else "waiting"
-                return wait_dec
+                return dict(mgr._waiting_decision(state) or {})
             except Exception:
                 pass
         return {
             "status": "active",
             "should_continue": False,
             "continuation_prompt": None,
-            "verdict": verdict if verdict in ("wait", "waiting") else "waiting",
+            "verdict": "waiting",
             "reason": reason,
             "message": f"⏳ Goal parked — waiting: {reason}" if reason else "⏳ Goal parked",
+        }
+
+    # Native ``evaluate_after_turn`` runs the quality gates BEFORE the judge
+    # and a failing gate short-circuits it WITHOUT touching ``last_verdict``.
+    # Gates run in order and stop at the first failure (earlier passing gates
+    # reset ``attempts`` to 0), so the first gate still carrying attempts and
+    # a non-zero exit is the one that failed this turn.
+    failed_gate = None
+    for gate in list(getattr(state, "gates", None) or []):
+        attempts = int(getattr(gate, "attempts", 0) or 0)
+        exit_code = getattr(gate, "last_exit_code", None)
+        if attempts > 0 and exit_code not in (None, 0):
+            failed_gate = gate
+            break
+    if failed_gate is not None:
+        if not CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE:
+            return None  # cannot rebuild the native prompt faithfully: don't adopt
+        command = str(getattr(failed_gate, "command", "") or "")
+        exit_code = getattr(failed_gate, "last_exit_code", None)
+        attempts = int(getattr(failed_gate, "attempts", 0) or 0)
+        max_retries = int(getattr(failed_gate, "max_retries", 0) or 0)
+        try:
+            prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
+                goal=getattr(state, "goal", ""),
+                command=command,
+                exit_code=exit_code,
+                attempt=attempts,
+                max_retries=max_retries,
+                output=str(getattr(failed_gate, "last_output_tail", "") or "") or "(no output)",
+            )
+        except Exception:
+            return None
+        return {
+            "status": "active",
+            "should_continue": True,
+            "continuation_prompt": prompt,
+            "verdict": "gate_failed",
+            "reason": f"gate failed (exit {exit_code}): $ {command}",
+            "message": (
+                f"✗ Quality gate failed ({turns_used}/{max_turns} turns, "
+                f"attempt {attempts}/{max_retries}): $ {command}"
+            ),
         }
 
     prompt = None
@@ -799,19 +906,19 @@ def _decision_from_evaluated_state(mgr: Any, state: Any) -> Dict[str, Any]:
             prompt = mgr.next_continuation_prompt()
         except Exception:
             prompt = None
-    if not prompt and getattr(state, "goal", ""):
-        prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=state.goal)
-    if verdict == "gate_failed":
-        msg = f"✗ Quality gate failed ({turns_used}/{max_turns} turns): {reason}"
-    else:
-        msg = f"↻ Continuing toward goal ({turns_used}/{max_turns}): {reason}"
+    if not prompt:
+        return None
+    # A judge WAIT whose barrier could not be observed continues natively
+    # with verdict "continue"; a live barrier was handled above.
+    if verdict in ("wait", "waiting", "gate_failed"):
+        verdict = "continue"
     return {
         "status": "active",
-        "should_continue": bool(prompt),
+        "should_continue": True,
         "continuation_prompt": prompt,
         "verdict": verdict,
         "reason": reason,
-        "message": msg,
+        "message": f"↻ Continuing toward goal ({turns_used}/{max_turns}): {reason}",
     }
 
 
@@ -829,12 +936,36 @@ def stream_channel_has_subscribers(channel: Any) -> bool:
         return True
 
 
-def detached_goal_continuation_skip_reason(session_id: str) -> str:
+def pending_goal_continuation_matches(session_id: str, continuation_id: str) -> bool:
+    """True when *session_id*'s pending record is exactly *continuation_id*.
+
+    Read under ``PENDING_GOAL_CONTINUATION_LOCK`` against the full record
+    (marker AND record with the same ID), not set membership.
+    """
+    sid = str(session_id or "").strip()
+    cid = str(continuation_id or "").strip()
+    if not sid or not cid:
+        return False
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        if sid not in _cfg.PENDING_GOAL_CONTINUATION:
+            return False
+        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(sid)
+        if not isinstance(record, dict):
+            return False
+        current = str(record.get("continuation_id") or "").strip()
+        return bool(current) and secrets.compare_digest(current, cid)
+
+
+def detached_goal_continuation_skip_reason(session_id: str, continuation_id: str = "") -> str:
     """Return why a detached goal continuation must NOT start, or '' if safe.
 
-    Invariants (re-checked at fire time, not only at teardown):
-      1. never after a user cancel / pause / clear (pending marker gone, goal
-         inactive, or a cancel marker persisted on the transcript);
+    Pre-flight only: ``start_session_turn(source="goal_wakeup")`` re-validates
+    the record ID and the active goal under the session lock at admission, so
+    a pause/clear between this check and the start is still rejected.
+
+    Invariants:
+      1. never after a user cancel / pause / clear (record gone or replaced,
+         goal inactive, or a cancel marker persisted on the transcript);
       2. never races a queued user message or an active/pending turn;
       3. stays inside the owning profile (goal state resolved from the
          session's own profile home; isolated mode refuses foreign sessions).
@@ -842,9 +973,7 @@ def detached_goal_continuation_skip_reason(session_id: str) -> str:
     sid = str(session_id or "").strip()
     if not sid:
         return "missing_session"
-    from api.config import PENDING_GOAL_CONTINUATION
-
-    if sid not in PENDING_GOAL_CONTINUATION:
+    if not pending_goal_continuation_matches(sid, continuation_id):
         return "not_pending"
     try:
         from api.models import get_session
@@ -892,18 +1021,24 @@ def detached_goal_continuation_skip_reason(session_id: str) -> str:
 def start_detached_goal_continuation(
     session_id: str,
     continuation_prompt: str,
+    continuation_id: str,
 ) -> None:
-    """Start a goal continuation turn server-side when no browser SSE subscriber is attached."""
+    """Run a registered continuation server-side (0 SSE subscribers).
+
+    The caller did NOT publish ``goal_continue`` for this record, so the
+    server is its only dispatcher. Admission consumes the record by ID.
+    """
     sid = str(session_id or "").strip()
     prompt = str(continuation_prompt or "").strip()
-    if not sid or not prompt:
+    cid = str(continuation_id or "").strip()
+    if not sid or not prompt or not cid:
         return
 
     def _runner() -> None:
         try:
             from api.routes import start_session_turn
 
-            reason = detached_goal_continuation_skip_reason(sid)
+            reason = detached_goal_continuation_skip_reason(sid, cid)
             if reason:
                 logger.debug(
                     "Detached goal continuation skipped for session %s: %s",
@@ -911,7 +1046,9 @@ def start_detached_goal_continuation(
                     reason,
                 )
                 return
-            start_session_turn(sid, prompt, source="goal_wakeup")
+            start_session_turn(
+                sid, prompt, source="goal_wakeup", goal_continuation_id=cid
+            )
         except Exception:
             logger.debug(
                 "Detached goal continuation start failed for session %s",
@@ -963,7 +1100,8 @@ def evaluate_goal_after_turn(
             and float(getattr(state, "last_turn_at", 0.0) or 0.0) >= float(min_evaluated_at)
         ):
             decision = _decision_from_evaluated_state(mgr, state)
-            return _goal_decision_payload(decision, state)
+            if decision is not None:
+                return _goal_decision_payload(decision, state)
         if not mgr.is_active():
             return {
                 "status": getattr(state, "status", None),
@@ -1017,3 +1155,250 @@ def evaluate_goal_after_turn(
     decision = dict(decision)
     decision = _goal_decision_payload(decision, getattr(mgr, "state", None))
     return decision
+
+
+# ── #6885 goal-continuation admission (single-record lifecycle) ─────────────
+# Round 2 (maintainer review 2026-09-26): the marker set and the prompt map
+# are one logical record. Writers register both under the lock; readers admit
+# a turn only after the wire text is normalized to the canonical semantic
+# user text. Helpers live here (not routes.py) because streaming.py,
+# gateway_chat.py and routes.py all mutate the pair — a shared module owned by
+# the goal domain keeps add/consume/sweep atomic in one place.
+from api import config as _cfg
+
+
+def _goal_continuation_normalize_wire_text(text: str) -> str:
+    """Strip the browser's transport decorations from an outgoing /chat/start
+    message, yielding the canonical semantic user text (#6885 round 2).
+
+    The browser rewrites the composer text before POSTing (static/messages.js
+    ``send()``): ``/use <skill>`` arms a directive, the forced-skill envelope
+    and the queued-continuation tail are all prepended to whatever the user
+    (or the queue) submitted, and file uploads append an attached-files
+    marker. The goal-continuation prompt recorded server-side is the RAW
+    semantic text, so the admission check must compare like with like or a
+    legitimate continuation fails the match and the marker pair leaks.
+
+    Server-side equivalent of static/sessions.js ``_stripForcedSkillEnvelope``
+    / ``_stripAttachedFilesMarker``; deliberately anchored so a user-authored
+    lookalike envelope in the middle of a message is NOT stripped (the front
+    text, before the first envelope, is only admitted when what remains is
+    exactly the continuation prompt).
+    """
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    # Leading `[USER OVERRIDE] ...` directive line (`/use`), line-anchored.
+    value = re.sub(r"^\[USER OVERRIDE\][^\n]*\n*", "", value).strip()
+    # Forced-skill envelope blocks, line-anchored at the front (repeat: a
+    # second consecutive envelope is still transport, not user content).
+    while True:
+        matched = re.match(
+            r"\[FORCED SKILL CONTEXT:[^\]]+\][\s\S]*?\[/FORCED SKILL CONTEXT\]\s*",
+            value,
+        )
+        if not matched:
+            break
+        value = value[matched.end():].strip()
+    # Attached-files tail appended by the upload path.
+    value = re.sub(r"\n\n\[Attached files: [^\]]+\]$", "", value).strip()
+    return value
+
+
+def register_pending_goal_continuation(session_id: str, continuation_prompt: str) -> str | None:
+    """Record a pending goal continuation as ONE marker+prompt+ID record.
+
+    Returns the continuation ID when a record was written (non-empty prompt),
+    or None when there was nothing to register — callers must only emit the
+    goal_continue SSE event when this returns a truthy ID so the frontend
+    queue and the server record cannot disagree.
+
+    The ID is the admission token (#7855): the browser carries it on the
+    queued entry through inline edits and combines, and /api/chat/start
+    validates it. A genuine user message never carries it, which is the
+    #6885 distinction. Matching on the prompt text is what previously
+    dropped the goal after an edit or a late send.
+
+    No wall-clock expiry (#7855): the browser deliberately keeps a queued
+    continuation — it survives a refresh and is restored into the composer
+    for the user to send later — so a TTL retired a continuation that was
+    still perfectly usable. A record now lives until it is consumed
+    (admitted-and-consumed by its ID) or explicitly retired (goal cleared /
+    session retired). Pause does NOT retire it — the resume path restores
+    the active goal with the same pending continuation, so clearing it on
+    pause silently stopped the goal loop (test_7855_regate_behaviour CORE 2).
+    """
+    session_id = str(session_id or "").strip()
+    prompt = str(continuation_prompt or "").strip()
+    if not session_id or not prompt:
+        return None
+    record = {
+        "prompt": prompt,
+        "continuation_id": uuid.uuid4().hex,
+    }
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        _cfg.PENDING_GOAL_CONTINUATION.add(session_id)
+        _cfg.PENDING_GOAL_CONTINUATION_PROMPTS[session_id] = record
+    return str(record["continuation_id"])
+
+
+def peek_pending_goal_continuation_id(session_id: str) -> str | None:
+    """Return the pending continuation ID for *session_id* without consuming.
+
+    Used by the gateway when it re-emits the goal_continue event for a
+    reconnecting stream so the browser and the server record agree.
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return None
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(session_id)
+        if not isinstance(record, dict):
+            return None
+        cont_id = str(record.get("continuation_id") or "").strip()
+        return cont_id or None
+
+
+def consume_pending_goal_continuation(session_id: str, msg: str) -> str | dict | bool | None:
+    """Admit the pending continuation record for *session_id* by its ID.
+
+    *msg* is the continuation ID issued by
+    :func:`register_pending_goal_continuation`. On a match the record is
+    removed, the turn becomes goal-related, and the consumed record is
+    returned as a **rollback receipt** (a dict, or the session id when only
+    the in-memory marker had no record half). Any other value (a genuine user
+    turn, or a queued turn whose entry lost its ID) keeps user priority and
+    the record stays for the browser's real dispatch; ``None`` or ``False``
+    is returned. Fails closed when no record is present.
+
+    Matching on the ID rather than the prompt text is the #7855 fix: the
+    browser's queue lets the user edit or combine a queued continuation, and
+    an exact-text comparison silently turned those into ordinary turns.
+    There is no wall-clock expiry — a late send (after any amount of time,
+    including across a refresh) is still admitted, because the browser
+    deliberately keeps queued continuations alive.
+
+    The receipt exists because a chat start can be rejected *after*
+    admission (#7249 rolls back rejected starts). Re-adding only the marker
+    on rollback — the pre-#7855 shape — left the retry unmatchable, because
+    admission also pops the record half. Returning both halves lets
+    :func:`restore_pending_goal_continuation` put the pair back together (see
+    its "newer continuation armed" guard).
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return False
+    incoming = str(msg or "").strip()
+    if not incoming:
+        return False
+    # A genuine user turn is arbitrary text (any language). Admission is by
+    # ID, so a non-ASCII-ineligible value can never match — reject it before
+    # compare_digest, which raises TypeError on non-ASCII input.
+    if any(c not in "0123456789abcdef" for c in incoming.lower()) or len(incoming) != 32:
+        return False
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        if session_id not in _cfg.PENDING_GOAL_CONTINUATION:
+            return False
+        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(session_id)
+        if not isinstance(record, dict):
+            # Marker without record (legacy/abnormal state): fail closed and
+            # clear the broken half so the session is not stuck (#6885).
+            _drop_pending_goal_continuation(session_id)
+            return False
+        cont_id = str(record.get("continuation_id") or "").strip()
+        if not cont_id:
+            # Legacy record without an ID (pre-#7855 process): fail closed and
+            # clear, so the session is not stuck with an unmatchable record.
+            _drop_pending_goal_continuation(session_id)
+            return False
+        if not secrets.compare_digest(cont_id, incoming):
+            # Mismatch: keep the record for the browser's real dispatch.
+            return False
+        _drop_pending_goal_continuation(session_id)
+        return dict(record)
+
+
+def restore_pending_goal_continuation(session_id: str, receipt) -> bool:
+    """Re-arm an admitted continuation from *receipt* (rollback path).
+
+    Called when a chat start that admitted a continuation is rejected
+    (#7249's transactional rollback). Restoring the marker without the
+    record — the pre-#7855 shape — left the retry unable to match, because
+    admission pops both halves.
+
+    The *newer continuation* guard is what keeps rollback honest: if another
+    ``register_pending_goal_continuation`` armed this session while the start
+    was in flight, this receipt is stale and must NOT overwrite the newer
+    record (that would burn a continuation the browser has not sent yet).
+    Restoring an older ID would also resurrect a consumed one.
+
+    ``receipt`` is what
+    :func:`consume_pending_goal_continuation` returned: the record dict, or
+    the session id when only the marker was present.
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id or receipt is None or receipt is False:
+        return False
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        if session_id in _cfg.PENDING_GOAL_CONTINUATION_PROMPTS:
+            # A newer continuation is armed; keep it and drop the stale receipt.
+            return False
+        if isinstance(receipt, dict):
+            record = dict(receipt)
+            if not str(record.get("continuation_id") or "").strip():
+                return False
+        else:
+            # Marker-only admission (no popped record): re-arm the marker
+            # alone, matching #7249's rollback for the legacy half-pair.
+            record = None
+        _cfg.PENDING_GOAL_CONTINUATION.add(session_id)
+        if record is not None:
+            _cfg.PENDING_GOAL_CONTINUATION_PROMPTS[session_id] = record
+        return True
+
+
+def _drop_pending_goal_continuation(session_id: str) -> None:
+    """Remove both halves of the record. Caller holds the lock."""
+    _cfg.PENDING_GOAL_CONTINUATION.discard(session_id)
+    _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.pop(session_id, None)
+
+
+def clear_pending_goal_continuation(session_id: str) -> None:
+    """Drop any pending continuation record for *session_id* (goal clear /
+    session-retirement paths). Pause deliberately does NOT clear it: the
+    resume path restores the active goal with the same pending continuation,
+    so clearing it on pause broke the resume retry (test_7855_regate_behaviour
+    CORE 2)."""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        _drop_pending_goal_continuation(session_id)
+
+
+def sweep_expired_goal_continuations() -> int:
+    """Remove every orphaned continuation record; return count.
+
+    An orphan is a marker in the set whose record is missing — the reverse
+    (record without marker) is cleared here too, so the two halves cannot
+    drift apart. Safe to call from any thread; called from the /goal command
+    handler so the sweep runs on live traffic without a background timer.
+
+    There is no wall-clock sweep (#7855): the browser deliberately keeps a
+    queued continuation (it survives a refresh and is restored into the
+    composer for a later send), so a TTL retired continuations that were
+    still usable. Records end when they are consumed or the goal/session
+    explicitly retires them.
+    """
+    swept = 0
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        for session_id in list(_cfg.PENDING_GOAL_CONTINUATION_PROMPTS.keys()):
+            record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(session_id)
+            if not isinstance(record, dict) or not str(record.get("continuation_id") or "").strip():
+                _drop_pending_goal_continuation(session_id)
+                swept += 1
+        for session_id in list(_cfg.PENDING_GOAL_CONTINUATION):
+            if session_id not in _cfg.PENDING_GOAL_CONTINUATION_PROMPTS:
+                _drop_pending_goal_continuation(session_id)
+                swept += 1
+    return swept
