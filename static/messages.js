@@ -2102,6 +2102,17 @@ async function send(){
       if(typeof renderSessionList==='function') void renderSessionList();
       return;
     }
+    // The server already dispatched this continuation (browser lease expired
+    // and the fallback ran): drop the queue entry instead of a second turn.
+    if(e&&e.status===409&&/goal_continuation_already_dispatched/.test(errMsg)){
+      delete INFLIGHT[activeSid];
+      if(typeof clearInflightState==='function') clearInflightState(activeSid);
+      removeThinking();setBusy(false);setComposerStatus('');
+      if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
+      showToast('Goal continuation already running.',2200);
+      if(typeof renderSessionList==='function') void renderSessionList();
+      return;
+    }
     if(await _recoverCompressedSend(e,activeSid,_failedSendDraftText,_failedSendFilesSnapshot,_composerDraftClearPromise,_goalContinuationId)) return;
     const conflictActiveStream=/session already has an active stream/i.test(errMsg);
     if(conflictActiveStream){

@@ -27875,6 +27875,9 @@ def _start_chat_stream_for_session(
     # to an ordinary goal_related=False turn.
     goal_wakeup_turn = str(source or "") == "goal_wakeup"
     goal_wakeup_rejection = None
+    # A continuation the server already dispatched (browser lease expired, or
+    # the same queue entry drained twice) must not run as a second turn.
+    browser_continuation_rejection = None
 
     def _goal_wakeup_admission_error() -> str:
         if not goal_continuation_id:
@@ -27897,6 +27900,7 @@ def _start_chat_stream_for_session(
     def consume_continuation_markers() -> None:
         nonlocal goal_related, consumed_goal_continuation, consumed_bg_task_completion
         nonlocal consumed_goal_continuation_receipt, goal_wakeup_rejection
+        nonlocal browser_continuation_rejection
         if goal_wakeup_turn:
             reason = _goal_wakeup_admission_error()
             receipt = None
@@ -27920,6 +27924,20 @@ def _start_chat_stream_for_session(
                 goal_related = True
                 consumed_goal_continuation = True
                 consumed_goal_continuation_receipt = receipt
+            else:
+                from api.goals import goal_continuation_already_dispatched
+
+                if goal_continuation_already_dispatched(
+                    s.session_id, goal_continuation_id
+                ):
+                    # The browser lost the race (server fallback ran first, or
+                    # a duplicate drain): a second turn would redo the work.
+                    browser_continuation_rejection = {
+                        "error": "goal_continuation_already_dispatched",
+                        "reason": "goal_continuation_consumed",
+                        "_status": 409,
+                    }
+                    return
         if s.session_id in PENDING_BG_TASK_COMPLETIONS:
             PENDING_BG_TASK_COMPLETIONS.discard(s.session_id)
             consumed_bg_task_completion = True
@@ -27965,6 +27983,8 @@ def _start_chat_stream_for_session(
                     consume_continuation_markers()
                     if goal_wakeup_rejection is not None:
                         return goal_wakeup_rejection
+                    if browser_continuation_rejection is not None:
+                        return browser_continuation_rejection
                     try:
                         regeneration_response = _start_regeneration_stream_locked(
                             s,
@@ -28033,6 +28053,9 @@ def _start_chat_stream_for_session(
                 if goal_wakeup_rejection is not None:
                     diag.stage("response_write") if diag else None
                     return goal_wakeup_rejection
+                if browser_continuation_rejection is not None:
+                    diag.stage("response_write") if diag else None
+                    return browser_continuation_rejection
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
                 try:

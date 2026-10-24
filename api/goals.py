@@ -10,6 +10,7 @@ import threading
 import secrets
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -936,6 +937,159 @@ def stream_channel_has_subscribers(channel: Any) -> bool:
         return True
 
 
+# A browser hand-off is a LEASE, not the only dispatcher: the tab queues the
+# continuation only when it still owns the session at ``done`` time, so a tab
+# that switched away never posts it and the goal would stall. After this grace
+# the server dispatches the same record (same ID) itself.
+GOAL_CONTINUATION_BROWSER_GRACE_SECONDS = 15.0
+_BROWSER_GRACE_TIMERS: dict[str, Any] = {}
+_BROWSER_GRACE_LOCK = threading.Lock()
+# IDs this process already admitted, so a late duplicate POST cannot run the
+# continuation twice. Bounded: continuation IDs are never re-armed after use.
+_SPENT_GOAL_CONTINUATION_IDS: "OrderedDict[tuple, None]" = OrderedDict()
+_SPENT_GOAL_CONTINUATION_LIMIT = 64
+
+
+def pending_goal_continuation_record(session_id: str) -> Optional[Dict[str, Any]]:
+    """Return a copy of the session's pending record, or None.
+
+    ``grace_deadline`` is the monotonic time at which a browser-held record
+    stops being browser-only (:func:`hand_goal_continuation_to_browser`).
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        if sid not in _cfg.PENDING_GOAL_CONTINUATION:
+            return None
+        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(sid)
+        if not isinstance(record, dict):
+            return None
+        prompt = str(record.get("prompt") or "").strip()
+        cid = str(record.get("continuation_id") or "").strip()
+        if not prompt or not cid:
+            return None
+        deadline = record.get("browser_grace_deadline")
+        return {
+            "prompt": prompt,
+            "continuation_id": cid,
+            "detached_owned": bool(record.get("detached_owned")),
+            "grace_deadline": float(deadline)
+            if isinstance(deadline, (int, float))
+            else None,
+        }
+
+
+def _arm_browser_grace_timer(sid: str, cid: str, grace: float) -> None:
+    """One bounded daemon timer per session; re-arming cancels the previous."""
+    holder: dict[str, Any] = {}
+
+    def _fire() -> None:
+        with _BROWSER_GRACE_LOCK:
+            if _BROWSER_GRACE_TIMERS.get(sid) is holder.get("timer"):
+                _BROWSER_GRACE_TIMERS.pop(sid, None)
+        try:
+            dispatch_browser_owned_goal_continuation(sid, cid)
+        except Exception:
+            logger.debug(
+                "Browser-owned goal continuation fallback failed for %s",
+                sid,
+                exc_info=True,
+            )
+
+    timer = threading.Timer(grace, _fire)
+    timer.daemon = True
+    holder["timer"] = timer
+    with _BROWSER_GRACE_LOCK:
+        previous = _BROWSER_GRACE_TIMERS.pop(sid, None)
+        _BROWSER_GRACE_TIMERS[sid] = timer
+    if previous is not None:
+        previous.cancel()
+    timer.start()
+
+
+def hand_goal_continuation_to_browser(
+    session_id: str, continuation_id: str, *, grace_seconds: float | None = None
+) -> bool:
+    """Give an attached browser first refusal, with a server-side deadline.
+
+    Publishing ``goal_continue`` alone is not delivery: the tab only queues the
+    continuation while it is the active session at ``done`` time. The deadline
+    is what lets :func:`dispatch_browser_owned_goal_continuation` take over.
+    """
+    sid = str(session_id or "").strip()
+    cid = str(continuation_id or "").strip()
+    if not sid or not cid:
+        return False
+    grace = (
+        GOAL_CONTINUATION_BROWSER_GRACE_SECONDS
+        if grace_seconds is None
+        else grace_seconds
+    )
+    try:
+        grace = max(0.0, float(grace))
+    except Exception:
+        grace = GOAL_CONTINUATION_BROWSER_GRACE_SECONDS
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        if sid not in _cfg.PENDING_GOAL_CONTINUATION:
+            return False
+        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(sid)
+        if not isinstance(record, dict):
+            return False
+        current = str(record.get("continuation_id") or "").strip()
+        if not current or not secrets.compare_digest(current, cid):
+            return False
+        record["browser_grace_deadline"] = time.monotonic() + grace
+    _arm_browser_grace_timer(sid, cid, grace)
+    return True
+
+
+def dispatch_browser_owned_goal_continuation(
+    session_id: str, continuation_id: str = ""
+) -> bool:
+    """Take over a browser-held continuation once its grace deadline passed.
+
+    The record keeps its ID and gains ``detached_owned``, so admission stays
+    the single arbiter: a browser POST that lands anyway consumes nothing and
+    is rejected as an already-dispatched duplicate. A dispatch inside the
+    grace, a replaced record, or a pause/clear all make this a no-op.
+    """
+    record = pending_goal_continuation_record(session_id)
+    if not record or record["detached_owned"]:
+        return False
+    want = str(continuation_id or "").strip()
+    if want and not secrets.compare_digest(record["continuation_id"], want):
+        return False
+    deadline = record.get("grace_deadline")
+    if deadline is None or time.monotonic() < deadline:
+        return False
+    if not mark_detached_goal_continuation(session_id, record["continuation_id"]):
+        return False
+    start_detached_goal_continuation(
+        session_id, record["prompt"], record["continuation_id"]
+    )
+    return True
+
+
+def goal_continuation_already_dispatched(session_id: str, continuation_id: str) -> bool:
+    """True when this session already admitted a record with this ID."""
+    key = (str(session_id or "").strip(), str(continuation_id or "").strip())
+    if not key[0] or not key[1]:
+        return False
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        return key in _SPENT_GOAL_CONTINUATION_IDS
+
+
+def _note_goal_continuation_consumed(session_id: str, continuation_id: str) -> None:
+    """Remember an admitted ID. Caller holds ``PENDING_GOAL_CONTINUATION_LOCK``."""
+    key = (str(session_id or "").strip(), str(continuation_id or "").strip())
+    if not key[0] or not key[1]:
+        return
+    _SPENT_GOAL_CONTINUATION_IDS[key] = None
+    while len(_SPENT_GOAL_CONTINUATION_IDS) > _SPENT_GOAL_CONTINUATION_LIMIT:
+        _SPENT_GOAL_CONTINUATION_IDS.popitem(last=False)
+
+
 def pending_goal_continuation_matches(session_id: str, continuation_id: str) -> bool:
     """True when *session_id*'s pending record is exactly *continuation_id*.
 
@@ -1114,20 +1268,10 @@ def mark_detached_goal_continuation(session_id: str, continuation_id: str) -> bo
 
 def pending_detached_goal_continuation(session_id: str) -> Optional[Dict[str, Any]]:
     """Return ``{prompt, continuation_id}`` for a WebUI-owned pending record."""
-    sid = str(session_id or "").strip()
-    if not sid:
+    record = pending_goal_continuation_record(session_id)
+    if not record or not record["detached_owned"]:
         return None
-    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
-        if sid not in _cfg.PENDING_GOAL_CONTINUATION:
-            return None
-        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(sid)
-        if not isinstance(record, dict) or not record.get("detached_owned"):
-            return None
-        prompt = str(record.get("prompt") or "").strip()
-        cid = str(record.get("continuation_id") or "").strip()
-        if not prompt or not cid:
-            return None
-        return {"prompt": prompt, "continuation_id": cid}
+    return {"prompt": record["prompt"], "continuation_id": record["continuation_id"]}
 
 
 def retry_detached_goal_continuation(session_id: str) -> bool:
@@ -1143,13 +1287,13 @@ def retry_detached_goal_continuation(session_id: str) -> bool:
 
     Retrying is safe because admission consumes the record by ID under the
     session lock: concurrent attempts collapse to at most one admitted turn,
-    and a losing attempt leaves a consumed or replaced record untouched. It
-    also keeps ONE dispatcher: a browser-owned record is never retried here,
-    because the browser holds that dispatch.
+    and a losing attempt leaves a consumed or replaced record untouched. A
+    browser-held record is retried only after its grace deadline, when the
+    server has become the dispatcher (:func:`hand_goal_continuation_to_browser`).
     """
     record = pending_detached_goal_continuation(session_id)
     if not record:
-        return False
+        return dispatch_browser_owned_goal_continuation(session_id)
     start_detached_goal_continuation(
         session_id, record["prompt"], record["continuation_id"]
     )
@@ -1411,6 +1555,7 @@ def consume_pending_goal_continuation(session_id: str, msg: str) -> str | dict |
         if not secrets.compare_digest(cont_id, incoming):
             # Mismatch: keep the record for the browser's real dispatch.
             return False
+        _note_goal_continuation_consumed(session_id, cont_id)
         _drop_pending_goal_continuation(session_id)
         return dict(record)
 
@@ -1451,13 +1596,25 @@ def restore_pending_goal_continuation(session_id: str, receipt) -> bool:
         _cfg.PENDING_GOAL_CONTINUATION.add(session_id)
         if record is not None:
             _cfg.PENDING_GOAL_CONTINUATION_PROMPTS[session_id] = record
+            # The rollback un-consumed this ID: it is dispatchable again.
+            _SPENT_GOAL_CONTINUATION_IDS.pop(
+                (session_id, str(record.get("continuation_id") or "").strip()), None
+            )
         return True
 
 
 def _drop_pending_goal_continuation(session_id: str) -> None:
-    """Remove both halves of the record. Caller holds the lock."""
+    """Remove both halves of the record and cancel its grace timer.
+
+    Caller holds the record lock. Cancelling is best-effort: a timer that
+    fires anyway finds no matching record and does nothing.
+    """
     _cfg.PENDING_GOAL_CONTINUATION.discard(session_id)
     _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.pop(session_id, None)
+    with _BROWSER_GRACE_LOCK:
+        timer = _BROWSER_GRACE_TIMERS.pop(str(session_id), None)
+    if timer is not None:
+        timer.cancel()
 
 
 def clear_pending_goal_continuation(session_id: str) -> None:

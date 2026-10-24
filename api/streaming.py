@@ -17647,6 +17647,7 @@ def _run_agent_streaming(
             try:
                 from api.goals import (
                     evaluate_goal_after_turn,
+                    hand_goal_continuation_to_browser,
                     has_active_goal,
                     mark_detached_goal_continuation,
                     stream_channel_has_subscribers,
@@ -17712,8 +17713,13 @@ def _run_agent_streaming(
                         if not continuation_id:
                             continuation_prompt = ''
                     if continuation_prompt:
-                        # ONE dispatcher: browser (subscriber) XOR detached server.
+                        # Browser first, server at the grace deadline: a tab
+                        # that is not the active session at done time never
+                        # posts the queued continuation.
                         if stream_channel_has_subscribers(q):
+                            hand_goal_continuation_to_browser(
+                                session_id, str(continuation_id or '')
+                            )
                             put('goal_continue', {
                                 'session_id': session_id,
                                 'continuation_prompt': continuation_prompt,
