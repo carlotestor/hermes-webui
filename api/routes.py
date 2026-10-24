@@ -29228,18 +29228,31 @@ def _handle_goal_command(handler, body):
     if runner_goal_owned:
         return j(handler, payload)
 
-    # Review 5593825504 Should fix 1: /goal resume re-arms the loop. An
-    # existing continuation record is kept as-is (its ID is still admitted
-    # goal-related); with none pending, resume kicks off a goal-related turn
-    # with the manager's next continuation prompt through the same kickoff
-    # path /goal <text> uses. No bare PENDING_GOAL_CONTINUATION writes.
+    # Review 5593825504 Should fix 1: /goal resume re-arms the loop. A pending
+    # continuation record is kept as-is; with none pending, resume kicks off a
+    # goal-related turn with the manager's next continuation prompt through the
+    # same kickoff path /goal <text> uses. No bare PENDING_GOAL_CONTINUATION
+    # writes.
+    # Review 5603344218 Must fix 2: when the pending record is WebUI-owned
+    # (detached), resume RETRIES it through the same admission with its existing
+    # continuation ID instead of starting a second dispatcher. That is what
+    # recovers a runner that stopped without dispatching — a pause landing
+    # between tear-down and preflight, or an admission rejected with 409 while
+    # the goal was paused — instead of stalling the goal until /goal clear.
+    # Browser-owned records are untouched: the browser holds that dispatch.
     if goal_adapter_action == "resume" and not stream_running and not payload.get("kickoff_prompt"):
-        from api.goals import peek_pending_goal_continuation_id, resume_kickoff_prompt
+        from api.goals import (
+            peek_pending_goal_continuation_id,
+            resume_kickoff_prompt,
+            retry_detached_goal_continuation,
+        )
 
         if peek_pending_goal_continuation_id(s.session_id) is None:
             _resume_prompt = resume_kickoff_prompt(s.session_id, profile_home=profile_home)
             if _resume_prompt:
                 payload["kickoff_prompt"] = _resume_prompt
+        else:
+            retry_detached_goal_continuation(s.session_id)
 
     kickoff_prompt = str(payload.get("kickoff_prompt") or "").strip()
     if kickoff_prompt:

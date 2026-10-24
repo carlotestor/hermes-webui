@@ -1027,6 +1027,11 @@ def start_detached_goal_continuation(
 
     The caller did NOT publish ``goal_continue`` for this record, so the
     server is its only dispatcher. Admission consumes the record by ID.
+
+    A skipped preflight or a rejected admission leaves the record in place
+    (and detached-owned): :func:`retry_detached_goal_continuation` runs it
+    again with this same ID on ``/goal resume`` and when the session goes
+    idle, so a stopped runner never silently ends the goal loop.
     """
     sid = str(session_id or "").strip()
     prompt = str(continuation_prompt or "").strip()
@@ -1046,9 +1051,24 @@ def start_detached_goal_continuation(
                     reason,
                 )
                 return
-            start_session_turn(
+            result = start_session_turn(
                 sid, prompt, source="goal_wakeup", goal_continuation_id=cid
             )
+            status = 0
+            if isinstance(result, dict):
+                try:
+                    status = int(result.get("_status", 200) or 200)
+                except Exception:
+                    status = 0
+            if status and status >= 400:
+                # Not a lost cause: the record still owns its dispatcher, so
+                # /goal resume or the next idle teardown retries this ID.
+                logger.debug(
+                    "Detached goal continuation rejected for session %s: status=%s reason=%s",
+                    sid,
+                    status,
+                    result.get("reason") if isinstance(result, dict) else "",
+                )
         except Exception:
             logger.debug(
                 "Detached goal continuation start failed for session %s",
@@ -1061,6 +1081,79 @@ def start_detached_goal_continuation(
         name=f"goal-continue-{sid[:12]}",
         daemon=True,
     ).start()
+
+
+def mark_detached_goal_continuation(session_id: str, continuation_id: str) -> bool:
+    """Record that the WebUI server is the SOLE dispatcher of this continuation.
+
+    A ``goal_continue`` published to a browser subscriber is dispatched by
+    that browser; with no subscriber the server runs the turn itself
+    (:func:`start_detached_goal_continuation`). Only the second kind carries
+    dispatcher ownership, so :func:`retry_detached_goal_continuation` never
+    starts a second dispatcher for a record the browser already holds.
+
+    Ownership is bound to the ID (compare under the record lock), so a mark
+    that arrives after the record was consumed or replaced is ignored.
+    """
+    sid = str(session_id or "").strip()
+    cid = str(continuation_id or "").strip()
+    if not sid or not cid:
+        return False
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        if sid not in _cfg.PENDING_GOAL_CONTINUATION:
+            return False
+        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(sid)
+        if not isinstance(record, dict):
+            return False
+        current = str(record.get("continuation_id") or "").strip()
+        if not current or not secrets.compare_digest(current, cid):
+            return False
+        record["detached_owned"] = True
+        return True
+
+
+def pending_detached_goal_continuation(session_id: str) -> Optional[Dict[str, Any]]:
+    """Return ``{prompt, continuation_id}`` for a WebUI-owned pending record."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        if sid not in _cfg.PENDING_GOAL_CONTINUATION:
+            return None
+        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(sid)
+        if not isinstance(record, dict) or not record.get("detached_owned"):
+            return None
+        prompt = str(record.get("prompt") or "").strip()
+        cid = str(record.get("continuation_id") or "").strip()
+        if not prompt or not cid:
+            return None
+        return {"prompt": prompt, "continuation_id": cid}
+
+
+def retry_detached_goal_continuation(session_id: str) -> bool:
+    """Re-dispatch a WebUI-owned (detached) continuation with its EXISTING ID.
+
+    Dispatcher ownership stays with the record: a detached runner can stop
+    without ever dispatching — its preflight skips (queued/active turn, or a
+    pause landing between tear-down and preflight) or admission rejects the
+    wakeup (``409`` after a pause) — and no browser event exists to replay.
+    Called when the session goes idle and when ``/goal resume`` re-arms the
+    loop, so a resumed goal keeps exactly one recoverable dispatch instead of
+    stalling until ``/goal clear``.
+
+    Retrying is safe because admission consumes the record by ID under the
+    session lock: concurrent attempts collapse to at most one admitted turn,
+    and a losing attempt leaves a consumed or replaced record untouched. It
+    also keeps ONE dispatcher: a browser-owned record is never retried here,
+    because the browser holds that dispatch.
+    """
+    record = pending_detached_goal_continuation(session_id)
+    if not record:
+        return False
+    start_detached_goal_continuation(
+        session_id, record["prompt"], record["continuation_id"]
+    )
+    return True
 
 
 def evaluate_goal_after_turn(
@@ -1235,6 +1328,10 @@ def register_pending_goal_continuation(session_id: str, continuation_prompt: str
     record = {
         "prompt": prompt,
         "continuation_id": uuid.uuid4().hex,
+        # Dispatcher ownership (review 5603344218 Must fix 2). False until the
+        # writer learns no browser is attached; see
+        # :func:`mark_detached_goal_continuation`.
+        "detached_owned": False,
     }
     with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
         _cfg.PENDING_GOAL_CONTINUATION.add(session_id)

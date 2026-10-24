@@ -17648,6 +17648,7 @@ def _run_agent_streaming(
                 from api.goals import (
                     evaluate_goal_after_turn,
                     has_active_goal,
+                    mark_detached_goal_continuation,
                     stream_channel_has_subscribers,
                     register_pending_goal_continuation,
                 )
@@ -17724,6 +17725,15 @@ def _run_agent_streaming(
                                 'decision': decision,
                             })
                         else:
+                            # Review 5603344218 Must fix 2: dispatcher ownership
+                            # stays with the record. With no subscriber the
+                            # server is the only dispatcher, so mark the record
+                            # detached-owned; a stopped runner is retried with
+                            # this same continuation ID on /goal resume and when
+                            # the session goes idle.
+                            mark_detached_goal_continuation(
+                                session_id, str(continuation_id or '')
+                            )
                             _detached_goal_continuation_prompt = continuation_prompt
                             _detached_goal_continuation_id = continuation_id
             except Exception as _goal_exc:
@@ -18539,6 +18549,23 @@ def _run_agent_streaming(
             except Exception:
                 logger.debug(
                     "turn-teardown detached-goal continuation failed for session %s",
+                    session_id,
+                    exc_info=True,
+                )
+        elif not cancel_event.is_set():
+            # Review 5603344218 Must fix 2, idle half: this turn ended without
+            # handing off a continuation, so a WebUI-owned (detached) record
+            # whose runner stopped — preflight skipped a queued/active turn, or
+            # admission rejected the wakeup — is retried now that the session is
+            # idle, with its existing continuation ID (admission still admits at
+            # most one turn). Browser-owned records are left alone.
+            try:
+                from api.goals import retry_detached_goal_continuation
+
+                retry_detached_goal_continuation(session_id)
+            except Exception:
+                logger.debug(
+                    "turn-teardown detached-goal retry failed for session %s",
                     session_id,
                     exc_info=True,
                 )

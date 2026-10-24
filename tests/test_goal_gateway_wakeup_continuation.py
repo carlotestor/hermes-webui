@@ -241,12 +241,10 @@ def test_evaluate_goal_after_turn_forwards_background_processes_and_active_deleg
     assert decision["should_continue"] is False
 
 
-def test_gateway_worker_adopts_in_turn_gateway_goal_evaluation_without_double_judging(
-    tmp_path, monkeypatch
-):
-    """When the Gateway already evaluated the goal in state.db during the turn, WebUI adopts it
-    without calling evaluate_after_turn a second time (and even if goal_related was lost on restart).
-    """
+def _gateway_in_turn_goal_env(tmp_path, monkeypatch, *, stream_id):
+    """Session + a fake native GoalManager whose in-turn evaluation already
+    persisted to ``state.db`` (``last_turn_at`` in the future ⇒ the Gateway
+    evaluated this turn's goal, the WebUI did not)."""
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
@@ -306,16 +304,29 @@ def test_gateway_worker_adopts_in_turn_gateway_goal_evaluation_without_double_ju
     monkeypatch.setattr("api.profiles.get_hermes_home_for_profile", lambda _p: tmp_path)
 
     s = new_session()
-    stream_id = "stream-gateway-in-turn-goal"
     s.active_stream_id = stream_id
     s.pending_user_message = "continue - subagents have finished"
     s.pending_attachments = []
     s.pending_started_at = 123
     s.save()
     channel = create_stream_channel()
-    subscriber = channel.subscribe()
     STREAMS[stream_id] = channel
     PENDING_GOAL_CONTINUATION.discard(s.session_id)
+    return s, channel, fake_mgr, eval_calls
+
+
+def test_gateway_worker_adopts_in_turn_gateway_goal_evaluation_without_double_judging(
+    tmp_path, monkeypatch
+):
+    """Review 5603344218 Must fix 1: when the Gateway already evaluated the goal
+    in-turn, the WebUI adopts that decision (no second judge) but only to REPORT
+    status. The turn was not goal-related, so the native Agent owns the
+    continuation: no browser ``goal_continue`` and no record."""
+    stream_id = "stream-gateway-in-turn-goal"
+    s, channel, fake_mgr, eval_calls = _gateway_in_turn_goal_env(
+        tmp_path, monkeypatch, stream_id=stream_id
+    )
+    subscriber = channel.subscribe()
 
     try:
         gateway_chat._run_gateway_chat_streaming(
@@ -336,13 +347,67 @@ def test_gateway_worker_adopts_in_turn_gateway_goal_evaluation_without_double_ju
         assert eval_calls == []
         assert fake_mgr.state.turns_used == 1
         assert "goal" in event_names
-        assert "goal_continue" in event_names
-        assert s.session_id in PENDING_GOAL_CONTINUATION
-        goal_continue_ev = next(item[1] for item in events if item[0] == "goal_continue")
-        assert "remove all replaceable helpers" in goal_continue_ev["continuation_prompt"]
-        assert "1/100" in goal_continue_ev["message"]
+        # The Agent's own post-turn hook dispatched it; a WebUI dispatch would
+        # be the second continuation the review reproduced.
+        assert "goal_continue" not in event_names
+        assert s.session_id not in PENDING_GOAL_CONTINUATION
+        goal_messages = [
+            str(item[1].get("message") or "") for item in events if item[0] == "goal"
+        ]
+        assert any("1/100" in memo for memo in goal_messages), goal_messages
     finally:
         PENDING_GOAL_CONTINUATION.discard(s.session_id)
+        webui_goals.clear_pending_goal_continuation(s.session_id)
+
+
+def test_gateway_turn_with_native_hook_and_goal_related_false_launches_nothing(
+    tmp_path, monkeypatch
+):
+    """Review 5603344218 Must fix 1 regression: ONE Gateway turn whose native
+    post-turn hook owns the continuation (``goal_related=False``) gives ZERO
+    WebUI launches — no detached ``start_session_turn``, no browser dispatch,
+    no record (and therefore nothing for a late subscriber to replay)."""
+    stream_id = "stream-gateway-native-owned"
+    s, channel, fake_mgr, eval_calls = _gateway_in_turn_goal_env(
+        tmp_path, monkeypatch, stream_id=stream_id
+    )
+
+    launches = []
+    monkeypatch.setattr(
+        routes,
+        "start_session_turn",
+        lambda *a, **kw: launches.append(("detached", a, kw)) or {"_status": 200},
+    )
+    monkeypatch.setattr(
+        webui_goals,
+        "start_detached_goal_continuation",
+        lambda *a, **kw: launches.append(("handoff", a, kw)),
+    )
+
+    try:
+        # No SSE subscriber: the detached branch is the only WebUI dispatcher.
+        gateway_chat._run_gateway_chat_streaming(
+            s.session_id,
+            "continue - subagents have finished",
+            "test-model",
+            str(tmp_path),
+            stream_id,
+            [],
+            goal_related=False,
+        )
+
+        assert launches == []
+        assert eval_calls == []
+        assert fake_mgr.state.turns_used == 1
+        assert s.session_id not in PENDING_GOAL_CONTINUATION
+        late = channel.subscribe()
+        replayed = []
+        while not late.empty():
+            replayed.append(late.get_nowait()[0])
+        assert "goal_continue" not in replayed
+    finally:
+        PENDING_GOAL_CONTINUATION.discard(s.session_id)
+        webui_goals.clear_pending_goal_continuation(s.session_id)
 
 
 def test_gateway_worker_starts_detached_goal_continuation_when_no_sse_subscriber(
@@ -765,3 +830,182 @@ def test_goal_pause_and_clear_run_under_the_session_lock(monkeypatch, tmp_path, 
     monkeypatch.setattr(webui_goals, "goal_command_payload", spy)
     assert routes._handle_goal_command(object(), {"session_id": session.session_id, "args": action})["status"] == 200
     assert held == [True]
+
+
+# ── Review 5603344218 Must fix 2: a detached record keeps its dispatcher ────
+
+
+def _capture_goal_threads(monkeypatch):
+    """Capture (and join) the detached runner threads spawned by api.goals."""
+    import threading as _threading
+
+    threads = []
+    real_thread = _threading.Thread
+
+    def _thread(*a, **k):
+        t = real_thread(*a, **k)
+        threads.append(t)
+        return t
+
+    monkeypatch.setattr(webui_goals.threading, "Thread", _thread)
+
+    def join_all(timeout=5.0):
+        for t in list(threads):
+            t.join(timeout)
+
+    return join_all
+
+
+def test_pause_after_detached_preflight_then_resume_dispatches_once(
+    monkeypatch, tmp_path
+):
+    """Review 5603344218 Must fix 2: with no SSE subscriber the record keeps
+    dispatcher ownership. A pause landing after the preflight makes admission
+    409 and, before this fix, left the record pending with nothing to run it:
+    both resumes returned 200 with 0 kickoffs and 0 replayable events. Resume
+    must retry that SAME continuation ID — exactly one recoverable
+    goal-related dispatch, no second dispatcher, record consumed."""
+    session, holder, kickoffs = _goal_command_env(
+        monkeypatch, tmp_path, "sid-detached-paused-resume"
+    )
+    webui_goals.clear_pending_goal_continuation(session.session_id)
+    cid = webui_goals.register_pending_goal_continuation(
+        session.session_id, "continue the goal"
+    )
+    assert webui_goals.mark_detached_goal_continuation(session.session_id, cid)
+
+    admitted = []
+
+    def fake_start_session_turn(
+        sid, prompt, *, source="process_wakeup", goal_continuation_id="", **_kw
+    ):
+        """Admission: rejected while the goal is paused, otherwise it consumes
+        the record by ID — the same contract as the real route."""
+        if holder["state"].status != "active":
+            return {
+                "_status": 409,
+                "error": "goal_continuation_rejected",
+                "reason": "goal_inactive",
+            }
+        receipt = webui_goals.consume_pending_goal_continuation(sid, goal_continuation_id)
+        if not receipt:
+            return {
+                "_status": 409,
+                "error": "goal_continuation_rejected",
+                "reason": "goal_continuation_stale",
+            }
+        admitted.append((sid, prompt, source, goal_continuation_id))
+        return {"_status": 200, "stream_id": "goal-wakeup-stream", "session_id": sid}
+
+    monkeypatch.setattr(routes, "start_session_turn", fake_start_session_turn)
+    # Real preflight, with the session/model/profile seams stubbed: the record
+    # exists, the goal is active after resume, no turn is queued or running.
+    from api import background_process, profiles
+
+    monkeypatch.setattr(models, "get_session", lambda _sid, *a, **k: session)
+    monkeypatch.setattr(background_process, "_session_has_active_turn", lambda _sid: False)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda _name: str(tmp_path))
+    monkeypatch.setattr(
+        webui_goals,
+        "has_active_goal",
+        lambda _sid, **_kw: holder["state"].status == "active",
+    )
+    join_all = _capture_goal_threads(monkeypatch)
+    try:
+        # The detached handoff already preflighted; the pause then lands before
+        # admission, so the wakeup is rejected and nothing dispatches.
+        assert (
+            routes._handle_goal_command(
+                object(), {"session_id": session.session_id, "args": "pause"}
+            )["status"]
+            == 200
+        )
+        assert webui_goals.peek_pending_goal_continuation_id(session.session_id) == cid
+
+        res = routes._handle_goal_command(
+            object(), {"session_id": session.session_id, "args": "resume"}
+        )
+        assert res["status"] == 200
+        join_all()
+
+        assert kickoffs == [], "resume must retry the record, not start a second dispatcher"
+        assert admitted == [
+            (session.session_id, "continue the goal", "goal_wakeup", cid)
+        ], "exactly one recoverable goal-related dispatch"
+        assert webui_goals.peek_pending_goal_continuation_id(session.session_id) is None
+    finally:
+        join_all()
+        webui_goals.clear_pending_goal_continuation(session.session_id)
+
+
+@pytest.mark.parametrize("detached_owned, expected", [(True, 1), (False, 0)])
+def test_gateway_teardown_retries_only_webui_owned_records(
+    tmp_path, monkeypatch, detached_owned, expected
+):
+    """Must fix 2, idle half: a turn that ends without handing off a
+    continuation retries a WebUI-owned (detached) record left by a stopped
+    runner — its preflight skipped a queued/active turn, say — with its
+    existing ID. A browser-owned record is never re-dispatched."""
+    stream_id = f"stream-gateway-idle-retry-{detached_owned}"
+    s, channel, _fake_mgr, _eval_calls = _gateway_in_turn_goal_env(
+        tmp_path, monkeypatch, stream_id=stream_id
+    )
+    monkeypatch.setattr(webui_goals, "has_active_goal", lambda *_a, **_kw: False)
+    cid = webui_goals.register_pending_goal_continuation(
+        s.session_id, "leftover continuation"
+    )
+    if detached_owned:
+        assert webui_goals.mark_detached_goal_continuation(s.session_id, cid)
+
+    retried = []
+    monkeypatch.setattr(
+        webui_goals,
+        "start_detached_goal_continuation",
+        lambda sid, prompt, cont_id: retried.append((sid, prompt, cont_id)),
+    )
+    try:
+        gateway_chat._run_gateway_chat_streaming(
+            s.session_id,
+            "continue - subagents have finished",
+            "test-model",
+            str(tmp_path),
+            stream_id,
+            [],
+            goal_related=True,
+        )
+        assert len(retried) == expected
+        if expected:
+            assert retried == [(s.session_id, "leftover continuation", cid)]
+    finally:
+        PENDING_GOAL_CONTINUATION.discard(s.session_id)
+        webui_goals.clear_pending_goal_continuation(s.session_id)
+
+
+def test_retry_detached_goal_continuation_binds_ownership_to_the_id(monkeypatch):
+    """Must fix 2: ownership is bound to the continuation ID, and retries reuse
+    that ID so admission stays the single arbiter."""
+    sid = "sid-detached-ownership"
+    webui_goals.clear_pending_goal_continuation(sid)
+    started = []
+    monkeypatch.setattr(
+        webui_goals,
+        "start_detached_goal_continuation",
+        lambda s, prompt, cont_id: started.append((s, prompt, cont_id)),
+    )
+    try:
+        cid = webui_goals.register_pending_goal_continuation(sid, "continue the goal")
+        # Browser-owned: the browser holds that dispatch, so nothing is retried.
+        assert webui_goals.retry_detached_goal_continuation(sid) is False
+        assert started == []
+        # A mark for another ID (consumed/replaced record) is ignored.
+        assert webui_goals.mark_detached_goal_continuation(sid, "0" * 32) is False
+        assert webui_goals.retry_detached_goal_continuation(sid) is False
+        assert started == []
+        # WebUI-owned: retried with its EXISTING ID.
+        assert webui_goals.mark_detached_goal_continuation(sid, cid) is True
+        assert webui_goals.retry_detached_goal_continuation(sid) is True
+        assert started == [(sid, "continue the goal", cid)]
+        webui_goals.clear_pending_goal_continuation(sid)
+        assert webui_goals.retry_detached_goal_continuation(sid) is False
+    finally:
+        webui_goals.clear_pending_goal_continuation(sid)

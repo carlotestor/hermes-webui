@@ -3355,6 +3355,7 @@ def _run_gateway_chat_streaming(
                 evaluate_goal_after_turn,
                 gateway_evaluated_goal_in_turn,
                 has_active_goal,
+                mark_detached_goal_continuation,
                 stream_channel_has_subscribers,
                 register_pending_goal_continuation,
             )
@@ -3366,9 +3367,19 @@ def _run_gateway_chat_streaming(
                 min_evaluated_at=_turn_started_at,
                 profile_home=profile_home,
             )
-            if _gateway_evaluated or (
+            # Review 5603344218 Must fix 1: only a turn the WebUI itself started
+            # goal-related gives the WebUI the continuation decision. When the
+            # native Agent evaluated the goal in-turn (``_gateway_evaluated``)
+            # for a turn that was NOT goal-related, the Agent owns that
+            # decision: its post-turn hook already queued the continuation in
+            # the adapter FIFO (``gateway/run_goals.py`` ``_enqueue_fifo``) or
+            # committed it through the local authority. Adopting the decision
+            # here may only REPORT goal status — registering a record and
+            # dispatching it again would run the same turn twice.
+            _webui_owns_goal = bool(
                 goal_related and has_active_goal(session_id, profile_home=profile_home)
-            ):
+            )
+            if _gateway_evaluated or _webui_owns_goal:
                 put_gateway_event("goal", {
                     "session_id": session_id,
                     "state": "evaluating",
@@ -3398,7 +3409,7 @@ def _run_gateway_chat_streaming(
                         "message_args": decision.get("message_args") or [],
                         "decision": decision,
                     })
-                if decision.get("should_continue"):
+                if decision.get("should_continue") and _webui_owns_goal:
                     continuation_prompt = str(decision.get("continuation_prompt") or "").strip()
                     continuation_id = None
                     if continuation_prompt:
@@ -3425,6 +3436,15 @@ def _run_gateway_chat_streaming(
                                 "decision": decision,
                             })
                         else:
+                            # Review 5603344218 Must fix 2: dispatcher ownership
+                            # stays with the record. With no subscriber the
+                            # server is the only dispatcher, so mark the record
+                            # detached-owned; a stopped runner is then retried
+                            # with this same continuation ID on /goal resume and
+                            # when the session goes idle.
+                            mark_detached_goal_continuation(
+                                session_id, str(continuation_id or "")
+                            )
                             _detached_goal_continuation_prompt = continuation_prompt
                             _detached_goal_continuation_id = continuation_id
         except Exception as goal_exc:
@@ -3507,6 +3527,23 @@ def _run_gateway_chat_streaming(
             except Exception:
                 logger.debug(
                     "Failed to start detached gateway goal continuation for %s",
+                    session_id,
+                    exc_info=True,
+                )
+        elif not cancel_event.is_set():
+            # Review 5603344218 Must fix 2, idle half: this turn ended without
+            # handing off a continuation, so any WebUI-owned (detached) record
+            # whose runner stopped — preflight skipped a queued/active turn, or
+            # admission rejected the wakeup — is retried now that the session
+            # is idle. Its existing continuation ID is reused, so at most one
+            # admission can win. Browser-owned records are left alone.
+            try:
+                from api.goals import retry_detached_goal_continuation
+
+                retry_detached_goal_continuation(session_id)
+            except Exception:
+                logger.debug(
+                    "Failed to retry a detached gateway goal continuation for %s",
                     session_id,
                     exc_info=True,
                 )
