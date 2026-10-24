@@ -429,24 +429,59 @@ def _mirror_pin_to_state_db(session, pinned: bool) -> None:
         logger.debug("Failed to mirror pin state to state.db", exc_info=True)
 
 
+def _state_db_pin_owner(profile) -> str | None:
+    """Canonical state.db owner of a logical profile name, or None when unresolvable.
+
+    The owner is the home whose ``state.db`` the name reads, so root and renamed-root
+    aliases collapse to one key while two named profiles stay apart. Returning None for
+    an unshaped name keeps a malformed tag from claiming another profile's pins.
+    """
+    name = str(profile or "").strip() or "default"
+    try:
+        from api import profiles as profiles_api
+        if not (profiles_api._is_root_profile(name) or profiles_api._PROFILE_ID_RE.fullmatch(name)):
+            return None
+        return str(Path(profiles_api._resolve_profile_home_for_name(name)).expanduser().resolve())
+    except Exception:
+        logger.debug("Failed to resolve the state.db owner of profile %r", name, exc_info=True)
+        return None
+
+
 def _stamp_state_db_pins(rows: list[dict], profiles) -> None:
-    """Mark rows pinned in a requested profile's state.db, as an extra input to the sidecar.
+    """Mark rows pinned in their own profile's state.db, as an extra input to the sidecar.
 
     The sidecar stays the authority, so a state.db pin only ever adds to a row's flag: a
     WebUI pin whose mirror write lost the lock still renders pinned, while a pin made in
-    Desktop or the CLI shows up here. Read-only; nothing is written while building a list.
+    Desktop or the CLI shows up here. Pin sets stay keyed by the owner whose database
+    produced them, so the same session id kept in two profiles cannot borrow the other's
+    pin; root and renamed-root aliases share one key. Only the requested profiles'
+    databases are opened, and only for reading.
     """
     from api.state_sync import read_state_db_pinned_ids
-    pinned: set[str] = set()
+    owners: dict[str, str | None] = {}
+
+    def owner_of(profile) -> str | None:
+        name = str(profile or "").strip() or "default"
+        if name not in owners:
+            owners[name] = _state_db_pin_owner(name)
+        return owners[name]
+
+    pins_by_owner: dict[str, set[str]] = {}
     for name in profiles:
-        pinned |= read_state_db_pinned_ids(name)
-    if not pinned:
+        owner = owner_of(name)
+        if owner is None or owner in pins_by_owner:
+            continue
+        pins_by_owner[owner] = read_state_db_pinned_ids(name)
+    if not any(pins_by_owner.values()):
         return
     for row in rows:
         if not isinstance(row, dict):
             continue
         sid = str(row.get("session_id") or "").strip()
-        if sid and sid in pinned:
+        if not sid:
+            continue
+        pinned = pins_by_owner.get(owner_of(row.get("profile")))
+        if pinned and sid in pinned:
             row["pinned"] = True
 
 
@@ -20343,7 +20378,8 @@ def handle_post(handler, parsed) -> bool:
                 s.pinned = pin_requested
                 s.save()
         # The sidecar save above is the pin. Mirror it to state.db for Desktop/CLI
-        # visibility, best-effort: the mirror can never fail or delay this response.
+        # visibility, best-effort: it never fails this response, and its wait is
+        # bounded by the short (~0.5 s) busy timeout.
         _mirror_pin_to_state_db(s, pin_requested)
         publish_session_list_changed(
             "session_pin",

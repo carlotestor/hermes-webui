@@ -115,8 +115,12 @@ def _pin_endpoint(monkeypatch, sessions, *, limit=10):
     return post
 
 
-def _sidebar_rows(monkeypatch, rows, *, active_profile="default", all_profiles=False):
-    """Build the sidebar payload over *rows*, with listing and pruning stubbed out."""
+def _sidebar_payload(monkeypatch, rows, *, active_profile="default", all_profiles=False):
+    """Build the sidebar payload over *rows*, with listing and pruning stubbed out.
+
+    Returns the row list in payload order, so two profiles that keep the same session
+    id stay distinguishable.
+    """
     from api import routes
 
     monkeypatch.setattr(
@@ -138,7 +142,16 @@ def _sidebar_rows(monkeypatch, rows, *, active_profile="default", all_profiles=F
         show_cron_sessions=False,
         include_archived=False,
     )
-    return {row["session_id"]: row for row in payload["sessions"]}
+    return payload["sessions"]
+
+
+def _sidebar_rows(monkeypatch, rows, *, active_profile="default", all_profiles=False):
+    return {
+        row["session_id"]: row
+        for row in _sidebar_payload(
+            monkeypatch, rows, active_profile=active_profile, all_profiles=all_profiles,
+        )
+    }
 
 
 # ── the pin route never fails because of the mirror ──────────────────────────
@@ -173,7 +186,7 @@ def test_pin_and_unpin_save_the_sidecar_while_another_writer_holds_state_db(tmp_
         elapsed = time.monotonic() - started
         assert status == 200
         assert sessions["s1"].saved is True
-        # A short busy timeout, not the request's problem: the user is not made to wait.
+        # The wait is bounded by the short busy timeout (~0.5 s), not unbounded.
         assert elapsed < 3
         assert _db_snapshot(db)[1] == {"s1": False}
         assert post("s1", False)[0] == 200
@@ -278,6 +291,69 @@ def test_profile_a_sidebar_never_reads_or_writes_profile_b(tmp_path, monkeypatch
     assert opened == [str(db_a)]
     assert {sid: row["pinned"] for sid, row in rows.items()} == {"s1": False, "s2": True}
     assert (db_b.read_bytes(), _db_snapshot(db_b)) == before_b
+
+
+def test_all_profiles_same_id_keeps_each_owners_own_pin(tmp_path, monkeypatch):
+    """A copied/restored history id in two profiles must not borrow the other's pin."""
+    homes = _homes(tmp_path, monkeypatch, names=("default", "work"))
+    # A/default keeps s1 unpinned; B/work pins its own s1 and one other session.
+    _make_state_db(homes["default"] / "state.db", rows=(("s1", 0),))
+    _make_state_db(homes["work"] / "state.db", rows=(("s1", 1), ("b_other", 0), ("b_pinned", 1)))
+
+    rows = _sidebar_payload(monkeypatch, [
+        {"session_id": "s1", "profile": "default", "pinned": False, "session_source": "webui"},
+        {"session_id": "b_other", "profile": "work", "pinned": False, "session_source": "webui"},
+        {"session_id": "b_pinned", "profile": "work", "pinned": False, "session_source": "webui"},
+    ], all_profiles=True)
+
+    assert {(row["profile"], row["session_id"]): row["pinned"] for row in rows} == {
+        ("default", "s1"): False,
+        ("work", "b_other"): False,
+        ("work", "b_pinned"): True,
+    }
+
+
+def test_all_profiles_same_id_marks_only_the_owning_row(tmp_path, monkeypatch):
+    """One row per owner, same id: only work's row renders pinned."""
+    homes = _homes(tmp_path, monkeypatch, names=("default", "work"))
+    _make_state_db(homes["default"] / "state.db", rows=(("s1", 0),))
+    _make_state_db(homes["work"] / "state.db", rows=(("s1", 1),))
+
+    rows = _sidebar_payload(monkeypatch, [
+        {"session_id": "s1", "profile": "default", "pinned": False, "session_source": "webui"},
+        {"session_id": "s1", "profile": "work", "pinned": False, "session_source": "webui"},
+    ], all_profiles=True)
+
+    assert {(row["profile"], row["session_id"]): row["pinned"] for row in rows} == {
+        ("default", "s1"): False,
+        ("work", "s1"): True,
+    }
+
+
+def test_renamed_root_and_default_rows_share_one_pin_owner(tmp_path, monkeypatch):
+    """Root/default alias equivalence survives the owner-keyed read."""
+    import api.profiles as profiles
+
+    homes = _homes(tmp_path, monkeypatch, names=("default", "work"))
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda name: (name or "default") in ("default", "kinni"))
+    monkeypatch.setattr(
+        profiles, "_resolve_profile_home_for_name",
+        lambda name: str(homes["default"] if (name or "default") in ("default", "kinni") else homes["work"]),
+    )
+    _make_state_db(homes["default"] / "state.db", rows=(("s1", 0), ("root_pinned", 1)))
+    _make_state_db(homes["work"] / "state.db", rows=(("w_pinned", 1),))
+
+    rows = _sidebar_payload(monkeypatch, [
+        {"session_id": "s1", "profile": "default", "pinned": False, "session_source": "webui"},
+        {"session_id": "root_pinned", "profile": "kinni", "pinned": False, "session_source": "webui"},
+        {"session_id": "w_pinned", "profile": "work", "pinned": False, "session_source": "webui"},
+    ], all_profiles=True)
+
+    assert {(row["profile"], row["session_id"]): row["pinned"] for row in rows} == {
+        ("default", "s1"): False,
+        ("kinni", "root_pinned"): True,
+        ("work", "w_pinned"): True,
+    }
 
 
 def test_agent_projection_carries_the_state_db_pin(tmp_path, monkeypatch):

@@ -397,7 +397,8 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
 
 
 # A pin mirrors with a short busy timeout: Desktop or the CLI can hold the
-# state.db write lock, and a pin must never wait long or fail on that account.
+# state.db write lock, so the wait is bounded (~0.5 s) rather than unbounded, and
+# a pin must never fail on that account.
 PIN_MIRROR_TIMEOUT_S = 0.5
 
 
