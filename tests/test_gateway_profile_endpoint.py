@@ -49,7 +49,11 @@ def test_shared_url_loaded_from_root_env_reaches_named_profile(homes, monkeypatc
     (root / ".env").write_text("HERMES_WEBUI_GATEWAY_BASE_URL=http://shared-gw:7000\nAPI_SERVER_KEY=root-key-0123456789\n")
     (work / ".env").write_text("API_SERVER_KEY=work-key-0123456789\n")
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://shared-gw:7000")
-    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {"HERMES_WEBUI_GATEWAY_BASE_URL", "API_SERVER_KEY"})
+    # Root-home values are shared, never profile-sourced (#8432): model startup, where the launch home is the root
+    # home and its .env is the snapshot a launcher preloaded.
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", set())
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", str(root))
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME_DOTENV", {"HERMES_WEBUI_GATEWAY_BASE_URL": "http://shared-gw:7000"})
 
     assert gateway_chat._gateway_endpoint_for_profile("work") == ("http://shared-gw:7000/p/work", "work-key-0123456789")
 
