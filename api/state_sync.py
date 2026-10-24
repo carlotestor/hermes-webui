@@ -19,10 +19,13 @@ any double-counting risk.
 import logging
 import ntpath
 import os
+import sqlite3
 import threading
 from contextlib import closing
 from pathlib import Path
 from typing import Optional
+
+from api.agent_sessions import open_state_db_readonly, state_db_file_uri
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,7 @@ def _get_state_db(profile: Optional[str] = None):
     db_path = _resolve_state_db_path(profile)
     if db_path is None:
         return None
+
     try:
         return SessionDB(db_path)
     except Exception:
@@ -66,7 +70,7 @@ def _get_state_db(profile: Optional[str] = None):
 
 
 def _resolve_state_db_path(profile: Optional[str] = None) -> Optional[Path]:
-    """Path of the profile's existing state.db, or None (see ``_get_state_db``)."""
+    """Path of *profile*'s existing state.db, or None (see ``_get_state_db``)."""
     if profile is not None:
         # Explicit-profile path — a resolution failure here MUST NOT
         # silently fall back to HERMES_HOME or the caller's "write to
@@ -392,111 +396,59 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
             logger.debug("Failed to close state.db")
 
 
-def state_db_knows_session(session_id: str, profile: Optional[str] = None) -> Optional[bool]:
-    """Whether ``session_id`` has a state.db row; no state.db is False, an unreadable one None.
-
-    Read with sqlite directly so a missing ``hermes_state`` cannot turn an existing row into "absent".
-    """
-    db_path = _resolve_state_db_path(profile)
-    if db_path is None:
-        return False
-    try:
-        from api.agent_sessions import open_state_db_readonly
-        with closing(open_state_db_readonly(db_path)) as conn:
-            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").fetchone():
-                return False
-            row = conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
-        return row is not None
-    except Exception:
-        logger.debug("state.db lookup failed for %s", session_id, exc_info=True)
-        return None
-
-
-# Default wait for the state.db write lock on a user-initiated pin; background
-# migration/carry callers pass a much shorter one so a busy Agent writer cannot
-# stall the sidebar (the pin stays pending and is retried on the next build).
-PIN_WRITE_TIMEOUT_S = 5.0
-_CANONICAL_BOT_CHAT_TITLE = "Bot Chat"
-
-
-def _continuation_lineage_cte(columns: set) -> str:
-    """``lineage(id)`` over verified continuation edges only (forks/branches/delegates/resets excluded).
-
-    Binds the start id once; descendants start from every ancestor so sibling continuations
-    of a shared parent are covered. Hermes Agent's ``set_session_pinned`` follows every child of a
-    compression-ended parent, so a fork would share its parent's pin; this walk does not.
-    """
-    from api.agent_sessions import continuation_edge_sql
-    edge = continuation_edge_sql("parent", "child", columns)
-    return (
-        "WITH RECURSIVE"
-        " ancestors(id) AS (SELECT ? UNION SELECT parent.id FROM ancestors a"
-        " JOIN sessions child ON child.id = a.id JOIN sessions parent ON parent.id = child.parent_session_id"
-        f" WHERE {edge}),"
-        " descendants(id) AS (SELECT id FROM ancestors UNION SELECT child.id FROM descendants d"
-        " JOIN sessions parent ON parent.id = d.id JOIN sessions child ON child.parent_session_id = parent.id"
-        f" WHERE {edge}),"
-        " lineage(id) AS (SELECT id FROM ancestors UNION SELECT id FROM descendants) "
-    )
-
-
-def _write_pin_lineage(db_path: Path, session_id: str, pinned: bool, timeout: float) -> bool:
-    """Set ``pinned`` on *session_id*'s continuation lineage in one ``BEGIN IMMEDIATE`` transaction.
-
-    Pinning also clears ``hidden`` (as the Agent setter does) unless the row is the canonical
-    hidden Bot Chat. False when the row is absent, the schema has no pin column, or the lock
-    is not obtained within *timeout*.
-    """
-    import sqlite3
-    from api.agent_sessions import state_db_file_uri
-    conn = sqlite3.connect(state_db_file_uri(Path(db_path).resolve()), uri=True,
-                           timeout=max(0.0, float(timeout)), isolation_level=None)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(sessions)")}
-            if not {"id", "pinned"} <= cols:
-                conn.execute("ROLLBACK")
-                return False
-            row = conn.execute(
-                "SELECT " + ("hidden, title" if {"hidden", "title"} <= cols else "0, NULL")
-                + " FROM sessions WHERE id = ?", (session_id,),
-            ).fetchone()
-            if row is None:
-                conn.execute("ROLLBACK")
-                return False
-            if {"parent_session_id", "end_reason"} <= cols:
-                lineage = _continuation_lineage_cte(cols) + "SELECT id FROM lineage"
-                params = (session_id,)
-            else:
-                lineage, params = "SELECT ?", (session_id,)
-            conn.execute(f"UPDATE sessions SET pinned = ? WHERE id IN ({lineage})", (int(bool(pinned)), *params))
-            canonical_bot_chat = bool(row[0]) and (row[1] or "") == _CANONICAL_BOT_CHAT_TITLE
-            if pinned and "hidden" in cols and not canonical_bot_chat:
-                conn.execute(f"UPDATE sessions SET hidden = 0 WHERE id IN ({lineage})", params)
-            conn.execute("COMMIT")
-        except BaseException:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-            raise
-        stored = conn.execute("SELECT pinned FROM sessions WHERE id = ?", (session_id,)).fetchone()
-        return stored is not None and bool(stored[0]) == bool(pinned)
-    finally:
-        conn.close()
+# A pin mirrors with a short busy timeout: Desktop or the CLI can hold the
+# state.db write lock, and a pin must never wait long or fail on that account.
+PIN_MIRROR_TIMEOUT_S = 0.5
 
 
 def sync_session_pinned(session_id: str, pinned: bool, profile: Optional[str] = None,
-                        *, timeout: float = PIN_WRITE_TIMEOUT_S) -> bool:
-    """Pin the session's continuation lineage in state.db, the record Desktop and the CLI share.
+                        *, timeout: float = PIN_MIRROR_TIMEOUT_S) -> bool:
+    """Mirror a pin into *profile*'s ``sessions.pinned``, the flag Desktop and the CLI share.
 
-    Not gated by sync_to_insights. True when the row now holds *pinned*. Waits at most
-    *timeout* seconds for the write lock.
+    Best-effort by design: the WebUI sidecar is the authority and is already saved, so a
+    missing row, a schema without the column, or a lock held elsewhere returns False after
+    logging at debug. Nothing is queued; the next pin/unpin carries the change over.
     """
     db_path = _resolve_state_db_path(profile)
     if db_path is None:
         return False
     try:
-        return _write_pin_lineage(db_path, session_id, pinned, timeout)
+        with closing(sqlite3.connect(
+            state_db_file_uri(Path(db_path).resolve()),
+            uri=True,
+            timeout=max(0.0, float(timeout)),
+            isolation_level=None,
+        )) as conn:
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")}
+            if not {"id", "pinned"} <= columns:
+                return False
+            cur = conn.execute(
+                "UPDATE sessions SET pinned = ? WHERE id = ?",
+                (int(bool(pinned)), session_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
     except Exception:
-        logger.debug("Failed to sync pin state to state.db for %s", session_id, exc_info=True)
+        logger.debug("Failed to mirror pin state for %s into state.db", session_id, exc_info=True)
         return False
+
+
+def read_state_db_pinned_ids(profile: Optional[str] = None) -> set[str]:
+    """Ids pinned in *profile*'s own state.db; empty when unreadable or without the column.
+
+    Read-only, and never another profile's database: a profile whose state.db is missing
+    contributes nothing instead of falling back to the active profile (#2762).
+    """
+    db_path = _resolve_state_db_path(profile)
+    if db_path is None:
+        return set()
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            return {
+                str(row[0]).strip()
+                for row in conn.execute("SELECT id FROM sessions WHERE pinned")
+                if row[0]
+            }
+    except Exception:
+        logger.debug("Failed to read pinned sessions from %s", db_path, exc_info=True)
+        return set()
