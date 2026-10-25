@@ -19819,9 +19819,8 @@ def handle_post(handler, parsed) -> bool:
         if not command:
             return bad(handler, "command is required")
         if command.split()[0].lower() in ("/loop", "loop"):
-            from api.loops import run_loop_command  # session_id ownership: generic POST guard above
-            sid = str(body.get("session_id", "") or "")
-            return j(handler, {"output": run_loop_command(sid, command.partition(" ")[2],
+            from api.loops import run_loop_command  # session_id ownership: the generic POST guard above
+            return j(handler, {"output": run_loop_command(str(body.get("session_id") or ""), command.partition(" ")[2],
                                                           request_profile=_get_active_profile_name())})
 
         try:

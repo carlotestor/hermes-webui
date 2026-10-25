@@ -1,30 +1,69 @@
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 from tests.conftest import requires_agent_modules
 
 
+def _src(rel):
+    return (Path(__file__).resolve().parents[1] / rel).read_text(encoding="utf-8")
+
+
+def _due(agent, sid="s1"):
+    s = agent.load_loop(sid)
+    s.next_due_at = 0
+    agent.save_loop(sid, s)
+
+
+def _loop(agent, loops, sid="s1", home=None):
+    """The stored loop state, read in `home`'s profile store."""
+    with loops._home(home):
+        return agent.load_loop(sid)
+
+
+def _setup(tmp_path, monkeypatch, session, cmd="5m check", due=True, get_session=None, home=None, root=None):
+    """Sandboxed loop store for one session; `cmd` starts its loop and `due` makes that loop due."""
+    from hermes_cli import goals, loops as agent
+    from api import background_process, loops, models, profiles, routes, streaming
+    from api.process_event_utils import build_active_turn_token
+    started = []
+    monkeypatch.setattr(goals, "_DB_CACHE", {})
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", home or (lambda p: tmp_path / (p or "default")))
+    monkeypatch.setattr(profiles, "_profiles_root", lambda: root or tmp_path / "none")
+    monkeypatch.setattr(background_process, "_session_has_active_turn", lambda sid: False)
+    for mod in (models, streaming):
+        monkeypatch.setattr(mod, "get_session", get_session or (lambda sid, **kw: session))
+
+    def start(sid, msg, source):  # stamps the wakeup user row the way _start_run does
+        started.append(msg)
+        stream, at = f"stream{len(started)}", 1000.0 + len(started)
+        session.messages.append({"role": "user", "content": msg, "_source": source, "timestamp": at,
+                                 "_active_turn_token": build_active_turn_token(stream, at)})
+        return {"stream_id": stream, "pending_started_at": at}
+
+    monkeypatch.setattr(routes, "start_session_turn", start)
+    if cmd:
+        loops.run_loop_command("s1", cmd)
+    if due:
+        with loops._home(None):
+            _due(agent)
+    return agent, loops, started
+
+
 @requires_agent_modules
 def test_webui_loop_matches_cli(tmp_path, monkeypatch):
-    from hermes_cli import goals, loops as agent
-    from api import background_process, loops, models, profiles, routes
-    msgs, started = [], []
-    monkeypatch.setattr(goals, "_DB_CACHE", {})
-    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda p: tmp_path)
-    monkeypatch.setattr(profiles, "_profiles_root", lambda: tmp_path / "none")
-    monkeypatch.setattr(models, "get_session", lambda sid, **kw: NS(profile=None, messages=msgs))
-    monkeypatch.setattr(background_process, "_session_has_active_turn", lambda sid: False)
-    monkeypatch.setattr(routes, "start_session_turn",
-                        lambda sid, m, source: started.append(m) or {"pending_started_at": float(len(started))})
+    from hermes_cli import goals
+    session = NS(session_id="s1", profile=None, messages=[])
+    agent, loops, started = _setup(tmp_path, monkeypatch, session, cmd="", due=False)
 
     def tick(reply, max_ticks=100):  # a due tick fires, its turn ends with `reply`, the scheduler judges it
-        s = agent.load_loop("s1")
-        s.next_due_at, s.max_ticks = 0, max_ticks
-        agent.save_loop("s1", s)
+        with loops._home(None):
+            s = agent.load_loop("s1")
+            s.next_due_at, s.max_ticks = 0, max_ticks
+            agent.save_loop("s1", s)
         loops.run_due_loops()
-        msgs.extend([{"role": "user", "content": started[-1], "timestamp": float(len(started))},
-                     {"role": "assistant", "content": reply}])
+        session.messages.append({"role": "assistant", "content": reply})
         loops.run_due_loops()
-        return agent.load_loop("s1")
+        return _loop(agent, loops)
 
     out = loops.run_loop_command("s1", "5m check the deploy")
     with loops._home(None):
@@ -53,30 +92,18 @@ def test_webui_loop_matches_cli(tmp_path, monkeypatch):
 
 @requires_agent_modules
 def test_webui_loop_greptile_regressions(tmp_path, monkeypatch):
-    from hermes_cli import goals, loops as agent
-    from api import background_process, loops, models, profiles, routes
-    msgs, started = [{"role": "assistant", "content": "old\nLOOP_COMPLETE"}], []
-    monkeypatch.setattr(goals, "_DB_CACHE", {})
-    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda p: tmp_path)
-    monkeypatch.setattr(profiles, "_profiles_root", lambda: tmp_path / "none")
-    monkeypatch.setattr(background_process, "_session_has_active_turn", lambda sid: False)
+    from api import routes
+    session = NS(session_id="s1", profile=None, messages=[{"role": "assistant", "content": "old\nLOOP_COMPLETE"}])
 
-    def get_session(sid, **kw):
+    def find(sid, **kw):
         if sid != "s1":
             raise KeyError(sid)
-        return NS(profile=None, messages=msgs)
+        return session
 
-    monkeypatch.setattr(models, "get_session", get_session)
+    agent, loops, started = _setup(tmp_path, monkeypatch, session, cmd="", due=False, get_session=find)
     # Unknown session: fail closed instead of writing the default profile's state.db.
     assert loops.run_loop_command("gone", "5m x") == "/loop: open a saved chat first."
-    with loops._home(None):
-        assert agent.load_loop("gone") is None
-
-    def due():
-        s = agent.load_loop("s1")
-        s.next_due_at = 0
-        agent.save_loop("s1", s)
-
+    assert _loop(agent, loops, "gone") is None
     loops.run_loop_command("s1", "5m check")
 
     def boom(*a, **kw):
@@ -84,14 +111,14 @@ def test_webui_loop_greptile_regressions(tmp_path, monkeypatch):
 
     monkeypatch.setattr(routes, "start_session_turn", boom)
     with loops._home(None):
-        due()
+        _due(agent)
         loops.run_due_loops()
         s = agent.load_loop("s1")  # a start that raised is rolled back, never judged later
         assert s.ticks_fired == 0 and not s.awaiting_response and s.status == "active"
         monkeypatch.setattr(routes, "start_session_turn", lambda sid, m, source: started.append(m) or {})
-        due()
+        _due(agent)
         loops.run_due_loops()
-        msgs.append({"role": "user", "content": started[-1]})  # wakeup turn ended with no reply
+        session.messages.append({"role": "user", "content": started[-1]})  # wakeup turn ended with no reply
         loops.run_due_loops()
         s = agent.load_loop("s1")  # the older LOOP_COMPLETE reply is not this tick's reply
         assert s.status == "active" and s.ticks_fired == 1 and not s.awaiting_response
@@ -99,32 +126,17 @@ def test_webui_loop_greptile_regressions(tmp_path, monkeypatch):
 
 @requires_agent_modules
 def test_isolated_profile_loop_launches_without_scanning_siblings(tmp_path, monkeypatch):
-    from hermes_cli import goals, loops as agent
-    from api import background_process, loops, models, profiles, routes
+    from api import profiles
     (tmp_path / "profiles" / "bob").mkdir(parents=True)
-    homes, started = [], []
-    monkeypatch.setattr(goals, "_DB_CACHE", {})
+    homes = []
+    session = NS(session_id="s1", profile="alice", messages=[])
+    agent, loops, started = _setup(tmp_path, monkeypatch, session, due=False, root=tmp_path / "profiles",
+                                   home=lambda p: homes.append(p) or tmp_path)
     monkeypatch.setattr(profiles, "_is_isolated_profile_mode", lambda: True)
     monkeypatch.setattr(profiles, "_isolated_profile_name", lambda: "alice")
-    monkeypatch.setattr(profiles, "_profiles_root", lambda: tmp_path / "profiles")
-    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda p: homes.append(p) or tmp_path)
-    monkeypatch.setattr(models, "get_session", lambda sid, **kw: NS(profile="alice", messages=[]))
-    monkeypatch.setattr(background_process, "_session_has_active_turn", lambda sid: False)
-    monkeypatch.setattr(routes, "start_session_turn", lambda sid, m, source: started.append(m) or {})
-    loops.run_loop_command("s1", "5m check")
     with loops._home("alice"):
-        s = agent.load_loop("s1")
-        s.next_due_at = 0
-        agent.save_loop("s1", s)
+        _due(agent)
     homes.clear()
     loops.run_due_loops()
-    with loops._home("alice"):
-        assert agent.load_loop("s1").status == "active"
+    assert _loop(agent, loops, home="alice").status == "active"
     assert len(started) == 1 and homes[0] == "alice" and None not in homes and "bob" not in homes
-
-
-def test_loop_controls_bypass_busy_routing():
-    from pathlib import Path
-    src = (Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text(encoding="utf-8")
-    busy = src[src.index("Busy-control slash commands must be intercepted"):src.index("const defaultMessageMode=")]
-    assert "_pc.name==='loop'" in busy and "executeAgentCommand(text,{name:'loop'})" in busy

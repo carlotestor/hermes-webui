@@ -44,19 +44,14 @@ def _wakeup_outcome(messages, turn):
     """(cancelled, reply) of the recorded wakeup turn, read from that turn's own rows only."""
     from types import SimpleNamespace
     from api.streaming import _session_has_cancel_marker
-    msgs = list(messages or [])
-    turn = turn or {}
+    msgs, turn = list(messages or []), turn or {}
     token, at = turn.get("token"), turn.get("started_at")
-
-    def _is_wakeup(m):  # Stop's recovered row carries the same token
-        return bool((token and m.get("_active_turn_token") == token) or (at and m.get("timestamp") == at))
     for i, m in enumerate(msgs):
-        if m.get("role") == "user" and _is_wakeup(m):
-            rows = []
-            for n in msgs[i + 1:]:
-                if n.get("role") == "user":
-                    break
-                rows.append(n)
+        # Stop's recovered row carries the same token; a pre-upgrade row only the exact pending time.
+        if m.get("role") == "user" and ((token and m.get("_active_turn_token") == token)
+                                        or (at and m.get("timestamp") == at)):
+            end = next((j for j in range(i + 1, len(msgs)) if msgs[j].get("role") == "user"), len(msgs))
+            rows = msgs[i + 1:end]
             replies = [n for n in rows if n.get("role") == "assistant"]
             return (_session_has_cancel_marker(SimpleNamespace(messages=rows)),
                     str(replies[-1].get("content") or "") if replies else "")
@@ -65,8 +60,7 @@ def _wakeup_outcome(messages, turn):
 
 def _turn_record(db, sid):
     """The wakeup turn fired for this loop; walks the whole compression parent chain, then re-keys it to sid."""
-    raw = db.get_meta(_TURN_PREFIX + sid)
-    seen, cur = {sid}, sid
+    raw, seen, cur = db.get_meta(_TURN_PREFIX + sid), {sid}, sid
     while raw is None:  # several rotations in one wakeup leave the record on an older ancestor
         cur = (db.get_session(cur) or {}).get("parent_session_id")
         if not cur or cur in seen:
@@ -150,12 +144,12 @@ def run_loop_command(session_id, args, request_profile=None):
     return out["output"]
 
 
-def _conditional_manager():
+def _conditional_manager(session_id, db):
+    """LoopManager for one session whose saves only land if the row is still the one this pass read."""
     from hermes_cli import loops as cli
 
     class _CasLoop(cli.LoopManager):
-        """LoopManager whose saves only land if the row is still the one this pass read."""
-        def __init__(self, session_id, db):
+        def __init__(self):
             self.session_id, self._db, self._key = session_id, db, cli._meta_key(session_id)
             self._raw = db.get_meta(self._key)
             self._state = cli._parse_state(self._raw, session_id) if self._raw else None
@@ -168,7 +162,7 @@ def _conditional_manager():
             else:
                 self.lost = True  # a /loop command or another process changed it first
             return self._state
-    return _CasLoop
+    return _CasLoop()
 
 
 def _run_one(profile, sid):
@@ -181,7 +175,7 @@ def _run_one(profile, sid):
     db = cli._get_session_db()
     if db is None:
         return
-    mgr = _conditional_manager()(sid, db)
+    mgr = _conditional_manager(sid, db)
     state = mgr.state
     if (state is None or state.status != "active" or (state.route or {}).get("platform") != "webui"
             or _session_has_active_turn(sid)):
@@ -218,10 +212,9 @@ def _run_one(profile, sid):
         if status >= 400:
             mgr.clear() if status == 404 else mgr.abandon_tick()
             return
-        at = resp.get("pending_started_at")
+        at, stream = resp.get("pending_started_at"), resp.get("stream_id")
         db.set_meta(_TURN_PREFIX + sid, json.dumps(
-            {"token": build_active_turn_token(resp.get("stream_id"), at), "started_at": at,
-             "stream_id": resp.get("stream_id")}))
+            {"token": build_active_turn_token(stream, at), "started_at": at, "stream_id": stream}))
     except KeyError:  # session deleted
         mgr.clear()
 
@@ -230,10 +223,9 @@ def run_due_loops():
     from api.profiles import _is_isolated_profile_mode, _isolated_profile_name, _profiles_root
     from hermes_cli.loops import list_active_loops
     root = _profiles_root()
-    if _is_isolated_profile_mode():  # only the pinned profile, under its real name, or _run_one clears its loops
-        profiles = [_isolated_profile_name()]
-    else:
-        profiles = [None] + (sorted(p.name for p in root.iterdir() if p.is_dir()) if root.is_dir() else [])
+    # Isolated mode: only the pinned profile, under its real name, or _run_one clears its own loops.
+    profiles = [_isolated_profile_name()] if _is_isolated_profile_mode() else [None] + (
+        sorted(p.name for p in root.iterdir() if p.is_dir()) if root.is_dir() else [])
     for profile in profiles:
         with _home(profile):
             for sid, state in list_active_loops():

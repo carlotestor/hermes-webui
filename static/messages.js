@@ -1639,8 +1639,7 @@ async function send(){
           // /loop status|pause|stop must reach the loop while its own wakeup turn runs.
           $('msg').value='';autoResize();
           S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
-          // Capture the owning chat: loadSession replaces S.messages if the user switches chats mid-request.
-          const _loopSid=S.session&&S.session.session_id, _loopMsgs=S.messages;
+          const _loopSid=S.session&&S.session.session_id,_loopMsgs=S.messages;  // the owning chat: a switch replaces S.messages
           let _out;
           try{_out=await executeAgentCommand(text,{name:'loop'});}catch(e){_out='Agent command error: '+(e&&e.message||e);}
           _loopMsgs.push({role:'assistant',content:String(_out||'(no output)'),_ts:Date.now()/1000});

@@ -1,50 +1,14 @@
-import pytest
 import threading
-from pathlib import Path
 from types import SimpleNamespace as NS
+
+import pytest
 
 from tests.conftest import requires_agent_modules
 from tests import test_issue7193_eager_start_rollback as _r7193
+from tests.test_loop_webui import _due, _loop, _setup, _src
 
 _start7193 = _r7193._start
 issue7193_env = _r7193.issue7193_env  # reused fixture: the eager chat-start sandbox
-
-
-def _src(rel):
-    return (Path(__file__).resolve().parents[1] / rel).read_text(encoding="utf-8")
-
-
-def _setup(tmp_path, monkeypatch, session, due=True):
-    """Sandboxed loop store on one session; `due` makes its loop due without firing it."""
-    from hermes_cli import goals, loops as agent
-    from api import background_process, loops, models, profiles, routes
-    from api.process_event_utils import build_active_turn_token
-    started = []
-    monkeypatch.setattr(goals, "_DB_CACHE", {})
-    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda p: tmp_path / (p or "default"))
-    monkeypatch.setattr(profiles, "_profiles_root", lambda: tmp_path / "none")
-    monkeypatch.setattr(models, "get_session", lambda sid, **kw: session)
-    monkeypatch.setattr(background_process, "_session_has_active_turn", lambda sid: False)
-
-    def start(sid, msg, source):  # records the wakeup user row the way _start_run stamps it
-        started.append(msg)
-        sid_, at = f"stream{len(started)}", 1000.0 + len(started)
-        session.messages.append({"role": "user", "content": msg, "_source": source, "timestamp": at,
-                                 "_active_turn_token": build_active_turn_token(sid_, at)})
-        return {"stream_id": sid_, "pending_started_at": at}
-
-    monkeypatch.setattr(routes, "start_session_turn", start)
-    loops.run_loop_command("s1", "5m check")
-    if due:
-        with loops._home(None):
-            _due(agent)
-    return agent, loops, started
-
-
-def _due(agent, sid="s1"):
-    s = agent.load_loop(sid)
-    s.next_due_at = 0
-    agent.save_loop(sid, s)
 
 
 @requires_agent_modules
@@ -58,9 +22,7 @@ def test_retag_session_profile_clears_old_loop_only_on_a_move(
     agent, loops, _ = _setup(tmp_path, monkeypatch, session, due=False)
     from api.routes import _retag_empty_session_profile
     assert loops.retag_session_profile(session, "b", _retag_empty_session_profile) == (expected_profile, result)
-    assert session.profile == expected_profile
-    with loops._home(None):
-        assert agent.load_loop("s1").status == loop_status
+    assert session.profile == expected_profile and _loop(agent, loops).status == loop_status
     if result == "retagged":  # both retag sites go through the helper, carrying the request profile
         src = _src("api/routes.py")
         assert src.count("retag_session_profile(\n") == 2
@@ -84,9 +46,7 @@ def test_pass_launches_nothing_after_a_concurrent_move_or_stop(tmp_path, monkeyp
 
     monkeypatch.setattr(agent, "goal_blocks_loop_tick", mid_pass)
     loops.run_due_loops()
-    assert started == []
-    with loops._home(None):
-        assert agent.load_loop("s1").status == "cleared"  # the loop left in profile a is dropped
+    assert started == [] and _loop(agent, loops).status == "cleared"  # the loop left in profile a is dropped
 
 
 @requires_agent_modules
@@ -105,9 +65,7 @@ def test_stop_command_waits_for_scheduler_pass(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "goal_blocks_loop_tick", race)
     loops.run_due_loops()
     t[0].join(10)
-    assert out == ["✓ Loop stopped."]
-    with loops._home(None):
-        assert agent.load_loop("s1").status == "cleared"
+    assert out == ["✓ Loop stopped."] and _loop(agent, loops).status == "cleared"
     loops.run_due_loops()
     assert len(started) == 1  # never brought back after stop reported success
 
@@ -121,8 +79,7 @@ def test_user_turn_before_judgment_does_not_decide_tick(tmp_path, monkeypatch):
                          {"role": "user", "content": "unrelated", "timestamp": 2000.0},
                          {"role": "assistant", "content": "sure\nLOOP_COMPLETE"}]
     loops.run_due_loops()
-    with loops._home(None):
-        s = agent.load_loop("s1")
+    s = _loop(agent, loops)
     assert s.status == "active" and not s.awaiting_response and s.ticks_fired == 1
 
 
@@ -143,8 +100,7 @@ def test_loop_command_rechecks_profile_under_retag_lock(tmp_path, monkeypatch):
     # the retag lands after the route's ownership check, before the command
     loops.retag_session_profile(session, "b", lambda s, p: (setattr(s, "profile", p), (p, "retagged"))[1])
     assert "another profile" in loops.run_loop_command("s1", "5m check", request_profile="default")
-    with loops._home("b"):
-        assert agent.load_loop("s1") is None  # profile b's store was never written
+    assert _loop(agent, loops, home="b") is None  # profile b's store was never written
 
 
 @requires_agent_modules
@@ -166,17 +122,16 @@ def test_compression_mid_wakeup_keeps_turn_and_loop(tmp_path, monkeypatch, rotat
             cur = "c2"
     monkeypatch.setattr(config, "ACTIVE_RUNS", {"stream1": {"session_id": "s1"}})  # turn still running
     loops.run_due_loops()
-    with loops._home(None):
-        s = agent.load_loop(cur)
+    s = _loop(agent, loops, cur)
     assert s.status == "active" and s.awaiting_response  # not cleared, not judged mid-turn
     monkeypatch.setattr(config, "ACTIVE_RUNS", {})
     session.session_id = cur
     session.messages.append({"role": "assistant", "content": "done\nLOOP_COMPLETE"})
     loops.run_due_loops()
+    assert _loop(agent, loops, cur).status == "done"
+    if rotations == 2:
+        assert db.get_meta(loops._TURN_PREFIX + cur)  # re-keyed to the current session
     with loops._home(None):
-        assert agent.load_loop(cur).status == "done"
-        if rotations == 2:
-            assert db.get_meta(loops._TURN_PREFIX + cur)  # re-keyed to the current session
         _due(agent, cur)
     loops.run_due_loops()
     assert len(started) == 1
@@ -191,24 +146,21 @@ def test_message_after_stop_does_not_hide_stop(tmp_path, monkeypatch):
                          {"role": "user", "content": "next question", "timestamp": 2000.0},
                          {"role": "assistant", "content": "answer"}]
     loops.run_due_loops()
-    with loops._home(None):
-        s = agent.load_loop("s1")
+    s = _loop(agent, loops)
     assert s.status == "paused" and s.paused_reason == "user-interrupted (Stop)"
 
 
 def _deferred_stop_env(tmp_path, monkeypatch, session_source, worker_first):
     """Saved session in deferred save mode whose wakeup starts through the production chat-start preparer."""
     import queue
-    from api import config, models, routes, streaming
+    from api import config, models, routes
     from api.models import Session
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     (tmp_path / "sessions").mkdir()
     monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda *a: "deferred")
     holder = {"s": Session(session_id="s1", title="loop", messages=[], session_source=session_source)}
     holder["s"].save()
-    agent, loops, started = _setup(tmp_path, monkeypatch, holder["s"])
-    monkeypatch.setattr(models, "get_session", lambda sid, **kw: holder["s"])
-    monkeypatch.setattr(streaming, "get_session", lambda sid, **kw: holder["s"])
+    agent, loops, started = _setup(tmp_path, monkeypatch, holder["s"], get_session=lambda sid, **kw: holder["s"])
 
     def start(sid, msg, source):  # the prompt lives only in pending_* until the turn settles
         started.append(msg)
@@ -250,16 +202,15 @@ def test_stop_on_wakeup_pauses_loop_after_reload(tmp_path, monkeypatch, session_
     config.ACTIVE_RUNS.pop("stream1", None)
     holder["s"] = Session.load("s1")  # judge the durably settled transcript
     users = [m for m in holder["s"].messages if m.get("role") == "user"]
-    assert len(users) == 1
-    assert users[0]["_active_turn_token"] == build_active_turn_token("stream1", 1000.75)
+    assert len(users) == 1 and users[0]["_active_turn_token"] == build_active_turn_token("stream1", 1000.75)
     if settled_by == "caller":
         assert users[0]["timestamp"] == 1000.75  # Stop's own recovery keeps the exact pending time
     if session_source == "fork":
         assert users[0]["_source"] == "fork"
     loops.run_due_loops()
+    s = _loop(agent, loops)
+    assert s.status == "paused" and s.paused_reason == "user-interrupted (Stop)"
     with loops._home(None):
-        s = agent.load_loop("s1")
-        assert s.status == "paused" and s.paused_reason == "user-interrupted (Stop)"
         _due(agent)
     loops.run_due_loops()
     assert len(started) == 1  # no further provider call after a forced due
@@ -275,20 +226,17 @@ def test_loop_scheduler_kill_switch(monkeypatch):
     assert loops.start_loop_scheduler() is True and spawned[0]["name"] == "webui-loop-scheduler"
 
 
-def test_tokenless_row_is_never_matched_by_prompt():
-    # Token-only recognizer: an older token-less row with the same prompt must not shadow the real wakeup.
+def test_loop_state_helpers_ignore_old_rows_and_parent_cycles():
     from api import loops
-    turn = {"token": "tok", "started_at": 1000.75, "prompt": "check"}  # records written before this fix carry prompt
+    # A token-less row with the same prompt must not shadow the real wakeup turn.
+    turn = {"token": "tok", "started_at": 1000.75, "prompt": "check"}
     msgs = [{"role": "user", "content": "check", "timestamp": 1000},
             {"role": "assistant", "content": "old reply"},
             {"role": "user", "content": "check", "timestamp": 1000.75, "_active_turn_token": "tok"},
             {"role": "assistant", "content": "done\nLOOP_COMPLETE"}]
     assert loops._wakeup_outcome(msgs, turn) == (False, "done\nLOOP_COMPLETE")
     assert loops._wakeup_outcome(msgs[:2], turn) == (False, "")
-
-
-def test_turn_record_parent_cycle_terminates():
-    from api import loops
+    # A compression parent cycle in the turn record must terminate instead of looping.
     parents = {"a": "b", "b": "a"}
     db = NS(get_meta=lambda k: None, get_session=lambda sid: {"parent_session_id": parents.get(sid)},
             set_meta=lambda k, v: (_ for _ in ()).throw(AssertionError("no record to copy")))
@@ -296,8 +244,7 @@ def test_turn_record_parent_cycle_terminates():
 
 
 def test_launch_response_keeps_started_at_when_worker_clears_pending(issue7193_env, tmp_path, monkeypatch):
-    # greptile 4237618938: the response must carry the launch timestamp even if the worker
-    # (or Stop) cleared s.pending_* before the launcher read it back.
+    # greptile 4237618938: the launch timestamp must survive the worker (or Stop) clearing pending_*.
     from api import routes
     from api.models import new_session
     cleared = threading.Event()
@@ -321,40 +268,32 @@ def test_archived_session_loop_pauses_instead_of_firing(tmp_path, monkeypatch):
     session = NS(session_id="s1", profile=None, messages=[], archived=True)
     agent, loops, started = _setup(tmp_path, monkeypatch, session)
     loops.run_due_loops()
-    assert started == []
-    with loops._home(None):
-        s = agent.load_loop("s1")
-        assert s.status == "paused" and s.paused_reason == "session archived"
+    s = _loop(agent, loops)
+    assert started == [] and s.status == "paused" and s.paused_reason == "session archived"
 
 
 @requires_agent_modules
 def test_archive_guard_pauses_loop_under_loop_lock(tmp_path, monkeypatch):
     session = NS(session_id="s1", profile=None, messages=[], archived=False)
-    agent, loops, started = _setup(tmp_path, monkeypatch, session)
+    agent, loops, _ = _setup(tmp_path, monkeypatch, session)
     with loops.archive_guard("s1") as guard:
         assert loops._session_lock("s1").locked()  # held before the caller takes the agent lock
-        session.archived = True
-        guard["session"] = session
-    with loops._home(None):
-        assert agent.load_loop("s1").paused_reason == "session archived"
+        session.archived, guard["session"] = True, session
+    assert _loop(agent, loops).paused_reason == "session archived"
     with loops.archive_guard("s1") as guard:  # unarchive does not touch the loop
-        session.archived = False
-        guard["session"] = session
-    with loops._home(None):
-        assert agent.load_loop("s1").status == "paused"
+        session.archived, guard["session"] = False, session
+    assert _loop(agent, loops).status == "paused"
 
 
-def test_only_loop_command_carries_session_id():
+def test_loop_js_wiring_is_session_scoped_and_chat_bound():
+    """Only `/loop` carries a session_id, and a busy `/loop` reply lands in the chat that asked."""
     body = _src("static/commands.js")
     body = body[body.index("async function _runAgentCommandTransport"):]
     body = body[:body.index("\n}\n")]
     assert "/^\\/?loop(\\s|$)/i.test(command)?{command,session_id:" in body and ":{command})" in body
-
-
-def test_busy_loop_reply_stays_in_owning_chat():
-    src = _src("static/messages.js")
-    busy = src[src.index("_pc.name==='loop'"):src.index("const defaultMessageMode=")]
+    busy = _src("static/messages.js")
+    busy = busy[busy.index("_pc.name==='loop'"):busy.index("const defaultMessageMode=")]
     busy = busy[:busy.index("return;")]
-    assert "_loopMsgs=S.messages" in busy and "_loopMsgs.push({role:'assistant'" in busy
-    assert "S.messages.push({role:'assistant'" not in busy
+    assert "executeAgentCommand(text,{name:'loop'})" in busy and "_loopMsgs=S.messages" in busy
+    assert "_loopMsgs.push({role:'assistant'" in busy and "S.messages.push({role:'assistant'" not in busy
     assert "S.messages===_loopMsgs&&(S.session&&S.session.session_id)===_loopSid" in busy
