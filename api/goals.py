@@ -723,6 +723,7 @@ def _gather_goal_turn_background_state(
             active_deleg = int(count_active_delegations(sid) or 0)
         except Exception:
             active_deleg = 0
+        active_deleg = max(active_deleg, _state_db_live_delegations(sid, profile_home))
         return bg_procs, active_deleg
     finally:
         if token is not None and context_api is not None:
@@ -762,6 +763,52 @@ def gateway_evaluated_goal_in_turn(
         return last_turn_at > 0.0 and last_turn_at >= float(min_evaluated_at)
     except Exception:
         return False
+
+
+_LIVE_DELEGATION_STATES = ("running", "stalling", "finalizing")
+
+
+def _state_db_live_delegations(session_id: str, profile_home: str | Path | None) -> int:
+    """Live async delegations for *session_id* recorded in the profile's state.db (fail-safe 0)."""
+    try:
+        from api.agent_sessions import open_state_db_readonly
+        from api.profiles import get_active_hermes_home
+
+        home = Path(profile_home) if profile_home else Path(get_active_hermes_home())
+        db = home / "state.db"
+        if not db.exists():
+            return 0
+        conn = open_state_db_readonly(db)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM async_delegations WHERE state IN (?,?,?) "
+                "AND (parent_session_id = ? OR origin_session_id = ?)",
+                (*_LIVE_DELEGATION_STATES, session_id, session_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+
+
+def _hold_while_delegations_run(decision: Dict[str, Any], session_id: str, profile_home) -> Dict[str, Any]:
+    """Defer a continuation while subagents run; their completion wakeup re-evaluates the goal."""
+    if not decision.get("should_continue"):
+        return decision
+    live = _state_db_live_delegations(session_id, profile_home)
+    if live <= 0:
+        return decision
+    return {
+        **decision,
+        "should_continue": False,
+        "continuation_prompt": None,
+        "verdict": "wait",
+        "reason": f"waiting on {live} running subagent(s)",
+        "message": f"⏳ Goal waiting on {live} running subagent(s); resumes when they finish.",
+        "message_key": "",
+        "message_args": [],
+    }
 
 
 def _decision_from_evaluated_state(mgr: Any, state: Any) -> Optional[Dict[str, Any]]:
@@ -1337,7 +1384,7 @@ def evaluate_goal_after_turn(
         ):
             decision = _decision_from_evaluated_state(mgr, state)
             if decision is not None:
-                return _goal_decision_payload(decision, state)
+                return _hold_while_delegations_run(_goal_decision_payload(decision, state), sid, profile_home)
         if not mgr.is_active():
             return {
                 "status": getattr(state, "status", None),
@@ -1390,7 +1437,7 @@ def evaluate_goal_after_turn(
     decision.setdefault("message", "")
     decision = dict(decision)
     decision = _goal_decision_payload(decision, getattr(mgr, "state", None))
-    return decision
+    return _hold_while_delegations_run(decision, sid, profile_home)
 
 
 # ── #6885 goal-continuation admission (single-record lifecycle) ─────────────
