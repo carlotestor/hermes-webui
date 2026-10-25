@@ -176,18 +176,15 @@ def test_benign_assignment_not_over_redacted(driver_path):
     assert "echo ok" in out["lead"]
 
 
-def test_gateway_preview_only_command_is_labelled_as_preview(driver_path):
+@pytest.mark.parametrize("tc,label,lead", [
     # Gateway runs send only the producer's summarized preview (display_command).
-    out = _run(driver_path, {"name": "terminal", "args": {}, "display_command": "npm ci + 1 command"})
-    assert out["label"] == "Command preview"
-    assert out["lead"] == "npm ci + 1 command"
-    assert not out["lead"].startswith("$ ")
-
-
-def test_real_command_keeps_shell_label_over_display_command(driver_path):
-    out = _run(driver_path, {"args": {"command": "git status"}, "display_command": "git status"})
-    assert out["label"] == "Shell"
-    assert out["lead"] == "$ git status"
+    ({"name": "terminal", "args": {}, "display_command": "npm ci + 1 command"}, "Command preview", "npm ci + 1 command"),
+    ({"args": {"command": "git status"}, "display_command": "git status"}, "Shell", "$ git status"),
+], ids=["preview-only", "real-command"])
+def test_command_label_separates_preview_from_real_command(driver_path, tc, label, lead):
+    out = _run(driver_path, tc)
+    assert out["label"] == label
+    assert out["lead"] == lead
 
 
 @pytest.mark.parametrize("cmd,kept", [
@@ -212,36 +209,27 @@ def test_curl_basic_auth_password_redacted_username_kept(driver_path, cmd, kept)
 @pytest.mark.parametrize("cmd", [
     "curl -u alice https://x", "sort -u file", "curl --username alice:bob",
     "docker run --user=1000:1000 alpine id", "docker run -u 1000:1000 alpine id",
-    "sudo -u postgres:postgres psql",
+    "sudo -u postgres:postgres psql", "curl https://x\nsort -u a:b",
 ])
 def test_curl_basic_auth_redaction_leaves_non_credentials(driver_path, cmd):
     assert _run(driver_path, {"args": {"command": cmd}})["lead"] == "$ " + cmd
 
 
-def test_gateway_tool_started_curl_password_never_reaches_card(driver_path):
+@pytest.mark.parametrize("preview", [
+    "curl -u alice:s3cretPW https://x",
+    "curl \\\n  -u alice:s3cretPW https://x",
+], ids=["tool-started", "continued-line"])
+def test_gateway_tool_started_curl_password_never_reaches_card(driver_path, preview):
+    # Real translator -> real card: neither the collapsed label nor the expanded detail may leak it.
     from api.gateway_chat import _gateway_tool_progress_event
 
-    _, started = _gateway_tool_progress_event(
-        {"event": "tool.started", "tool": "terminal", "preview": "curl -u alice:s3cretPW https://x"}
-    )
-    tc = {k: started[k] for k in ("name", "args", "display_command")}
-    out = _run(driver_path, tc)
-    for text in (out["header"], out["lead"]):
-        assert "s3cretPW" not in text and "alice:[redacted]" in text
-
-
-def test_curl_continuation_password_redacted_in_display_command_preview(driver_path):
-    out = _run(driver_path, {"name": "terminal", "args": {}, "display_command": "curl \\\n  -u alice:s3cretPW https://x"})
-    assert "s3cretPW" not in out["lead"] and "alice:[redacted]" in out["lead"]
-
-
-def test_continuation_does_not_extend_curl_past_line_end(driver_path):
-    out = _run(driver_path, {"args": {"command": "curl https://x\nsort -u a:b"}})
-    assert "sort -u a:b" in out["lead"]
+    _, started = _gateway_tool_progress_event({"event": "tool.started", "tool": "terminal", "preview": preview})
+    out = _run(driver_path, {k: started[k] for k in ("name", "args", "display_command")})
+    assert "s3cretPW" not in out["header"] and "s3cretPW" not in out["lead"]
+    assert "alice:[redacted]" in out["lead"]
 
 
 def test_command_preview_label_is_localized():
     src = (REPO_ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
     assert src.count("tool_detail_command_preview:") == 15
-    ui = UI_JS_PATH.read_text(encoding="utf-8")
-    assert "t('tool_detail_command_preview')" in ui
+    assert "t('tool_detail_command_preview')" in UI_JS_PATH.read_text(encoding="utf-8")

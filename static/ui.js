@@ -23102,8 +23102,8 @@ function _redactToolTargetLabel(value){
     .replace(/\bsshpass\s+-p\s+(?:"[^"]*"|'[^']*'|\S+)/gi,'sshpass -p "[redacted]"')
     .replace(/(--password(?:=|\s+))(?:"[^"]*"|'[^']*'|\S+)/gi,'$1[redacted]')
     .replace(/(password(?:=|\s+))(?:"[^"]*"|'[^']*'|\S+)/gi,'$1[redacted]')
-    // curl basic auth `-u user:pass` / `--user[=]user:pass`, curl only (across `\` line continuations): mask the password
-    // through the end of the whole shell word (quotes, `\ ` escapes), keep the user.
+    // curl basic auth `-u user:pass` / `--user[=]user:pass`: mask the password (whole shell word,
+    // continuations included), keep the user, and only inside a curl segment.
     .replace(/\bcurl\b(?:[^\n;|&\\]|\\[^])*/gi,seg=>seg.replace(/(\s)(-u\s*|--user(?:=|\s+))((?:[^\s"'\\]|\\.|"(?:[^"\\]|\\.)*"|'[^']*')+)/g,(m,pre,flag,word)=>{
       const i=word.indexOf(':'); if(i<0) return m;
       const q=(word[0]==='"'||word[0]==="'")&&word.length>1&&word.endsWith(word[0])?word[0]:'';
@@ -23562,10 +23562,8 @@ function _toolCommandIsPreviewOnly(tc){
   return !!(tc&&tc.display_command)&&!(a.cmd||a.command||tc.command||tc.raw_command||tc.original_command);
 }
 function _toolDetailLeadLabel(kind, tc){
-  if(kind==='shell'){
-    if(!_toolCommandIsPreviewOnly(tc)) return 'Shell';
-    return (typeof t==='function'?t('tool_detail_command_preview'):'')||'Command preview';
-  }
+  if(kind==='shell'&&!_toolCommandIsPreviewOnly(tc)) return 'Shell';
+  if(kind==='shell') return (typeof t==='function'?t('tool_detail_command_preview'):'')||'Command preview';
   if(kind==='write') return 'Target';
   return 'Input';
 }

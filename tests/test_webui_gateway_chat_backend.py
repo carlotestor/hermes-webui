@@ -157,16 +157,18 @@ def test_gateway_tool_progress_event_translates_gateway_lifecycle_payloads():
     assert _gateway_tool_progress_event({"tool": "_thinking", "status": "running"}) is None
 
 
-def test_gateway_tool_started_preview_only_payload_is_display_only():
-    # Runs API tool.started wire shape: {"tool", "preview"} with no args.
+@pytest.mark.parametrize("preview,args,display", [
+    ("git status", {}, "git status"),
+    ("npm ci + 1 command", {}, "npm ci + 1 command"),
+    ("npm ci + 1 command", {"command": "cd /repo && npm ci && npm test"}, None),
+], ids=["simple", "compound", "full-args"])
+def test_gateway_shell_preview_only_payload_is_display_only(preview, args, display):
+    # Runs API tool.started shape: {"tool", "preview"}; supplied args win and suppress the preview label.
     _, started = _gateway_tool_progress_event(
-        {"event": "tool.started", "tool": "terminal", "preview": "git status"}
+        {"event": "tool.started", "tool": "terminal", "preview": preview, "args": args}
     )
-    assert started["args"] == {}
-    assert started["display_command"] == "git status"
-    _, other = _gateway_tool_progress_event(
-        {"event": "tool.started", "tool": "my_plugin_tool", "preview": "x"}
-    )
+    assert started["args"] == args and started.get("display_command") == display
+    _, other = _gateway_tool_progress_event({"event": "tool.started", "tool": "my_plugin_tool", "preview": "x"})
     assert other["args"] == {} and "display_command" not in other
     _, completed = _gateway_tool_progress_event(
         {"event": "tool.completed", "tool": "terminal", "preview": "output text", "duration": 0.1}
@@ -174,43 +176,25 @@ def test_gateway_tool_started_preview_only_payload_is_display_only():
     assert "args" not in completed and "display_command" not in completed
 
 
-def test_gateway_compound_terminal_preview_is_not_claimed_as_command():
-    # Producer: build_tool_preview("terminal", {"command": "cd /repo && npm ci && npm test"}) == "npm ci + 1 command".
-    _, started = _gateway_tool_progress_event(
-        {"event": "tool.started", "tool": "terminal", "preview": "npm ci + 1 command"}
-    )
-    assert started["args"] == {}
-    assert started["display_command"] == "npm ci + 1 command"
-
-
-@pytest.mark.parametrize("preview", ["2 tasks: fix a | fix b", "3 parallel tasks", "list", "steer sub-1", "stop sub-1"])
-def test_gateway_delegate_task_preview_never_fabricates_goal(preview):
-    _, started = _gateway_tool_progress_event(
-        {"event": "tool.started", "tool": "delegate_task", "preview": preview}
-    )
-    assert started["args"] == {}
+@pytest.mark.parametrize("tool,preview", [
+    ("delegate_task", "2 tasks: fix a | fix b"), ("delegate_task", "3 parallel tasks"),
+    ("delegate_task", "list"), ("delegate_task", "steer sub-1"), ("delegate_task", "stop sub-1"),
+    ("web_extract", "https://a.example"), ("web_search", "https://a.example"),
+    ("search_files", "https://a.example"), ("clarify", "https://a.example"),
+    ("vision_analyze", "https://a.example"),
+])
+def test_gateway_non_shell_preview_never_fabricates_args(tool, preview):
+    _, started = _gateway_tool_progress_event({"event": "tool.started", "tool": tool, "preview": preview})
+    assert started["args"] == {} and "display_command" not in started and started["preview"] == preview
     assert "goal" not in json.dumps(started)
-    assert "display_command" not in started
-    assert started["preview"] == preview
-
-
-@pytest.mark.parametrize("tool", ["web_extract", "web_search", "search_files", "clarify", "vision_analyze"])
-def test_gateway_non_shell_preview_stays_preview_only(tool):
-    _, started = _gateway_tool_progress_event({"event": "tool.started", "tool": tool, "preview": "https://a.example"})
-    assert started["args"] == {} and "display_command" not in started
 
 
 def test_gateway_tool_started_preview_only_payload_bounds_huge_preview():
     huge = "echo " + "x" * (4 * 1024 * 1024)
-    _, started = _gateway_tool_progress_event(
-        {"event": "tool.started", "tool": "terminal", "preview": huge}
-    )
-    command = started["display_command"]
-    assert isinstance(command, str) and command.startswith("echo ")
-    assert len(command) < 100_000
-    _, completed = _gateway_tool_progress_event(
-        {"event": "tool.completed", "tool": "terminal", "preview": huge}
-    )
+    _, started = _gateway_tool_progress_event({"event": "tool.started", "tool": "terminal", "preview": huge})
+    assert started["display_command"].startswith("echo ")
+    assert len(started["display_command"]) < 100_000
+    _, completed = _gateway_tool_progress_event({"event": "tool.completed", "tool": "terminal", "preview": huge})
     assert "args" not in completed
 
 
@@ -1922,14 +1906,7 @@ def test_gateway_worker_skips_runs_api_when_opt_in_absent():
             STREAMS.pop(stream_id, None)
 
 
-def test_gateway_tool_full_args_and_result_supersede_preview():
-    # Optional fields: /api/sessions/{id}/chat/stream sends args; result is used only if present.
-    _, started = _gateway_tool_progress_event({
-        "event": "tool.started", "tool": "terminal", "preview": "npm ci + 1 command",
-        "args": {"command": "cd /repo && npm ci && npm test"},
-    })
-    assert started["args"] == {"command": "cd /repo && npm ci && npm test"}
-    assert "display_command" not in started
+def test_gateway_tool_result_supersedes_bounded_preview():
     long_out = "x" * 3000
     _, completed = _gateway_tool_progress_event({
         "event": "tool.completed", "tool": "terminal", "preview": long_out[:497] + "...",
@@ -1938,7 +1915,7 @@ def test_gateway_tool_full_args_and_result_supersede_preview():
     assert completed["snippet"] == long_out
 
 
-def test_gateway_tool_completed_without_result_persists_preview_as_snippet():
+def test_gateway_tool_completion_keeps_output_in_snapshot_and_saved_record():
     _, completed = _gateway_tool_progress_event(
         {"event": "tool.completed", "tool": "terminal", "preview": "short"}
     )
@@ -1954,20 +1931,14 @@ def test_gateway_tool_completed_without_result_persists_preview_as_snippet():
         session = type("S", (), {"messages": [{"role": "user", "content": "q"}, dict(answer)], "tool_calls": []})()
         gateway_chat._persist_gateway_turn_tool_calls(session, answer, STREAM_LIVE_TOOL_CALLS[stream_id])
         assert [tc["snippet"] for tc in session.tool_calls] == ["a.txt"]
-    finally:
-        STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
 
-
-def test_runs_api_live_snapshot_keeps_completed_result_snippet():
-    stream_id = "snap-snippet"
-    STREAM_LIVE_TOOL_CALLS[stream_id] = []
-    try:
+        # Upstream /v1/runs tool.completed shape: bounded result preview, no args/result.
+        STREAM_LIVE_TOOL_CALLS[stream_id].clear()
         name, started = _gateway_tool_progress_event(
-            {"event": "tool.started", "tool": "terminal", "preview": "pytest", "tool_call_id": "c1"})
+            {"event": "tool.started", "tool": "terminal", "preview": "pytest", "tool_call_id": "c2"})
         gateway_chat._note_live_gateway_event(stream_id, name, started)
         name, completed = _gateway_tool_progress_event(
-            # Upstream /v1/runs tool.completed wire shape: bounded result preview, no args/result.
-            {"event": "tool.completed", "tool": "terminal", "tool_call_id": "c1", "error": True,
+            {"event": "tool.completed", "tool": "terminal", "tool_call_id": "c2", "error": True,
              "duration": 0.1, "preview": ("boom " * 200)[:497] + "..."})
         gateway_chat._note_live_gateway_event(stream_id, name, completed)
         [tc] = STREAM_LIVE_TOOL_CALLS[stream_id]

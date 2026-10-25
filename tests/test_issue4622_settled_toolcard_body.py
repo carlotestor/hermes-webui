@@ -1220,27 +1220,22 @@ def test_short_genuine_prefix_not_clobbered(driver_path):
 
 def _gateway_preview_turn(persisted_display="npm ci + 1 command", live_display="npm ci + 1 command"):
     # Gateway runs carry only the producer's summarized display_command, no executed command.
-    messages = [
-        {"role": "user", "content": "install"},
-        {"role": "assistant", "content": "Done.", "tool_calls": [
-            {"id": "gw-1", "name": "terminal", "started_at": 100, "args": {},
-             "display_command": persisted_display, "snippet": "ok"}]},
-        {"role": "assistant", "content": "final answer"},
-    ]
-    S = {"toolCalls": [{"id": "gw-1", "name": "terminal", "assistant_msg_idx": 1, "started_at": 100,
-                        "args": {}, "display_command": live_display, "snippet": "ok"}]}
-    return {"messages": messages, "turnStart": 0, "lastAsstIndex": 2, "S": S}
+    call = {"id": "gw-1", "name": "terminal", "started_at": 100, "args": {},
+            "display_command": persisted_display, "snippet": "ok"}
+    live = {**call, "assistant_msg_idx": 1, "display_command": live_display}
+    return {
+        "messages": [
+            {"role": "user", "content": "install"},
+            {"role": "assistant", "content": "Done.", "tool_calls": [call]},
+            {"role": "assistant", "content": "final answer"},
+        ],
+        "turnStart": 0, "lastAsstIndex": 2, "S": {"toolCalls": [live]},
+    }
 
 
-def test_gateway_display_command_survives_settled_render_as_preview(driver_path):
-    term = _card(_run(driver_path, _gateway_preview_turn()), "terminal")
+@pytest.mark.parametrize("persisted_display", ["npm ci + 1 command", ""], ids=["persisted-row", "live-tool-call"])
+def test_gateway_display_command_survives_settled_render_as_preview(driver_path, persisted_display):
+    term = _card(_run(driver_path, _gateway_preview_turn(persisted_display=persisted_display)), "terminal")
     assert term["display_command"] == "npm ci + 1 command"
     assert term["command"] == "", "a preview must never be folded into the executed command"
-    assert term["leadLabel"] == "Command preview"
-
-
-def test_gateway_display_command_restored_from_live_tool_call(driver_path):
-    term = _card(_run(driver_path, _gateway_preview_turn(persisted_display="")), "terminal")
-    assert term["display_command"] == "npm ci + 1 command"
-    assert term["command"] == ""
     assert term["leadLabel"] == "Command preview"
