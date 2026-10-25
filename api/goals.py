@@ -964,8 +964,9 @@ def stream_channel_has_subscribers(channel: Any) -> bool:
 GOAL_CONTINUATION_BROWSER_GRACE_SECONDS = 15.0
 _BROWSER_GRACE_TIMERS: dict[str, Any] = {}
 _BROWSER_GRACE_LOCK = threading.Lock()
-# IDs this process already admitted, so a late duplicate POST cannot run the
-# continuation twice. Bounded: continuation IDs are never re-armed after use.
+# IDs this process already admitted, so a late duplicate POST can be LABELLED
+# as one. Bounded, therefore only a label: admission is decided by the pending
+# record itself, so an evicted entry can never turn a spent token into a turn.
 _SPENT_GOAL_CONTINUATION_IDS: "OrderedDict[tuple, None]" = OrderedDict()
 _SPENT_GOAL_CONTINUATION_LIMIT = 64
 
@@ -1009,7 +1010,11 @@ def _arm_browser_grace_timer(sid: str, cid: str, grace: float) -> None:
             if _BROWSER_GRACE_TIMERS.get(sid) is holder.get("timer"):
                 _BROWSER_GRACE_TIMERS.pop(sid, None)
         try:
-            dispatch_browser_owned_goal_continuation(sid, cid)
+            # One wakeup per record: take the lease over, or — for a restored
+            # WebUI-owned record whose runner died with its launch — re-run it
+            # with the record's own ID.
+            if not dispatch_browser_owned_goal_continuation(sid, cid):
+                retry_detached_goal_continuation(sid)
         except Exception:
             logger.debug(
                 "Browser-owned goal continuation fallback failed for %s",
@@ -1092,7 +1097,12 @@ def dispatch_browser_owned_goal_continuation(
 
 
 def goal_continuation_already_dispatched(session_id: str, continuation_id: str) -> bool:
-    """True when this session already admitted a record with this ID."""
+    """True when this process recorded admitting a record with this ID.
+
+    A LABEL, never an admission authority: the session's pending record is
+    what decides whether a token may start a turn, so a token this bounded
+    cache forgot is still rejected as stale (see api/routes.py admission).
+    """
     key = (str(session_id or "").strip(), str(continuation_id or "").strip())
     if not key[0] or not key[1]:
         return False
@@ -1594,33 +1604,46 @@ def restore_pending_goal_continuation(session_id: str, receipt) -> bool:
     record (that would burn a continuation the browser has not sent yet).
     Restoring an older ID would also resurrect a consumed one.
 
-    ``receipt`` is what
-    :func:`consume_pending_goal_continuation` returned: the record dict, or
-    the session id when only the marker was present.
+    ``receipt`` is what :func:`consume_pending_goal_continuation` returned:
+    the record dict, or the session id when only the marker was present.
+
+    Consuming a record also cancels its browser-grace timer, so the rollback
+    owes the dispatch obligation back: browser-held records re-arm at their
+    own deadline (immediately when it passed), WebUI-owned ones one grace out
+    so a persistently failing launch cannot hot-loop.
     """
     session_id = str(session_id or "").strip()
     if not session_id or receipt is None or receipt is False:
         return False
+    rearm: tuple[str, float] | None = None
     with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
         if session_id in _cfg.PENDING_GOAL_CONTINUATION_PROMPTS:
             # A newer continuation is armed; keep it and drop the stale receipt.
             return False
         if isinstance(receipt, dict):
             record = dict(receipt)
-            if not str(record.get("continuation_id") or "").strip():
+            cont_id = str(record.get("continuation_id") or "").strip()
+            if not cont_id:
                 return False
         else:
             # Marker-only admission (no popped record): re-arm the marker
             # alone, matching #7249's rollback for the legacy half-pair.
             record = None
+            cont_id = ""
         _cfg.PENDING_GOAL_CONTINUATION.add(session_id)
         if record is not None:
             _cfg.PENDING_GOAL_CONTINUATION_PROMPTS[session_id] = record
             # The rollback un-consumed this ID: it is dispatchable again.
-            _SPENT_GOAL_CONTINUATION_IDS.pop(
-                (session_id, str(record.get("continuation_id") or "").strip()), None
-            )
-        return True
+            _SPENT_GOAL_CONTINUATION_IDS.pop((session_id, cont_id), None)
+            deadline = record.get("browser_grace_deadline")
+            if cont_id and isinstance(deadline, (int, float)):
+                if record.get("detached_owned"):
+                    rearm = (cont_id, max(0.0, float(GOAL_CONTINUATION_BROWSER_GRACE_SECONDS)))
+                else:
+                    rearm = (cont_id, max(0.0, float(deadline) - time.monotonic()))
+    if rearm is not None:
+        _arm_browser_grace_timer(session_id, rearm[0], rearm[1])
+    return True
 
 
 def _drop_pending_goal_continuation(session_id: str) -> None:

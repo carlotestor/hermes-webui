@@ -2102,6 +2102,19 @@ async function send(){
       if(typeof renderSessionList==='function') void renderSessionList();
       return;
     }
+    // The token is no longer this session's pending continuation, so the
+    // server refused it: keep the user's words and drop only the spent token,
+    // or the resend is refused again.
+    if(e&&e.status===409&&/goal_continuation_stale/.test(errMsg)){
+      delete INFLIGHT[activeSid];
+      if(typeof clearInflightState==='function') clearInflightState(activeSid);
+      removeThinking();setBusy(false);setComposerStatus('');
+      if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
+      _restoreComposerDraftAfterFailedSend(_failedSendDraftText,_failedSendFilesSnapshot,activeSid,_composerDraftClearPromise,'');
+      showToast('That goal continuation is out of date. Your message is kept.',3200);
+      if(typeof renderSessionList==='function') void renderSessionList();
+      return;
+    }
     // The server already dispatched this continuation (browser lease expired
     // and the fallback ran): drop the queue entry instead of a second turn.
     if(e&&e.status===409&&/goal_continuation_already_dispatched/.test(errMsg)){

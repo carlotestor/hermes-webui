@@ -27925,19 +27925,28 @@ def _start_chat_stream_for_session(
                 consumed_goal_continuation = True
                 consumed_goal_continuation_receipt = receipt
             else:
+                # The pending record is the ONLY authority: an explicit token
+                # it did not consume is spent or superseded, never an ordinary
+                # turn (the tombstone may only label it).
                 from api.goals import goal_continuation_already_dispatched
 
-                if goal_continuation_already_dispatched(
+                already_dispatched = goal_continuation_already_dispatched(
                     s.session_id, goal_continuation_id
-                ):
-                    # The browser lost the race (server fallback ran first, or
-                    # a duplicate drain): a second turn would redo the work.
-                    browser_continuation_rejection = {
-                        "error": "goal_continuation_already_dispatched",
-                        "reason": "goal_continuation_consumed",
-                        "_status": 409,
-                    }
-                    return
+                )
+                browser_continuation_rejection = {
+                    "error": (
+                        "goal_continuation_already_dispatched"
+                        if already_dispatched
+                        else "goal_continuation_stale"
+                    ),
+                    "reason": (
+                        "goal_continuation_consumed"
+                        if already_dispatched
+                        else "goal_continuation_unmatched"
+                    ),
+                    "_status": 409,
+                }
+                return
         if s.session_id in PENDING_BG_TASK_COMPLETIONS:
             PENDING_BG_TASK_COMPLETIONS.discard(s.session_id)
             consumed_bg_task_completion = True
