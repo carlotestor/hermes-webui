@@ -396,37 +396,27 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
             logger.debug("Failed to close state.db")
 
 
-# A pin mirrors with a short busy timeout: Desktop or the CLI can hold the
-# state.db write lock, so the wait is bounded (~0.5 s) rather than unbounded, and
-# a pin must never fail on that account.
+# Desktop or the CLI can hold the state.db write lock, so a pin mirror waits at most ~0.5 s.
 PIN_MIRROR_TIMEOUT_S = 0.5
 
 
-def sync_session_pinned(session_id: str, pinned: bool, profile: Optional[str] = None,
-                        *, timeout: float = PIN_MIRROR_TIMEOUT_S) -> bool:
+def sync_session_pinned(session_id: str, pinned: bool, profile: Optional[str] = None) -> bool:
     """Mirror a pin into *profile*'s ``sessions.pinned``, the flag Desktop and the CLI share.
 
-    Best-effort by design: the WebUI sidecar is the authority and is already saved, so a
-    missing row, a schema without the column, or a lock held elsewhere returns False after
-    logging at debug. Nothing is queued; the next pin/unpin carries the change over.
+    Best-effort and never raises: the sidecar is the authority and is already saved, so a
+    missing row or column, or a lock held elsewhere, only costs the other app this update.
     """
-    db_path = _resolve_state_db_path(profile)
-    if db_path is None:
-        return False
     try:
+        db_path = _resolve_state_db_path(profile)
+        if db_path is None:
+            return False
         with closing(sqlite3.connect(
             state_db_file_uri(Path(db_path).resolve()),
             uri=True,
-            timeout=max(0.0, float(timeout)),
+            timeout=PIN_MIRROR_TIMEOUT_S,
             isolation_level=None,
         )) as conn:
-            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")}
-            if not {"id", "pinned"} <= columns:
-                return False
-            cur = conn.execute(
-                "UPDATE sessions SET pinned = ? WHERE id = ?",
-                (int(bool(pinned)), session_id),
-            )
+            cur = conn.execute("UPDATE sessions SET pinned = ? WHERE id = ?", (int(bool(pinned)), session_id))
             conn.commit()
             return cur.rowcount > 0
     except Exception:
@@ -437,13 +427,13 @@ def sync_session_pinned(session_id: str, pinned: bool, profile: Optional[str] = 
 def read_state_db_pinned_ids(profile: Optional[str] = None) -> set[str]:
     """Ids pinned in *profile*'s own state.db; empty when unreadable or without the column.
 
-    Read-only, and never another profile's database: a profile whose state.db is missing
-    contributes nothing instead of falling back to the active profile (#2762).
+    Read-only, and never another profile's database: a missing state.db contributes
+    nothing instead of falling back to the active profile (#2762).
     """
-    db_path = _resolve_state_db_path(profile)
-    if db_path is None:
-        return set()
     try:
+        db_path = _resolve_state_db_path(profile)
+        if db_path is None:
+            return set()
         with closing(open_state_db_readonly(db_path)) as conn:
             return {
                 str(row[0]).strip()
@@ -451,5 +441,5 @@ def read_state_db_pinned_ids(profile: Optional[str] = None) -> set[str]:
                 if row[0]
             }
     except Exception:
-        logger.debug("Failed to read pinned sessions from %s", db_path, exc_info=True)
+        logger.debug("Failed to read pinned sessions from %s", profile, exc_info=True)
         return set()

@@ -705,8 +705,7 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
             continue
 
         merged = dict(row)
-        # The pin lives on one row of a compression lineage; the projected conversation
-        # keeps it when either the visible head or the tip carries it.
+        # The pin can land on any row of a compression lineage; keep head's or tip's.
         merged['pinned'] = bool(row.get('pinned') or tip.get('pinned'))
         # Keep the chain head's visible identity (title, started_at), but
         # point the row at the latest importable segment for navigation AND

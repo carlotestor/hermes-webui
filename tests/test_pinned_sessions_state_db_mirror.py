@@ -1,28 +1,24 @@
 """Pins are WebUI sidecar data, mirrored best-effort into the Agent's state.db.
 
-``/api/session/pin`` saves the sidecar exactly as before and the response depends
-only on that save. The write into ``state.db.sessions.pinned`` -- the flag Hermes
-Desktop and ``hermes sessions pin`` share -- is best-effort: no column, no row, or
-a writer holding the database costs the other app the update, never this request.
-The sidebar reads that column as an extra input, so a pin made in Desktop or the
-CLI shows up here without ever clearing a WebUI pin.
+``/api/session/pin`` saves the sidecar as before, so the mirror never fails the response.
+The sidebar reads ``state.db.sessions.pinned`` as an extra input, so a pin made in
+Desktop or the CLI shows here without ever clearing a WebUI pin.
 """
 
-import pathlib
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from types import SimpleNamespace
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+import pytest
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
 def _make_state_db(path, *, rows=(("s1", 0),), pinned_column=True):
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
-    try:
+    with closing(sqlite3.connect(str(path))) as conn:
         if pinned_column:
             conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, pinned INTEGER NOT NULL DEFAULT 0)")
             conn.executemany("INSERT INTO sessions (id, pinned) VALUES (?, ?)", list(rows))
@@ -30,32 +26,27 @@ def _make_state_db(path, *, rows=(("s1", 0),), pinned_column=True):
             conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
             conn.executemany("INSERT INTO sessions (id) VALUES (?)", [(sid,) for sid, *_ in rows])
         conn.commit()
-    finally:
-        conn.close()
 
 
 def _db_snapshot(path):
-    """``(columns, {id: pinned})`` of a state.db, or bytes when there is no pin column."""
+    """``(columns, {id: pinned})`` of a state.db, or pins=None when there is no pin column."""
     conn = sqlite3.connect(str(path))
-    try:
+    with closing(conn):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-        pins = (
+        pinned = (
             {row[0]: bool(row[1]) for row in conn.execute("SELECT id, pinned FROM sessions")}
             if "pinned" in columns else None
         )
-        return columns, pins
-    finally:
-        conn.close()
+        return columns, pinned
 
 
 def _homes(tmp_path, monkeypatch, names=("default",)):
     """Give each profile its own home directory; return ``{name: Path}``."""
     import api.profiles as profiles
 
-    homes = {}
-    for name in names:
-        homes[name] = tmp_path / name
-        homes[name].mkdir(parents=True, exist_ok=True)
+    homes = {name: tmp_path / name for name in names}
+    for home in homes.values():
+        home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(
         profiles, "_resolve_profile_home_for_name",
         lambda name: str(homes.get(name or "default", homes["default"])),
@@ -66,9 +57,7 @@ def _homes(tmp_path, monkeypatch, names=("default",)):
 
 
 class _PinSession:
-    """Sidecar session fake: ``save()`` is all the pin route needs from it."""
-
-    archived = False
+    """Sidecar session fake: the pin route only needs ``compact()`` and ``save()``."""
 
     def __init__(self, sid, profile="default"):
         self.session_id, self.profile, self.pinned = sid, profile, False
@@ -80,12 +69,25 @@ class _PinSession:
         self.saved = bool(self.pinned)
 
 
+def _webui_rows(*specs):
+    """Sidebar rows as ``all_sessions()`` returns them, from ``(sid, profile, pinned)``."""
+    return [
+        {"session_id": sid, "profile": profile, "pinned": pinned, "session_source": "webui"}
+        for sid, profile, pinned in specs
+    ]
+
+
 def _pin_endpoint(monkeypatch, sessions, *, limit=10):
     """Stub the HTTP envelope of ``/api/session/pin``; return ``post(sid, pinned)``."""
     from api import routes
 
-    bodies, responses, locks = {}, {}, {}
-    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda sid: locks.setdefault(sid, threading.RLock()))
+    state = {}
+
+    def reply(status, payload):
+        state["response"] = (status, payload)
+        return True
+
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda _sid: threading.RLock())
     monkeypatch.setattr(routes, "get_session", lambda sid, **kw: sessions[sid])
     monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda _sid, s: s)
     monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda _sid: False)
@@ -97,29 +99,32 @@ def _pin_endpoint(monkeypatch, sessions, *, limit=10):
     monkeypatch.setattr(routes, "publish_session_list_changed", lambda *a, **kw: None)
     monkeypatch.setattr(routes, "_guard_request_session_visibility", lambda *a, **kw: True)
     monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
-    monkeypatch.setattr(routes, "read_body", lambda handler: bodies[threading.current_thread().name])
-
-    def reply(status, payload):
-        responses[threading.current_thread().name] = (status, payload)
-        return True
-
+    monkeypatch.setattr(routes, "read_body", lambda handler: state["body"])
     monkeypatch.setattr(routes, "j", lambda h, payload, status=200, extra_headers=None: reply(status, payload))
     monkeypatch.setattr(routes, "bad", lambda h, msg, status=400: reply(status, {"error": msg}))
 
     def post(sid, pinned=True):
-        name = threading.current_thread().name
-        bodies[name] = {"session_id": sid, "pinned": pinned}
+        state["body"] = {"session_id": sid, "pinned": pinned}
         routes.handle_post(object(), SimpleNamespace(path="/api/session/pin"))
-        return responses.pop(name)
+        return state.pop("response")
 
     return post
 
 
-def _sidebar_payload(monkeypatch, rows, *, active_profile="default", all_profiles=False):
-    """Build the sidebar payload over *rows*, with listing and pruning stubbed out.
+def _pin_setup(tmp_path, monkeypatch, **db_kwargs):
+    """Homes, a default state.db and a pin endpoint wired to one fake sidecar session."""
+    homes = _homes(tmp_path, monkeypatch)
+    db = homes["default"] / "state.db"
+    _make_state_db(db, **db_kwargs)
+    sessions = {"s1": _PinSession("s1")}
+    return db, sessions, _pin_endpoint(monkeypatch, sessions)
 
-    Returns the row list in payload order, so two profiles that keep the same session
-    id stay distinguishable.
+
+def _sidebar_payload(monkeypatch, rows, *, active_profile="default", all_profiles=False):
+    """Build the sidebar payload over *rows* with listing and pruning stubbed out.
+
+    Returns the row list in payload order, so two profiles keeping the same session id
+    stay distinguishable.
     """
     from api import routes
 
@@ -130,53 +135,47 @@ def _sidebar_payload(monkeypatch, rows, *, active_profile="default", all_profile
     monkeypatch.setattr(routes, "_enrich_sidebar_lineage_metadata", lambda _rows: None)
     monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
     monkeypatch.setattr(routes, "_prune_orphaned_webui_zero_message_sessions", lambda rows, **kw: list(rows))
-    monkeypatch.setattr(
-        routes, "get_cli_sessions",
-        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("CLI listing must not run")),
-    )
-    payload = routes._build_session_list_cache_payload(
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda *a, **kw: pytest.fail("CLI listing must not run"))
+    return routes._build_session_list_cache_payload(
         active_profile=active_profile,
         all_profiles=all_profiles,
         show_cli_sessions=False,
         show_previous_messaging_sessions=False,
         show_cron_sessions=False,
         include_archived=False,
-    )
-    return payload["sessions"]
+    )["sessions"]
 
 
-def _sidebar_rows(monkeypatch, rows, *, active_profile="default", all_profiles=False):
-    return {
-        row["session_id"]: row
-        for row in _sidebar_payload(
-            monkeypatch, rows, active_profile=active_profile, all_profiles=all_profiles,
-        )
-    }
+def _sidebar_rows(monkeypatch, rows, **kwargs):
+    return {row["session_id"]: row for row in _sidebar_payload(monkeypatch, rows, **kwargs)}
+
+
+def _pinned_flags(payload_rows):
+    """``{(profile, session_id): pinned}`` — keeps same-id rows from two owners apart."""
+    return {(row["profile"], row["session_id"]): row["pinned"] for row in payload_rows}
 
 
 # ── the pin route never fails because of the mirror ──────────────────────────
 
-def test_pin_and_unpin_save_the_sidecar_when_state_db_has_no_pin_column(tmp_path, monkeypatch):
-    homes = _homes(tmp_path, monkeypatch)
-    db = homes["default"] / "state.db"
-    _make_state_db(db, rows=(("s1", 0),), pinned_column=False)
-    sessions = {"s1": _PinSession("s1")}
-    post = _pin_endpoint(monkeypatch, sessions)
+@pytest.mark.parametrize("db_kwargs,pins", [
+    ({"rows": (("s1", 0),), "pinned_column": False}, None),
+    ({"rows": ()}, {}),
+], ids=["no-pin-column", "no-row"])
+def test_pin_and_unpin_save_the_sidecar_when_the_mirror_cannot_land(
+    tmp_path, monkeypatch, db_kwargs, pins,
+):
+    db, sessions, post = _pin_setup(tmp_path, monkeypatch, **db_kwargs)
 
     assert post("s1", True)[0] == 200
     assert sessions["s1"].pinned is True and sessions["s1"].saved is True
     assert post("s1", False)[0] == 200
     assert sessions["s1"].pinned is False and sessions["s1"].saved is False
-    # A mirror that cannot land must not add the column the Agent did not create.
-    assert "pinned" not in _db_snapshot(db)[0]
+    # `pins=None` means the Agent never created the column; {} means it never created the row.
+    assert _db_snapshot(db)[1] == pins
 
 
 def test_pin_and_unpin_save_the_sidecar_while_another_writer_holds_state_db(tmp_path, monkeypatch):
-    homes = _homes(tmp_path, monkeypatch)
-    db = homes["default"] / "state.db"
-    _make_state_db(db, rows=(("s1", 0),))
-    sessions = {"s1": _PinSession("s1")}
-    post = _pin_endpoint(monkeypatch, sessions)
+    db, sessions, post = _pin_setup(tmp_path, monkeypatch, rows=(("s1", 0),))
 
     holder = sqlite3.connect(str(db), isolation_level=None)
     try:
@@ -186,7 +185,7 @@ def test_pin_and_unpin_save_the_sidecar_while_another_writer_holds_state_db(tmp_
         elapsed = time.monotonic() - started
         assert status == 200
         assert sessions["s1"].saved is True
-        # The wait is bounded by the short busy timeout (~0.5 s), not unbounded.
+        # Bounded by the short busy timeout (~0.5 s), not unbounded.
         assert elapsed < 3
         assert _db_snapshot(db)[1] == {"s1": False}
         assert post("s1", False)[0] == 200
@@ -197,11 +196,7 @@ def test_pin_and_unpin_save_the_sidecar_while_another_writer_holds_state_db(tmp_
 
 
 def test_pin_and_unpin_save_the_sidecar_when_the_state_db_row_is_missing(tmp_path, monkeypatch):
-    homes = _homes(tmp_path, monkeypatch)
-    db = homes["default"] / "state.db"
-    _make_state_db(db, rows=())
-    sessions = {"s1": _PinSession("s1")}
-    post = _pin_endpoint(monkeypatch, sessions)
+    db, sessions, post = _pin_setup(tmp_path, monkeypatch, rows=())
 
     assert post("s1", True)[0] == 200
     assert sessions["s1"].saved is True
@@ -212,11 +207,7 @@ def test_pin_and_unpin_save_the_sidecar_when_the_state_db_row_is_missing(tmp_pat
 
 
 def test_pin_mirrors_to_state_db_and_unpin_clears_it(tmp_path, monkeypatch):
-    homes = _homes(tmp_path, monkeypatch)
-    db = homes["default"] / "state.db"
-    _make_state_db(db, rows=(("s1", 0), ("other", 0)))
-    sessions = {"s1": _PinSession("s1")}
-    post = _pin_endpoint(monkeypatch, sessions)
+    db, _sessions, post = _pin_setup(tmp_path, monkeypatch, rows=(("s1", 0), ("other", 0)))
 
     assert post("s1", True)[0] == 200
     assert _db_snapshot(db)[1] == {"s1": True, "other": False}
@@ -230,10 +221,7 @@ def test_desktop_pin_shows_in_the_sidebar(tmp_path, monkeypatch):
     homes = _homes(tmp_path, monkeypatch)
     _make_state_db(homes["default"] / "state.db", rows=(("s1", 1), ("s2", 0)))
 
-    rows = _sidebar_rows(monkeypatch, [
-        {"session_id": "s1", "profile": "default", "pinned": False, "session_source": "webui"},
-        {"session_id": "s2", "profile": "default", "pinned": False, "session_source": "webui"},
-    ])
+    rows = _sidebar_rows(monkeypatch, _webui_rows(("s1", "default", False), ("s2", "default", False)))
 
     assert rows["s1"]["pinned"] is True
     assert rows["s2"]["pinned"] is False
@@ -244,9 +232,7 @@ def test_webui_pin_survives_a_mirror_that_did_not_land(tmp_path, monkeypatch):
     # state.db still says unpinned: the mirror lost the writer when the user pinned.
     _make_state_db(homes["default"] / "state.db", rows=(("s1", 0),))
 
-    rows = _sidebar_rows(monkeypatch, [
-        {"session_id": "s1", "profile": "default", "pinned": True, "session_source": "webui"},
-    ])
+    rows = _sidebar_rows(monkeypatch, _webui_rows(("s1", "default", True)))
 
     assert rows["s1"]["pinned"] is True
 
@@ -257,10 +243,7 @@ def test_sidebar_build_never_writes_state_db(tmp_path, monkeypatch):
     _make_state_db(db, rows=(("s1", 1), ("s2", 0)))
     before = (db.read_bytes(), _db_snapshot(db))
 
-    rows = _sidebar_rows(monkeypatch, [
-        {"session_id": "s1", "profile": "default", "pinned": False, "session_source": "webui"},
-        {"session_id": "s2", "profile": "default", "pinned": True, "session_source": "webui"},
-    ])
+    rows = _sidebar_rows(monkeypatch, _webui_rows(("s1", "default", False), ("s2", "default", True)))
 
     assert (db.read_bytes(), _db_snapshot(db)) == before
     assert {sid: row["pinned"] for sid, row in rows.items()} == {"s1": True, "s2": True}
@@ -283,50 +266,30 @@ def test_profile_a_sidebar_never_reads_or_writes_profile_b(tmp_path, monkeypatch
 
     monkeypatch.setattr(state_sync, "read_state_db_pinned_ids", spy)
 
-    rows = _sidebar_rows(monkeypatch, [
-        {"session_id": "s1", "profile": "default", "pinned": False, "session_source": "webui"},
-        {"session_id": "s2", "profile": "default", "pinned": False, "session_source": "webui"},
-    ])
+    rows = _sidebar_rows(monkeypatch, _webui_rows(("s1", "default", False), ("s2", "default", False)))
 
     assert opened == [str(db_a)]
     assert {sid: row["pinned"] for sid, row in rows.items()} == {"s1": False, "s2": True}
     assert (db_b.read_bytes(), _db_snapshot(db_b)) == before_b
 
 
-def test_all_profiles_same_id_keeps_each_owners_own_pin(tmp_path, monkeypatch):
+def test_all_profiles_marks_only_each_owners_own_pin(tmp_path, monkeypatch):
     """A copied/restored history id in two profiles must not borrow the other's pin."""
     homes = _homes(tmp_path, monkeypatch, names=("default", "work"))
     # A/default keeps s1 unpinned; B/work pins its own s1 and one other session.
     _make_state_db(homes["default"] / "state.db", rows=(("s1", 0),))
     _make_state_db(homes["work"] / "state.db", rows=(("s1", 1), ("b_other", 0), ("b_pinned", 1)))
 
-    rows = _sidebar_payload(monkeypatch, [
-        {"session_id": "s1", "profile": "default", "pinned": False, "session_source": "webui"},
-        {"session_id": "b_other", "profile": "work", "pinned": False, "session_source": "webui"},
-        {"session_id": "b_pinned", "profile": "work", "pinned": False, "session_source": "webui"},
-    ], all_profiles=True)
+    rows = _pinned_flags(_sidebar_payload(monkeypatch, _webui_rows(
+        ("s1", "default", False), ("s1", "work", False),
+        ("b_other", "work", False), ("b_pinned", "work", False),
+    ), all_profiles=True))
 
-    assert {(row["profile"], row["session_id"]): row["pinned"] for row in rows} == {
-        ("default", "s1"): False,
-        ("work", "b_other"): False,
-        ("work", "b_pinned"): True,
-    }
-
-
-def test_all_profiles_same_id_marks_only_the_owning_row(tmp_path, monkeypatch):
-    """One row per owner, same id: only work's row renders pinned."""
-    homes = _homes(tmp_path, monkeypatch, names=("default", "work"))
-    _make_state_db(homes["default"] / "state.db", rows=(("s1", 0),))
-    _make_state_db(homes["work"] / "state.db", rows=(("s1", 1),))
-
-    rows = _sidebar_payload(monkeypatch, [
-        {"session_id": "s1", "profile": "default", "pinned": False, "session_source": "webui"},
-        {"session_id": "s1", "profile": "work", "pinned": False, "session_source": "webui"},
-    ], all_profiles=True)
-
-    assert {(row["profile"], row["session_id"]): row["pinned"] for row in rows} == {
+    assert rows == {
         ("default", "s1"): False,
         ("work", "s1"): True,
+        ("work", "b_other"): False,
+        ("work", "b_pinned"): True,
     }
 
 
@@ -343,13 +306,11 @@ def test_renamed_root_and_default_rows_share_one_pin_owner(tmp_path, monkeypatch
     _make_state_db(homes["default"] / "state.db", rows=(("s1", 0), ("root_pinned", 1)))
     _make_state_db(homes["work"] / "state.db", rows=(("w_pinned", 1),))
 
-    rows = _sidebar_payload(monkeypatch, [
-        {"session_id": "s1", "profile": "default", "pinned": False, "session_source": "webui"},
-        {"session_id": "root_pinned", "profile": "kinni", "pinned": False, "session_source": "webui"},
-        {"session_id": "w_pinned", "profile": "work", "pinned": False, "session_source": "webui"},
-    ], all_profiles=True)
+    rows = _pinned_flags(_sidebar_payload(monkeypatch, _webui_rows(
+        ("s1", "default", False), ("root_pinned", "kinni", False), ("w_pinned", "work", False),
+    ), all_profiles=True))
 
-    assert {(row["profile"], row["session_id"]): row["pinned"] for row in rows} == {
+    assert rows == {
         ("default", "s1"): False,
         ("kinni", "root_pinned"): True,
         ("work", "w_pinned"): True,
@@ -360,31 +321,26 @@ def test_agent_projection_carries_the_state_db_pin(tmp_path, monkeypatch):
     from api import models
 
     db = tmp_path / "state.db"
-    conn = sqlite3.connect(str(db))
-    try:
+    with closing(sqlite3.connect(str(db))) as conn:
         conn.executescript(
-            """
-            CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, model TEXT,
-                                   started_at REAL NOT NULL, message_count INTEGER DEFAULT 0,
-                                   pinned INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT,
-                                   content TEXT, timestamp REAL);
-            """
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, model TEXT,"
+            " started_at REAL NOT NULL, message_count INTEGER DEFAULT 0,"
+            " pinned INTEGER NOT NULL DEFAULT 0);"
+            " CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT,"
+            " content TEXT, timestamp REAL);"
         )
-        for sid, pinned in (("cli_pinned", 1), ("cli_plain", 0)):
-            conn.execute(
-                "INSERT INTO sessions (id, source, title, model, started_at, message_count, pinned)"
-                " VALUES (?, 'cli', ?, 'openai/gpt-5', 1.0, 2, ?)",
-                (sid, sid, pinned),
-            )
-            conn.execute(
-                "INSERT INTO messages (id, session_id, role, content, timestamp)"
-                " VALUES (?, ?, 'user', 'hi', 1.5)",
-                (f"m_{sid}", sid),
-            )
+        sessions = (("cli_pinned", 1), ("cli_plain", 0))
+        conn.executemany(
+            "INSERT INTO sessions (id, source, title, model, started_at, message_count, pinned)"
+            " VALUES (?, 'cli', ?, 'openai/gpt-5', 1.0, 2, ?)",
+            [(sid, sid, pinned) for sid, pinned in sessions],
+        )
+        conn.executemany(
+            "INSERT INTO messages (id, session_id, role, content, timestamp)"
+            " VALUES (?, ?, 'user', 'hi', 1.5)",
+            [(f"m_{sid}", sid) for sid, _pinned in sessions],
+        )
         conn.commit()
-    finally:
-        conn.close()
 
     monkeypatch.setattr(models, "get_last_workspace", lambda *_a, **_kw: str(tmp_path))
     monkeypatch.setattr(models, "ensure_cron_project", lambda *_a, **_kw: None, raising=False)
