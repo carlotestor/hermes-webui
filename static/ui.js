@@ -23227,8 +23227,20 @@ function _toolTargetLabel(tc){
   else if(kind==='memory') raw=a.target||a.name||a.action||'';
   else if(kind==='read'||kind==='write') raw=a.path||a.file_path||a.file||a.target||a.name||'';
   else if(kind==='search'||kind==='web') raw=a.query||a.pattern||a.url||a.uri||'';
+  else if(kind==='delegate') raw=_toolDelegateTargetLabel(tc,a);
   else raw=a.cmd||a.command||a.path||a.file_path||a.file||a.uri||a.url||a.query||a.pattern||a.dir||a.task||a.name||'';
   return _redactToolTargetLabel(_decodeToolLabelEntities(String(raw).split('\n')[0].trim()));
+}
+// delegate_task names its work in goal or a tasks batch; saved args may be a truncated string, so the result's count wins.
+function _toolDelegateTargetLabel(tc,a){
+  if(a.action&&a.action!=='spawn') return `subagents (${a.action})`;
+  const counted=String(tc&&tc.snippet||'').match(/"count"\s*:\s*(\d+)/);
+  let tasks=a.tasks;
+  const n=counted?+counted[1]:Array.isArray(tasks)?tasks.length:(String(tasks||'').match(/['"]goal['"]\s*:/g)||[]).length;
+  if(n>1) return `${n} subagents`;
+  if(Array.isArray(tasks)) tasks=tasks[0]&&tasks[0].goal;
+  else if(typeof tasks==='string') tasks=(tasks.match(/['"]goal['"]\s*:\s*['"]([^'"]+)/)||[])[1];
+  return tasks||a.goal||a.task||'';
 }
 function _toolReadRangeLabel(tc){
   const name=String(tc&&tc.name||'').toLowerCase().replace(/[^a-z0-9]+/g,'_');
