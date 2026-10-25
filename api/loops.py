@@ -91,19 +91,27 @@ def _turn_running(turn):
         return bool(stream_id) and (live or stream_id in config.ACTIVE_RUNS)
 
 
+@contextmanager
+def _loop_manager(session_id, profile):
+    """The session's LoopManager in its profile's store; None when the agent isn't installed."""
+    try:
+        from hermes_cli.loops import LoopManager
+    except ImportError:  # no agent installed: no loop store
+        yield None
+        return
+    with _home(profile):
+        yield LoopManager(session_id=session_id)
+
+
 def retag_session_profile(session, profile, retag):
     """Run `retag(session, profile)` under the loop lock; a real move clears the loop left in the old profile."""
     with _session_lock(session.session_id):
         old = getattr(session, "profile", None)
         session_profile, result = retag(session, profile)
-        if result != "retagged":
-            return session_profile, result
-        try:
-            from hermes_cli.loops import LoopManager
-        except ImportError:  # no agent installed: no loop store, nothing to clear
-            return session_profile, result
-        with _home(old):
-            LoopManager(session_id=session.session_id).clear()
+        if result == "retagged":
+            with _loop_manager(session.session_id, old) as mgr:
+                if mgr:
+                    mgr.clear()
         return session_profile, result
 
 
@@ -117,14 +125,10 @@ def archive_guard(session_id):
     with _session_lock(session_id):
         yield out
         s = out.get("session")
-        if s is None or not getattr(s, "archived", False):
-            return
-        try:
-            from hermes_cli.loops import LoopManager
-        except ImportError:  # no agent installed: no loop store
-            return
-        with _home(getattr(s, "profile", None)):
-            LoopManager(session_id=session_id).pause(reason="session archived")
+        if s is not None and getattr(s, "archived", False):
+            with _loop_manager(session_id, getattr(s, "profile", None)) as mgr:
+                if mgr:
+                    mgr.pause(reason="session archived")
 
 
 def run_loop_command(session_id, args, request_profile=None):
