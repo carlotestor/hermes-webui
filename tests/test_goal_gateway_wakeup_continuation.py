@@ -674,6 +674,30 @@ class _EvalMgr:
     def next_continuation_prompt(self):
         return f"[Continuing toward your standing goal]\nGoal: {self.state.goal}" if self.is_active() else None
 
+    def pause(self, reason="user-paused"):
+        self.state.status = "paused"
+        self.state.paused_reason = reason
+        return self.state
+
+
+@pytest.mark.parametrize("verdict", ["wait", "continue"])
+def test_in_turn_adoption_pauses_a_goal_past_its_turn_budget(verdict):
+    """A native WAIT parks without a budget check; once the barrier lifts the
+    adopted decision must pause at max_turns, not continue (156/100)."""
+    st = _EvalState()
+    st.turns_used, st.max_turns, st.last_verdict = 156, 100, verdict
+    decision = webui_goals._decision_from_evaluated_state(_EvalMgr(st, waiting=False), st)
+    assert decision is not None
+    assert decision["should_continue"] is False
+    assert decision["continuation_prompt"] is None
+    assert decision["status"] == "paused"
+    assert st.status == "paused"
+    assert st.paused_reason == "turn budget exhausted (156/100)"
+    under = _EvalState()
+    under.turns_used, under.max_turns, under.last_verdict = 99, 100, verdict
+    under_decision = webui_goals._decision_from_evaluated_state(_EvalMgr(under), under)
+    assert under_decision is not None and under_decision["should_continue"] is True
+
 
 @pytest.mark.parametrize("status", ["cleared", "", "bogus"])
 def test_in_turn_adoption_never_continues_a_cleared_or_unknown_goal(status):

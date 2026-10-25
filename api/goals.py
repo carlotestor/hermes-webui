@@ -901,6 +901,26 @@ def _decision_from_evaluated_state(mgr: Any, state: Any) -> Optional[Dict[str, A
             ),
         }
 
+    # A native WAIT parks without a budget check, so a lifted barrier can leave
+    # an active goal past max_turns; pause it here as the native judge would.
+    if max_turns > 0 and turns_used >= max_turns:
+        budget_reason = f"turn budget exhausted ({turns_used}/{max_turns})"
+        try:
+            mgr.pause(reason=budget_reason)
+        except Exception:
+            return None
+        return {
+            "status": "paused",
+            "should_continue": False,
+            "continuation_prompt": None,
+            "verdict": verdict,
+            "reason": reason or budget_reason,
+            "message": (
+                f"⏸ Goal paused — {turns_used}/{max_turns} turns used. "
+                "Use /goal resume to keep going, or /goal clear to stop."
+            ),
+        }
+
     prompt = None
     if hasattr(mgr, "next_continuation_prompt"):
         try:
