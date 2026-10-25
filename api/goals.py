@@ -1632,15 +1632,22 @@ def restore_pending_goal_continuation(session_id: str, receipt) -> bool:
             cont_id = ""
         _cfg.PENDING_GOAL_CONTINUATION.add(session_id)
         if record is not None:
+            deadline = record.get("browser_grace_deadline")
+            # A record with no usable lease deadline has no browser dispatcher
+            # left, so the server owns the retry.
+            server_owned = bool(record.get("detached_owned")) or not isinstance(
+                deadline, (int, float)
+            )
+            if cont_id and server_owned:
+                record["detached_owned"] = True
             _cfg.PENDING_GOAL_CONTINUATION_PROMPTS[session_id] = record
             # The rollback un-consumed this ID: it is dispatchable again.
             _SPENT_GOAL_CONTINUATION_IDS.pop((session_id, cont_id), None)
-            deadline = record.get("browser_grace_deadline")
-            if cont_id and isinstance(deadline, (int, float)):
-                if record.get("detached_owned"):
-                    rearm = (cont_id, max(0.0, float(GOAL_CONTINUATION_BROWSER_GRACE_SECONDS)))
-                else:
-                    rearm = (cont_id, max(0.0, float(deadline) - time.monotonic()))
+            if cont_id and server_owned:
+                # One grace out: a persistently failing launch must not hot-loop.
+                rearm = (cont_id, max(0.0, float(GOAL_CONTINUATION_BROWSER_GRACE_SECONDS)))
+            elif cont_id and isinstance(deadline, (int, float)):
+                rearm = (cont_id, max(0.0, float(deadline) - time.monotonic()))
     if rearm is not None:
         _arm_browser_grace_timer(session_id, rearm[0], rearm[1])
     return True

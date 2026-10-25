@@ -1694,6 +1694,37 @@ def test_restore_rearms_a_detached_record_one_grace_out(monkeypatch):
         webui_goals.clear_pending_goal_continuation(sid)
 
 
+def test_restore_rearms_a_webui_owned_record_without_a_lease(monkeypatch):
+    """The no-subscriber path marks a record WebUI-owned with no lease deadline:
+    its failed launch must still leave exactly one automatic retry."""
+    sid = "sid-review-5639825728-no-lease"
+    webui_goals.clear_pending_goal_continuation(sid)
+    monkeypatch.setattr(
+        webui_goals, "GOAL_CONTINUATION_BROWSER_GRACE_SECONDS", 0.2, raising=False
+    )
+    started = []
+    monkeypatch.setattr(
+        webui_goals,
+        "start_detached_goal_continuation",
+        lambda s, prompt, cont_id: started.append((s, prompt, cont_id)),
+    )
+    try:
+        cid = webui_goals.register_pending_goal_continuation(sid, "continue the goal")
+        assert cid
+        assert webui_goals.mark_detached_goal_continuation(sid, cid)
+        receipt = webui_goals.consume_pending_goal_continuation(sid, cid)
+        assert isinstance(receipt, dict)
+        assert "browser_grace_deadline" not in receipt
+        assert webui_goals.restore_pending_goal_continuation(sid, receipt) is True
+        assert sid in webui_goals._BROWSER_GRACE_TIMERS
+        assert _wait_for(lambda: bool(started), timeout=5.0), (
+            "a WebUI-owned record that never held a lease got no retry"
+        )
+        assert started == [(sid, "continue the goal", cid)]
+    finally:
+        webui_goals.clear_pending_goal_continuation(sid)
+
+
 def test_stale_token_rejection_keeps_the_browser_draft():
     """Review 5639825728: a stale token is refused, so the browser must keep the
     user's text and drop only the spent ID (a resubmit would be refused again)."""
