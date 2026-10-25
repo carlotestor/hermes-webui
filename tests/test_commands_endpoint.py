@@ -591,8 +591,7 @@ def test_list_commands_degrades_when_agent_missing(monkeypatch):
 def test_commands_exec_profile_gate_matches_master(monkeypatch):
     """Only the generic POST session guard checks session_id: one check per request, same as master."""
     import api.commands as commands
-    from api import routes
-    import api.loops as loops
+    from api import loops, routes
 
     class _H:
         def __init__(self, raw):
@@ -600,7 +599,7 @@ def test_commands_exec_profile_gate_matches_master(monkeypatch):
             self.headers, self.request, self.status, self.body = {"Content-Length": str(len(raw))}, None, None, bytearray()
         def send_response(self, s): self.status = s
         def send_header(self, *a): pass
-        def end_headers(self): pass
+        end_headers = send_header
         def write(self, d): self.body.extend(d)
 
     checked = []

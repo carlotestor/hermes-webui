@@ -48,22 +48,6 @@ def _due(agent, sid="s1"):
 
 
 @requires_agent_modules
-def test_retag_between_load_and_launch_never_runs_other_profile(tmp_path, monkeypatch):
-    session = NS(session_id="s1", profile=None, messages=[])
-    agent, loops, started = _setup(tmp_path, monkeypatch, session)
-
-    def retag(sid):  # chat start retags the empty session to profile b after the scheduler listed it
-        session.profile = "b"
-        return False
-
-    monkeypatch.setattr(agent, "goal_blocks_loop_tick", retag)
-    loops.run_due_loops()
-    assert started == []
-    with loops._home(None):
-        assert agent.load_loop("s1").status == "cleared"  # the loop left in profile a is dropped
-
-
-@requires_agent_modules
 @pytest.mark.parametrize("pinned,expected_profile,result,loop_status", [
     (False, "b", "retagged", "cleared"),
     (True, None, "pinned_empty", "active"),
@@ -77,7 +61,7 @@ def test_retag_session_profile_clears_old_loop_only_on_a_move(
     assert session.profile == expected_profile
     with loops._home(None):
         assert agent.load_loop("s1").status == loop_status
-    if result == "retagged":  # both retag sites in routes.py go through the helper, carrying the request profile
+    if result == "retagged":  # both retag sites go through the helper, carrying the request profile
         src = _src("api/routes.py")
         assert src.count("retag_session_profile(\n") == 2
         assert src.count("s, requested_profile, _retag_empty_session_profile") == 2
@@ -85,19 +69,24 @@ def test_retag_session_profile_clears_old_loop_only_on_a_move(
 
 
 @requires_agent_modules
-def test_stop_from_another_writer_is_not_overwritten(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mid_pass_writer", ["retag", "cli_stop"])
+def test_pass_launches_nothing_after_a_concurrent_move_or_stop(tmp_path, monkeypatch, mid_pass_writer):
+    """A retag or a CLI stop landing after the pass loaded the loop: no turn starts, the loop is dropped."""
     session = NS(session_id="s1", profile=None, messages=[])
     agent, loops, started = _setup(tmp_path, monkeypatch, session)
 
-    def cli_stop(sid):  # another process (CLI) stops the loop after the scheduler loaded it
-        agent.clear_loop(sid)
+    def mid_pass(sid):
+        if mid_pass_writer == "retag":  # chat start retags the empty session after the scheduler listed it
+            session.profile = "b"
+        else:  # another process (CLI) stops the loop after the scheduler loaded it
+            agent.clear_loop(sid)
         return False
 
-    monkeypatch.setattr(agent, "goal_blocks_loop_tick", cli_stop)
+    monkeypatch.setattr(agent, "goal_blocks_loop_tick", mid_pass)
     loops.run_due_loops()
     assert started == []
     with loops._home(None):
-        assert agent.load_loop("s1").status == "cleared"
+        assert agent.load_loop("s1").status == "cleared"  # the loop left in profile a is dropped
 
 
 @requires_agent_modules
