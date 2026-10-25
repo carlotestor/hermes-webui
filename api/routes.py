@@ -27868,11 +27868,8 @@ def _start_chat_stream_for_session(
     # newer continuation was armed for this session meanwhile.
     consumed_goal_continuation_receipt = None
 
-    # Review 5593825504 Must fix 2/3: a server-side goal continuation
-    # (source="goal_wakeup") is admitted ONLY by consuming its own record by ID,
-    # under the session lock that /goal pause/clear also take, and only while
-    # the goal is still active. An invalid wakeup is rejected, never downgraded
-    # to an ordinary goal_related=False turn.
+    # A goal_wakeup turn is admitted ONLY by consuming its own record by ID,
+    # under the session lock /goal pause/clear take; never downgraded.
     goal_wakeup_turn = str(source or "") == "goal_wakeup"
     goal_wakeup_rejection = None
     # A continuation the server already dispatched (browser lease expired, or
@@ -27925,25 +27922,20 @@ def _start_chat_stream_for_session(
                 consumed_goal_continuation = True
                 consumed_goal_continuation_receipt = receipt
             else:
-                # The pending record is the ONLY authority: an explicit token
-                # it did not consume is spent or superseded, never an ordinary
-                # turn (the tombstone may only label it).
+                # The pending record is the ONLY authority: a token it did not
+                # consume is spent or superseded, never an ordinary turn.
                 from api.goals import goal_continuation_already_dispatched
 
                 already_dispatched = goal_continuation_already_dispatched(
                     s.session_id, goal_continuation_id
                 )
                 browser_continuation_rejection = {
-                    "error": (
-                        "goal_continuation_already_dispatched"
-                        if already_dispatched
-                        else "goal_continuation_stale"
-                    ),
-                    "reason": (
-                        "goal_continuation_consumed"
-                        if already_dispatched
-                        else "goal_continuation_unmatched"
-                    ),
+                    "error": "goal_continuation_already_dispatched"
+                    if already_dispatched
+                    else "goal_continuation_stale",
+                    "reason": "goal_continuation_consumed"
+                    if already_dispatched
+                    else "goal_continuation_unmatched",
                     "_status": 409,
                 }
                 return
@@ -29147,9 +29139,7 @@ def _handle_goal_command(handler, body):
                 stream_running=stream_running,
                 profile_home=profile_home,
             )
-        # Review 5593825504 Must fix 3: pause/resume/clear serialize with
-        # detached goal_wakeup admission on the session lock, so admission
-        # either sees the record + active goal before the change, or rejects.
+        # pause/resume/clear serialize with goal_wakeup admission on the lock.
         with _get_session_agent_lock(session_id):
             result = goal_command_payload(
                 session_id,
@@ -29260,18 +29250,9 @@ def _handle_goal_command(handler, body):
     if runner_goal_owned:
         return j(handler, payload)
 
-    # Review 5593825504 Should fix 1: /goal resume re-arms the loop. A pending
-    # continuation record is kept as-is; with none pending, resume kicks off a
-    # goal-related turn with the manager's next continuation prompt through the
-    # same kickoff path /goal <text> uses. No bare PENDING_GOAL_CONTINUATION
-    # writes.
-    # Review 5603344218 Must fix 2: when the pending record is WebUI-owned
-    # (detached), resume RETRIES it through the same admission with its existing
-    # continuation ID instead of starting a second dispatcher. That is what
-    # recovers a runner that stopped without dispatching — a pause landing
-    # between tear-down and preflight, or an admission rejected with 409 while
-    # the goal was paused — instead of stalling the goal until /goal clear.
-    # Browser-owned records are untouched: the browser holds that dispatch.
+    # Review 5593825504 Should fix 1: /goal resume re-arms the loop — it keeps
+    # a pending record, else kicks off the next continuation prompt; a
+    # WebUI-owned record is retried with its existing ID, never re-registered.
     if goal_adapter_action == "resume" and not stream_running and not payload.get("kickoff_prompt"):
         from api.goals import (
             peek_pending_goal_continuation_id,

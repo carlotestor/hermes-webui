@@ -810,10 +810,7 @@ def _decision_from_evaluated_state(mgr: Any, state: Any) -> Optional[Dict[str, A
             "message": msg,
         }
 
-    if status != "active":
-        # Cleared, inactive or an unknown status: no continuation may be
-        # derived from it (review 5593825504 Must fix 1). A goal cleared
-        # between the in-turn evaluation and this read must not restart.
+    def _inactive() -> Dict[str, Any]:
         return {
             "status": status or None,
             "should_continue": False,
@@ -822,16 +819,13 @@ def _decision_from_evaluated_state(mgr: Any, state: Any) -> Optional[Dict[str, A
             "reason": "no active goal",
             "message": "",
         }
+
+    if status != "active":
+        # Cleared or unknown: never derive a continuation from it.
+        return _inactive()
     try:
         if not mgr.is_active():
-            return {
-                "status": status or None,
-                "should_continue": False,
-                "continuation_prompt": None,
-                "verdict": "inactive",
-                "reason": "no active goal",
-                "message": "",
-            }
+            return _inactive()
     except Exception:
         return None
 
@@ -860,10 +854,8 @@ def _decision_from_evaluated_state(mgr: Any, state: Any) -> Optional[Dict[str, A
         }
 
     # Native ``evaluate_after_turn`` runs the quality gates BEFORE the judge
-    # and a failing gate short-circuits it WITHOUT touching ``last_verdict``.
-    # Gates run in order and stop at the first failure (earlier passing gates
-    # reset ``attempts`` to 0), so the first gate still carrying attempts and
-    # a non-zero exit is the one that failed this turn.
+    # and leaves ``last_verdict`` untouched on a failing one, so the first gate
+    # with attempts and a non-zero exit is the one that failed this turn.
     failed_gate = None
     for gate in list(getattr(state, "gates", None) or []):
         attempts = int(getattr(gate, "attempts", 0) or 0)
@@ -957,10 +949,9 @@ def stream_channel_has_subscribers(channel: Any) -> bool:
         return True
 
 
-# A browser hand-off is a LEASE, not the only dispatcher: the tab queues the
-# continuation only when it still owns the session at ``done`` time, so a tab
-# that switched away never posts it and the goal would stall. After this grace
-# the server dispatches the same record (same ID) itself.
+# A browser hand-off is a LEASE: a tab that switched away never posts the
+# queued continuation, so after this grace the server dispatches the same
+# record (same ID) itself.
 GOAL_CONTINUATION_BROWSER_GRACE_SECONDS = 15.0
 _BROWSER_GRACE_TIMERS: dict[str, Any] = {}
 _BROWSER_GRACE_LOCK = threading.Lock()
@@ -971,20 +962,29 @@ _SPENT_GOAL_CONTINUATION_IDS: "OrderedDict[tuple, None]" = OrderedDict()
 _SPENT_GOAL_CONTINUATION_LIMIT = 64
 
 
-def pending_goal_continuation_record(session_id: str) -> Optional[Dict[str, Any]]:
-    """Return a copy of the session's pending record, or None.
+def _locked_pending_record(session_id: str) -> Optional[Dict[str, Any]]:
+    """Live record when marker and record agree. Caller holds the record lock."""
+    if not session_id or session_id not in _cfg.PENDING_GOAL_CONTINUATION:
+        return None
+    record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(session_id)
+    return record if isinstance(record, dict) else None
 
-    ``grace_deadline`` is the monotonic time at which a browser-held record
-    stops being browser-only (:func:`hand_goal_continuation_to_browser`).
-    """
+
+def _locked_pending_record_matches(session_id: str, continuation_id: str) -> bool:
+    """True when the live record carries *continuation_id*. Caller holds the lock."""
+    record = _locked_pending_record(session_id)
+    current = str((record or {}).get("continuation_id") or "").strip()
+    return bool(current) and secrets.compare_digest(current, continuation_id)
+
+
+def pending_goal_continuation_record(session_id: str) -> Optional[Dict[str, Any]]:
+    """Copy of the session's pending record (lease deadline included), or None."""
     sid = str(session_id or "").strip()
     if not sid:
         return None
     with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
-        if sid not in _cfg.PENDING_GOAL_CONTINUATION:
-            return None
-        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(sid)
-        if not isinstance(record, dict):
+        record = _locked_pending_record(sid)
+        if not record:
             return None
         prompt = str(record.get("prompt") or "").strip()
         cid = str(record.get("continuation_id") or "").strip()
@@ -1010,9 +1010,8 @@ def _arm_browser_grace_timer(sid: str, cid: str, grace: float) -> None:
             if _BROWSER_GRACE_TIMERS.get(sid) is holder.get("timer"):
                 _BROWSER_GRACE_TIMERS.pop(sid, None)
         try:
-            # One wakeup per record: take the lease over, or — for a restored
-            # WebUI-owned record whose runner died with its launch — re-run it
-            # with the record's own ID.
+            # One wakeup per record: take the lease over, or re-run a restored
+            # server-owned record with its own ID.
             if not dispatch_browser_owned_goal_continuation(sid, cid):
                 retry_detached_goal_continuation(sid)
         except Exception:
@@ -1036,12 +1035,7 @@ def _arm_browser_grace_timer(sid: str, cid: str, grace: float) -> None:
 def hand_goal_continuation_to_browser(
     session_id: str, continuation_id: str, *, grace_seconds: float | None = None
 ) -> bool:
-    """Give an attached browser first refusal, with a server-side deadline.
-
-    Publishing ``goal_continue`` alone is not delivery: the tab only queues the
-    continuation while it is the active session at ``done`` time. The deadline
-    is what lets :func:`dispatch_browser_owned_goal_continuation` take over.
-    """
+    """Give an attached browser first refusal, with a server-side deadline."""
     sid = str(session_id or "").strip()
     cid = str(continuation_id or "").strip()
     if not sid or not cid:
@@ -1056,17 +1050,29 @@ def hand_goal_continuation_to_browser(
     except Exception:
         grace = GOAL_CONTINUATION_BROWSER_GRACE_SECONDS
     with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
-        if sid not in _cfg.PENDING_GOAL_CONTINUATION:
+        if not _locked_pending_record_matches(sid, cid):
             return False
-        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(sid)
-        if not isinstance(record, dict):
-            return False
-        current = str(record.get("continuation_id") or "").strip()
-        if not current or not secrets.compare_digest(current, cid):
-            return False
-        record["browser_grace_deadline"] = time.monotonic() + grace
+        _cfg.PENDING_GOAL_CONTINUATION_PROMPTS[sid]["browser_grace_deadline"] = (
+            time.monotonic() + grace
+        )
     _arm_browser_grace_timer(sid, cid, grace)
     return True
+
+
+def dispatch_goal_continuation(
+    session_id: str, continuation_id: str, channel: Any
+) -> bool:
+    """Lease the record to a live browser, else keep the server as dispatcher.
+
+    Returns True when the browser must receive ``goal_continue``; False when
+    the server owns the record and starts the turn at teardown.
+    """
+    cid = str(continuation_id or "").strip()
+    if stream_channel_has_subscribers(channel):
+        hand_goal_continuation_to_browser(session_id, cid)
+        return True
+    mark_detached_goal_continuation(session_id, cid)
+    return False
 
 
 def dispatch_browser_owned_goal_continuation(
@@ -1075,9 +1081,7 @@ def dispatch_browser_owned_goal_continuation(
     """Take over a browser-held continuation once its grace deadline passed.
 
     The record keeps its ID and gains ``detached_owned``, so admission stays
-    the single arbiter: a browser POST that lands anyway consumes nothing and
-    is rejected as an already-dispatched duplicate. A dispatch inside the
-    grace, a replaced record, or a pause/clear all make this a no-op.
+    the single arbiter for a browser POST that lands anyway.
     """
     record = pending_goal_continuation_record(session_id)
     if not record or record["detached_owned"]:
@@ -1099,9 +1103,7 @@ def dispatch_browser_owned_goal_continuation(
 def goal_continuation_already_dispatched(session_id: str, continuation_id: str) -> bool:
     """True when this process recorded admitting a record with this ID.
 
-    A LABEL, never an admission authority: the session's pending record is
-    what decides whether a token may start a turn, so a token this bounded
-    cache forgot is still rejected as stale (see api/routes.py admission).
+    A LABEL only: the pending record decides whether a token may start a turn.
     """
     key = (str(session_id or "").strip(), str(continuation_id or "").strip())
     if not key[0] or not key[1]:
@@ -1121,38 +1123,20 @@ def _note_goal_continuation_consumed(session_id: str, continuation_id: str) -> N
 
 
 def pending_goal_continuation_matches(session_id: str, continuation_id: str) -> bool:
-    """True when *session_id*'s pending record is exactly *continuation_id*.
-
-    Read under ``PENDING_GOAL_CONTINUATION_LOCK`` against the full record
-    (marker AND record with the same ID), not set membership.
-    """
+    """True when the session's pending record is exactly *continuation_id*."""
     sid = str(session_id or "").strip()
     cid = str(continuation_id or "").strip()
     if not sid or not cid:
         return False
     with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
-        if sid not in _cfg.PENDING_GOAL_CONTINUATION:
-            return False
-        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(sid)
-        if not isinstance(record, dict):
-            return False
-        current = str(record.get("continuation_id") or "").strip()
-        return bool(current) and secrets.compare_digest(current, cid)
+        return _locked_pending_record_matches(sid, cid)
 
 
 def detached_goal_continuation_skip_reason(session_id: str, continuation_id: str = "") -> str:
-    """Return why a detached goal continuation must NOT start, or '' if safe.
+    """Why a detached goal continuation must NOT start, or '' when it may.
 
-    Pre-flight only: ``start_session_turn(source="goal_wakeup")`` re-validates
-    the record ID and the active goal under the session lock at admission, so
-    a pause/clear between this check and the start is still rejected.
-
-    Invariants:
-      1. never after a user cancel / pause / clear (record gone or replaced,
-         goal inactive, or a cancel marker persisted on the transcript);
-      2. never races a queued user message or an active/pending turn;
-      3. stays inside the owning profile (goal state resolved from the
-         session's own profile home; isolated mode refuses foreign sessions).
+    Pre-flight only: admission re-validates the record and the active goal
+    under the session lock.
     """
     sid = str(session_id or "").strip()
     if not sid:
@@ -1209,13 +1193,8 @@ def start_detached_goal_continuation(
 ) -> None:
     """Run a registered continuation server-side (0 SSE subscribers).
 
-    The caller did NOT publish ``goal_continue`` for this record, so the
-    server is its only dispatcher. Admission consumes the record by ID.
-
-    A skipped preflight or a rejected admission leaves the record in place
-    (and detached-owned): :func:`retry_detached_goal_continuation` runs it
-    again with this same ID on ``/goal resume`` and when the session goes
-    idle, so a stopped runner never silently ends the goal loop.
+    Admission consumes the record by ID; a stopped runner is retried with the
+    same ID by :func:`retry_detached_goal_continuation`.
     """
     sid = str(session_id or "").strip()
     prompt = str(continuation_prompt or "").strip()
@@ -1270,29 +1249,17 @@ def start_detached_goal_continuation(
 def mark_detached_goal_continuation(session_id: str, continuation_id: str) -> bool:
     """Record that the WebUI server is the SOLE dispatcher of this continuation.
 
-    A ``goal_continue`` published to a browser subscriber is dispatched by
-    that browser; with no subscriber the server runs the turn itself
-    (:func:`start_detached_goal_continuation`). Only the second kind carries
-    dispatcher ownership, so :func:`retry_detached_goal_continuation` never
-    starts a second dispatcher for a record the browser already holds.
-
-    Ownership is bound to the ID (compare under the record lock), so a mark
-    that arrives after the record was consumed or replaced is ignored.
+    Ownership is bound to the ID, so a mark arriving after the record was
+    consumed or replaced is ignored.
     """
     sid = str(session_id or "").strip()
     cid = str(continuation_id or "").strip()
     if not sid or not cid:
         return False
     with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
-        if sid not in _cfg.PENDING_GOAL_CONTINUATION:
+        if not _locked_pending_record_matches(sid, cid):
             return False
-        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(sid)
-        if not isinstance(record, dict):
-            return False
-        current = str(record.get("continuation_id") or "").strip()
-        if not current or not secrets.compare_digest(current, cid):
-            return False
-        record["detached_owned"] = True
+        _cfg.PENDING_GOAL_CONTINUATION_PROMPTS[sid]["detached_owned"] = True
         return True
 
 
@@ -1307,19 +1274,8 @@ def pending_detached_goal_continuation(session_id: str) -> Optional[Dict[str, An
 def retry_detached_goal_continuation(session_id: str) -> bool:
     """Re-dispatch a WebUI-owned (detached) continuation with its EXISTING ID.
 
-    Dispatcher ownership stays with the record: a detached runner can stop
-    without ever dispatching — its preflight skips (queued/active turn, or a
-    pause landing between tear-down and preflight) or admission rejects the
-    wakeup (``409`` after a pause) — and no browser event exists to replay.
-    Called when the session goes idle and when ``/goal resume`` re-arms the
-    loop, so a resumed goal keeps exactly one recoverable dispatch instead of
-    stalling until ``/goal clear``.
-
     Retrying is safe because admission consumes the record by ID under the
-    session lock: concurrent attempts collapse to at most one admitted turn,
-    and a losing attempt leaves a consumed or replaced record untouched. A
-    browser-held record is retried only after its grace deadline, when the
-    server has become the dispatcher (:func:`hand_goal_continuation_to_browser`).
+    session lock: concurrent attempts collapse to at most one admitted turn.
     """
     record = pending_detached_goal_continuation(session_id)
     if not record:
@@ -1328,6 +1284,33 @@ def retry_detached_goal_continuation(session_id: str) -> bool:
         session_id, record["prompt"], record["continuation_id"]
     )
     return True
+
+
+def settle_goal_continuation_after_turn(
+    session_id: str,
+    continuation_prompt: str,
+    continuation_id: str,
+    *,
+    cancelled: bool,
+) -> None:
+    """Teardown half: start the server-owned continuation, else retry a stopped one.
+
+    A cancelled turn never dispatches; admission still admits at most one turn,
+    so the retry cannot duplicate a live record.
+    """
+    if cancelled:
+        return
+    try:
+        if continuation_prompt:
+            start_detached_goal_continuation(
+                session_id, continuation_prompt, continuation_id
+            )
+        else:
+            retry_detached_goal_continuation(session_id)
+    except Exception:
+        logger.debug(
+            "Goal continuation teardown failed for session %s", session_id, exc_info=True
+        )
 
 
 def evaluate_goal_after_turn(
@@ -1502,9 +1485,7 @@ def register_pending_goal_continuation(session_id: str, continuation_prompt: str
     record = {
         "prompt": prompt,
         "continuation_id": uuid.uuid4().hex,
-        # Dispatcher ownership (review 5603344218 Must fix 2). False until the
-        # writer learns no browser is attached; see
-        # :func:`mark_detached_goal_continuation`.
+        # False until a writer learns no browser is attached.
         "detached_owned": False,
     }
     with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
@@ -1607,10 +1588,9 @@ def restore_pending_goal_continuation(session_id: str, receipt) -> bool:
     ``receipt`` is what :func:`consume_pending_goal_continuation` returned:
     the record dict, or the session id when only the marker was present.
 
-    Consuming a record also cancels its browser-grace timer, so the rollback
-    owes the dispatch obligation back: browser-held records re-arm at their
-    own deadline (immediately when it passed), WebUI-owned ones one grace out
-    so a persistently failing launch cannot hot-loop.
+    Consuming a record cancels its grace timer, so the rollback owes the
+    dispatch obligation back: the record's own deadline, or one grace out when
+    the server owns it (never a hot loop on a failing launch).
     """
     session_id = str(session_id or "").strip()
     if not session_id or receipt is None or receipt is False:
@@ -1633,8 +1613,7 @@ def restore_pending_goal_continuation(session_id: str, receipt) -> bool:
         _cfg.PENDING_GOAL_CONTINUATION.add(session_id)
         if record is not None:
             deadline = record.get("browser_grace_deadline")
-            # A record with no usable lease deadline has no browser dispatcher
-            # left, so the server owns the retry.
+            # No usable lease deadline: the server owns the retry.
             server_owned = bool(record.get("detached_owned")) or not isinstance(
                 deadline, (int, float)
             )

@@ -17646,11 +17646,9 @@ def _run_agent_streaming(
             # STREAM_GOAL_RELATED or goal_related parameter).
             try:
                 from api.goals import (
+                    dispatch_goal_continuation,
                     evaluate_goal_after_turn,
-                    hand_goal_continuation_to_browser,
                     has_active_goal,
-                    mark_detached_goal_continuation,
-                    stream_channel_has_subscribers,
                     register_pending_goal_continuation,
                 )
 
@@ -17713,13 +17711,11 @@ def _run_agent_streaming(
                         if not continuation_id:
                             continuation_prompt = ''
                     if continuation_prompt:
-                        # Browser first, server at the grace deadline: a tab
-                        # that is not the active session at done time never
-                        # posts the queued continuation.
-                        if stream_channel_has_subscribers(q):
-                            hand_goal_continuation_to_browser(
-                                session_id, str(continuation_id or '')
-                            )
+                        # A browser subscriber holds the dispatch; without one
+                        # the server starts the turn at teardown.
+                        if dispatch_goal_continuation(
+                            session_id, str(continuation_id or ''), q
+                        ):
                             put('goal_continue', {
                                 'session_id': session_id,
                                 'continuation_prompt': continuation_prompt,
@@ -17731,17 +17727,8 @@ def _run_agent_streaming(
                                 'decision': decision,
                             })
                         else:
-                            # Review 5603344218 Must fix 2: dispatcher ownership
-                            # stays with the record. With no subscriber the
-                            # server is the only dispatcher, so mark the record
-                            # detached-owned; a stopped runner is retried with
-                            # this same continuation ID on /goal resume and when
-                            # the session goes idle.
-                            mark_detached_goal_continuation(
-                                session_id, str(continuation_id or '')
-                            )
                             _detached_goal_continuation_prompt = continuation_prompt
-                            _detached_goal_continuation_id = continuation_id
+                            _detached_goal_continuation_id = continuation_id or ''
             except Exception as _goal_exc:
                 logger.debug("Goal continuation hook failed for session %s: %s", session_id, _goal_exc)
             with _stream_writeback_stage(_writeback_timings, "done_payload"):
@@ -18543,38 +18530,14 @@ def _run_agent_streaming(
                 session_id,
                 exc_info=True,
             )
-        if _detached_goal_continuation_prompt and not cancel_event.is_set():
-            try:
-                from api.goals import start_detached_goal_continuation
+        from api.goals import settle_goal_continuation_after_turn
 
-                start_detached_goal_continuation(
-                    session_id,
-                    _detached_goal_continuation_prompt,
-                    _detached_goal_continuation_id,
-                )
-            except Exception:
-                logger.debug(
-                    "turn-teardown detached-goal continuation failed for session %s",
-                    session_id,
-                    exc_info=True,
-                )
-        elif not cancel_event.is_set():
-            # Review 5603344218 Must fix 2, idle half: this turn ended without
-            # handing off a continuation, so a WebUI-owned (detached) record
-            # whose runner stopped — preflight skipped a queued/active turn, or
-            # admission rejected the wakeup — is retried now that the session is
-            # idle, with its existing continuation ID (admission still admits at
-            # most one turn). Browser-owned records are left alone.
-            try:
-                from api.goals import retry_detached_goal_continuation
-
-                retry_detached_goal_continuation(session_id)
-            except Exception:
-                logger.debug(
-                    "turn-teardown detached-goal retry failed for session %s",
-                    session_id,
-                    exc_info=True,
-                )
+        settle_goal_continuation_after_turn(
+            session_id,
+            _detached_goal_continuation_prompt,
+            _detached_goal_continuation_id,
+            cancelled=cancel_event.is_set(),
+        )
 
 # ============================================================
 # SECTION: HTTP Request Handler
