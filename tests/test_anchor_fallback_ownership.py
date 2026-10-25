@@ -412,7 +412,6 @@ def _render_messages_harness() -> str:
     """Node prelude that evaluates the real renderMessages() over a minimal fake DOM."""
 
     ui = _ui_js()
-    render_source = _function_source(ui, "renderMessages")
     transparent_source = _function_source(ui, "_transparentStreamOrderedParts")
     legacy_metadata_source = _function_source(ui, "_legacySettledFallbackHasToolMetadata")
     # #2051: renderMessages() inserts a message block through this helper, so it is
