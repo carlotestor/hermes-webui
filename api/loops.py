@@ -12,12 +12,9 @@ _TURN_PREFIX = "webui_loop_turn:"
 
 
 def _session_lock(session_id):
-    # One lock per session: the /loop command, the scheduler and profile retagging all take it.
+    """One lock per session: the /loop command, the scheduler and profile retagging all take it."""
     with _LOCKS_GUARD:
-        lock = _LOCKS.get(session_id)
-        if lock is None:
-            lock = _LOCKS[session_id] = threading.Lock()
-        return lock
+        return _LOCKS.setdefault(session_id, threading.Lock())
 
 
 @contextmanager
