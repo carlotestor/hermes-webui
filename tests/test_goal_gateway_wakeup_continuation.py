@@ -1546,19 +1546,32 @@ def test_restore_rearms_the_dispatch_it_restores(_restore_env, mode):
     assert started == [(sid, "continue the goal", cid)]
 
 
-def test_stale_token_rejection_keeps_the_browser_draft():
-    """A stale token is refused, so the browser keeps the text and drops only the spent ID."""
+@pytest.mark.parametrize("label", ["goal_continuation_stale", "goal_continuation_already_dispatched"])
+def test_refused_continuation_keeps_edited_text_and_files(label):
+    """Both 409 labels restore edited text and attachments, drop the token, and resend nothing."""
+    import json, shutil, subprocess
     from pathlib import Path
 
-    src = (
-        Path(__file__).parents[1].joinpath("static", "messages.js").read_text(encoding="utf-8")
-    )
-    start = src.find("/goal_continuation_stale/")
-    assert start != -1, "messages.js must handle the stale-token rejection"
-    branch = src[start : src.find("return;", start)]
-    assert "_restoreComposerDraftAfterFailedSend(" in branch, (
-        "a stale-token rejection must restore the attempted text"
-    )
-    assert "_composerDraftClearPromise,'')" in branch, (
-        "the restored draft must drop the spent token or the resend is refused again"
-    )
+    if not shutil.which("node"):
+        pytest.skip("node not available")
+    src = Path(__file__).parents[1].joinpath("static", "messages.js").read_text(encoding="utf-8")
+    start = src.index("    // Refused continuation token:")
+    body = src[start : src.index("      return;\n    }", start)] + "      return;\n    }"
+    script = """
+const calls=[];const INFLIGHT={s1:1};const activeSid='s1';
+const e={status:409};const errMsg=%s;
+const _failedSendDraftText='continue\\nplus my edits';const _failedSendFilesSnapshot=[{name:'user-notes.txt'}];
+const _composerDraftClearPromise=Promise.resolve();
+function clearInflightState(){calls.push('clearInflight')}function removeThinking(){}function setBusy(){}
+function setComposerStatus(){}function showToast(){}function renderSessionList(){}
+function queueSessionMessage(){calls.push('queue')}
+function _restoreComposerDraftAfterFailedSend(t,f,sid,p,id){calls.push(['restore',t,f.map(x=>x.name),sid,id])}
+(function(){%s})();
+console.log(JSON.stringify({calls,inflight:'s1' in INFLIGHT}));
+""" % (json.dumps(label), body)
+    out = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
+    assert out["inflight"] is False
+    assert ["restore", "continue\nplus my edits", ["user-notes.txt"], "s1", ""] in out["calls"]
+    assert "queue" not in out["calls"], "a refused continuation must never auto-resend"
+    # Draft clear happens before restore, so the restore is not overwritten.
+    assert out["calls"].index("clearInflight") < len(out["calls"]) - 1

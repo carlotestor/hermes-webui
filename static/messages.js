@@ -2102,24 +2102,14 @@ async function send(){
       if(typeof renderSessionList==='function') void renderSessionList();
       return;
     }
-    // Stale token: keep the user's words, drop only the spent token.
-    if(e&&e.status===409&&/goal_continuation_stale/.test(errMsg)){
+    // Refused continuation token: keep the user's text/files, drop only the token.
+    if(e&&e.status===409&&/goal_continuation_(stale|already_dispatched)/.test(errMsg)){
       delete INFLIGHT[activeSid];
       if(typeof clearInflightState==='function') clearInflightState(activeSid);
       removeThinking();setBusy(false);setComposerStatus('');
       if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
       _restoreComposerDraftAfterFailedSend(_failedSendDraftText,_failedSendFilesSnapshot,activeSid,_composerDraftClearPromise,'');
-      showToast('That goal continuation is out of date. Your message is kept.',3200);
-      if(typeof renderSessionList==='function') void renderSessionList();
-      return;
-    }
-    // Already dispatched (lease expired): no second turn.
-    if(e&&e.status===409&&/goal_continuation_already_dispatched/.test(errMsg)){
-      delete INFLIGHT[activeSid];
-      if(typeof clearInflightState==='function') clearInflightState(activeSid);
-      removeThinking();setBusy(false);setComposerStatus('');
-      if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
-      showToast('Goal continuation already running.',2200);
+      showToast('That goal continuation was already sent. Your message is kept.',3200);
       if(typeof renderSessionList==='function') void renderSessionList();
       return;
     }
