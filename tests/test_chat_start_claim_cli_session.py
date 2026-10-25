@@ -1308,31 +1308,21 @@ def test_helper_denylist_includes_gateway_and_unknown():
 
 
 def test_helper_keeps_state_db_source_on_schema_without_parent_session_id(
-    routes_module, tmp_path, monkeypatch, isolated_state_db
+    routes_module, monkeypatch, isolated_state_db
 ):
-    """Older state.db schemas predate sessions.parent_session_id.  The
-    state.db lookup must not fail there: a cron session must still be
-    classified from state.db.source (read-only, not materialised) with
-    its title and model, instead of falling back to a writable claim."""
+    """An older state.db without sessions.parent_session_id must still classify a
+    cron session read-only from state.db.source, with its title and model."""
     SID = "20260610_cron_old_schema"
     db = isolated_state_db["db"]
-    _make_state_db(
-        db, SID, message_count=2,
-        title="Nightly cron", model="cron-model", source="cron", cwd="/root",
-    )
+    _make_state_db(db, SID, message_count=2, title="Nightly cron", model="cron-model",
+                   source="cron", cwd="/root")
     conn = sqlite3.connect(str(db))
     conn.execute("ALTER TABLE sessions DROP COLUMN parent_session_id")
     conn.commit()
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+    assert "parent_session_id" not in {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
     conn.close()
-    assert "parent_session_id" not in cols
-    monkeypatch.setattr(
-        routes_module, "_lookup_cli_session_metadata", lambda _sid: {},
-    )
+    monkeypatch.setattr(routes_module, "_lookup_cli_session_metadata", lambda _sid: {})
     sess, reason = routes_module._claim_or_synthesize_cli_session(SID)
     assert reason != "materialized", reason
-    assert sess is not None
-    assert sess.read_only is True
-    assert sess.source_tag == "cron"
-    assert sess.title == "Nightly cron"
-    assert sess.model == "cron-model"
+    assert sess is not None and sess.read_only is True
+    assert (sess.source_tag, sess.title, sess.model) == ("cron", "Nightly cron", "cron-model")

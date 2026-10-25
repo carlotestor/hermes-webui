@@ -10232,16 +10232,13 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             import sqlite3 as _sqlite
             with closing(_sqlite.connect(str(db_path))) as _conn:
                 _conn.row_factory = _sqlite.Row
-                # Older state.db schemas lack parent_session_id; select NULL
-                # so source/title/model classification still works.
+                # Older state.db schemas lack parent_session_id; select NULL there
+                # so the source/title/model classification still resolves.
                 _cols = {r[1] for r in _conn.execute("PRAGMA table_info(sessions)")}
-                _parent_expr = (
-                    "parent_session_id" if "parent_session_id" in _cols
-                    else "NULL AS parent_session_id"
-                )
+                _parent = "parent_session_id" if "parent_session_id" in _cols else "NULL AS parent_session_id"
                 _row = _conn.execute(
                     "SELECT source, title, model, cwd, started_at, ended_at, "
-                    f"{_parent_expr} FROM sessions WHERE id = ?", (sid,)
+                    f"{_parent} FROM sessions WHERE id = ?", (sid,)
                 ).fetchone()
                 if _row is not None:
                     state_db_row = dict(_row)
@@ -10314,7 +10311,7 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             parent_sid = str(state_db_row.get("parent_session_id") or "").strip()
             session.parent_session_id = parent_sid or None
             session.relationship_type = "child_session" if parent_sid else None
-            session.active = "ended_at" in state_db_row and state_db_row["ended_at"] is None
+            session.active = state_db_row["ended_at"] is None
         return session, "not_claimable"
     return build_session(sid, cli_meta, msgs, read_only_flag=False), "materialized"
 

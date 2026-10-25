@@ -15149,8 +15149,7 @@ function _worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, visi
   const visibleTexts=Array.isArray(turnVisibleContents)?turnVisibleContents:[];
   return _stripVisibleAssistantEchoFromThinking(thinkingText, visibleContent, turnFinalVisibleContent, ...visibleTexts);
 }
-// A delegated subagent's whole task is one turn with no WebUI stream, so its settled
-// worklog splits at each visible interim text, and stays open while the child runs.
+// A delegated subagent's whole task is one turn; split its worklog at each interim text.
 function _isDelegatedSubagentTranscript(){
   return !S.busy&&!!S.session&&_isDelegatedSubagentRow(S.session);
 }
@@ -15165,11 +15164,9 @@ function _worklogGroupKey(anchorRow, anchorTurn, placedAfterAnchor){
 // Only the subagent's last turn opens: while it runs, or after it ended with no answer.
 function _subagentOpenWorklogTurn(inner){
   if(!_isDelegatedSubagentTranscript()) return null;
-  const turns=inner.querySelectorAll('.assistant-turn');
-  const lastTurn=turns[turns.length-1]||null;
+  const turns=inner.querySelectorAll('.assistant-turn'), lastTurn=turns[turns.length-1]||null;
   if(!lastTurn||S.session.active===true) return lastTurn;
-  const msgs=Array.isArray(S.messages)?S.messages:[];
-  const last=msgs.filter(m=>m&&m.role!=='tool').pop();
+  const last=(Array.isArray(S.messages)?S.messages:[]).filter(m=>m&&m.role!=='tool').pop();
   const answered=!!last&&last.role==='assistant'&&!(Array.isArray(last.tool_calls)&&last.tool_calls.length)&&!!String(msgContent(last)||'').trim();
   return answered?null:lastTurn;
 }
@@ -16614,8 +16611,7 @@ function _toggleActivityGroup(summary){
   if(!collapsed) _materializeDeferredWorklogRows(group);
   _writeActivityDisclosureState(group.getAttribute('data-activity-disclosure-key'), !collapsed);
   // The cached transcript HTML predates this click; drop it so a switch-back rebuilds.
-  const sid=typeof S!=='undefined'&&S.session&&S.session.session_id;
-  if(sid&&typeof _sessionHtmlCache!=='undefined') _sessionHtmlCache.delete(sid);
+  if(typeof S!=='undefined'&&S.session&&S.session.session_id&&typeof _sessionHtmlCache!=='undefined') _sessionHtmlCache.delete(S.session.session_id);
   if(typeof _onLiveActivityToggle==='function') _onLiveActivityToggle(group);
 }
 function _toggleToolWorklogGroup(summary){
@@ -22556,9 +22552,8 @@ function renderMessages(options){
       }
       // The running subagent's newest worklog is live work: label it Running, not Processed.
       let runningGroup=null;
-      if(subagentOpenTurn&&S.session.active===true){
-        activityByTurn.forEach(state=>{ if(state.group.closest('.assistant-turn')===subagentOpenTurn) runningGroup=state.group; });
-      }
+      if(subagentOpenTurn&&S.session.active===true)
+        activityByTurn.forEach(s=>{ if(s.group.closest('.assistant-turn')===subagentOpenTurn) runningGroup=s.group; });
       activityByTurn.forEach(state=>{
         if(state.group===runningGroup) state.group.setAttribute('data-subagent-running','1');
         else state.group.removeAttribute('data-subagent-running');
@@ -22976,15 +22971,9 @@ function renderMessages(options){
           _materializeDeferredWorklogRows(group);
         }
         if(!(group.textContent||'').trim()) continue; // empty group can't help
-        // A delegated transcript's worklog the user collapsed stays collapsed:
-        // its poll re-renders on new rows, and the chip itself keeps the turn
-        // non-blank, so honour the saved disclosure instead of force-opening.
-        if(typeof _isDelegatedSubagentTranscript==='function'&&_isDelegatedSubagentTranscript()
-           &&typeof _readActivityDisclosureState==='function'
-           &&_readActivityDisclosureState(group.getAttribute('data-activity-disclosure-key'))==='closed'){
-          revealed=true;
-          continue;
-        }
+        // A delegated transcript's collapsed chip stays collapsed (it keeps the turn non-blank).
+        if(typeof _isDelegatedSubagentTranscript==='function'&&_isDelegatedSubagentTranscript()&&
+           typeof _readActivityDisclosureState==='function'&&_readActivityDisclosureState(group.getAttribute('data-activity-disclosure-key'))==='closed'){revealed=true;continue;}
         if(group.classList.contains('tool-call-group-collapsed')){
           group.classList.remove('tool-call-group-collapsed');
           group.classList.add('open');

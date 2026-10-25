@@ -411,21 +411,20 @@ def test_transparent_raw_content_fallback_exits_for_anchor_owned_messages():
 def _render_messages_harness() -> str:
     """Node prelude that evaluates the real renderMessages() over a minimal fake DOM."""
 
-    render_source = _function_source(_ui_js(), "renderMessages")
-    transparent_source = _function_source(_ui_js(), "_transparentStreamOrderedParts")
-    legacy_metadata_source = _function_source(
-        _ui_js(), "_legacySettledFallbackHasToolMetadata"
-    )
+    ui = _ui_js()
+    render_source = _function_source(ui, "renderMessages")
+    transparent_source = _function_source(ui, "_transparentStreamOrderedParts")
+    legacy_metadata_source = _function_source(ui, "_legacySettledFallbackHasToolMetadata")
     # #2051: renderMessages() inserts a message block through this helper, so it is
     # evaluated with it. The shim's createElement() returns no template `content`, so the
     # helper takes its insertAdjacentHTML fallback here, exactly as before.
-    insert_block_source = _function_source(_ui_js(), "_insertSegmentBlock")
-    subagent_transcript_source = _function_source(_ui_js(), "_isDelegatedSubagentTranscript")
-    worklog_group_key_source = _function_source(_ui_js(), "_worklogGroupKey")
-    subagent_open_turn_source = _function_source(_ui_js(), "_subagentOpenWorklogTurn")
+    insert_block_source = _function_source(ui, "_insertSegmentBlock")
     sessions_js = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
-    child_session_source = _function_source(sessions_js, "_isChildSession")
-    delegated_row_source = _function_source(sessions_js, "_isDelegatedSubagentRow")
+    # renderMessages() delegates to these on every settled worklog pass.
+    evals = "".join(f"eval({json.dumps(_function_source(src, n))});" for src, n in (
+        (ui, "_isDelegatedSubagentTranscript"), (ui, "_worklogGroupKey"),
+        (ui, "_subagentOpenWorklogTurn"), (sessions_js, "_isChildSession"),
+        (sessions_js, "_isDelegatedSubagentRow"), (ui, "renderMessages")))
     return f"""
         class FakeClassList {{
           constructor(el) {{ this.el = el; }}
@@ -722,12 +721,7 @@ def _render_messages_harness() -> str:
         eval({json.dumps(transparent_source)});
         eval({json.dumps(legacy_metadata_source)});
         eval({json.dumps(insert_block_source)});
-        eval({json.dumps(subagent_transcript_source)});
-        eval({json.dumps(worklog_group_key_source)});
-        eval({json.dumps(subagent_open_turn_source)});
-        eval({json.dumps(child_session_source)});
-        eval({json.dumps(delegated_row_source)});
-        eval({json.dumps(render_source)});
+        {evals}
 """
 
 
