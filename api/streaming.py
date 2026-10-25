@@ -13657,8 +13657,7 @@ def _run_agent_streaming(
     When ephemeral=True, session mutations are skipped — used by /btw to get
     a streaming answer without persisting to the parent session.
     """
-    # Read unconditionally by the outer-finally teardown, so it must be bound
-    # before any exit path (error/raise/cancel never reach the goal hook).
+    # Bound before any exit path: the outer-finally teardown reads them.
     _detached_goal_continuation_prompt = ''
     _detached_goal_continuation_id = ''
     _turn_route_model = model

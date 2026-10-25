@@ -2102,9 +2102,7 @@ async function send(){
       if(typeof renderSessionList==='function') void renderSessionList();
       return;
     }
-    // The token is no longer this session's pending continuation, so the
-    // server refused it: keep the user's words and drop only the spent token,
-    // or the resend is refused again.
+    // Stale token: keep the user's words, drop only the spent token.
     if(e&&e.status===409&&/goal_continuation_stale/.test(errMsg)){
       delete INFLIGHT[activeSid];
       if(typeof clearInflightState==='function') clearInflightState(activeSid);
@@ -2115,8 +2113,7 @@ async function send(){
       if(typeof renderSessionList==='function') void renderSessionList();
       return;
     }
-    // The server already dispatched this continuation (browser lease expired
-    // and the fallback ran): drop the queue entry instead of a second turn.
+    // Already dispatched (lease expired): no second turn.
     if(e&&e.status===409&&/goal_continuation_already_dispatched/.test(errMsg)){
       delete INFLIGHT[activeSid];
       if(typeof clearInflightState==='function') clearInflightState(activeSid);

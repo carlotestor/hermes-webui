@@ -829,9 +829,8 @@ def _decision_from_evaluated_state(mgr: Any, state: Any) -> Optional[Dict[str, A
     except Exception:
         return None
 
-    # The manager's live barrier, not the persisted verdict, decides whether
-    # the goal is parked: native resume clears the barrier but leaves
-    # ``last_verdict="wait"`` behind (Must fix 4).
+    # The live barrier, not the persisted verdict, decides a parked goal:
+    # resume clears the barrier but leaves ``last_verdict="wait"`` behind.
     is_waiting = False
     if hasattr(mgr, "is_waiting"):
         try:
@@ -893,8 +892,7 @@ def _decision_from_evaluated_state(mgr: Any, state: Any) -> Optional[Dict[str, A
             ),
         }
 
-    # A native WAIT parks without a budget check, so a lifted barrier can leave
-    # an active goal past max_turns; pause it here as the native judge would.
+    # A lifted WAIT barrier can leave an active goal past max_turns: pause it.
     if max_turns > 0 and turns_used >= max_turns:
         budget_reason = f"turn budget exhausted ({turns_used}/{max_turns})"
         try:
@@ -921,8 +919,7 @@ def _decision_from_evaluated_state(mgr: Any, state: Any) -> Optional[Dict[str, A
             prompt = None
     if not prompt:
         return None
-    # A judge WAIT whose barrier could not be observed continues natively
-    # with verdict "continue"; a live barrier was handled above.
+    # An unobserved WAIT barrier continues; a live barrier returned above.
     if verdict in ("wait", "waiting", "gate_failed"):
         verdict = "continue"
     return {
@@ -955,9 +952,8 @@ def stream_channel_has_subscribers(channel: Any) -> bool:
 GOAL_CONTINUATION_BROWSER_GRACE_SECONDS = 15.0
 _BROWSER_GRACE_TIMERS: dict[str, Any] = {}
 _BROWSER_GRACE_LOCK = threading.Lock()
-# IDs this process already admitted, so a late duplicate POST can be LABELLED
-# as one. Bounded, therefore only a label: admission is decided by the pending
-# record itself, so an evicted entry can never turn a spent token into a turn.
+# Bounded and therefore only a label: the pending record decides admission,
+# so an evicted entry can never turn a spent token into a turn.
 _SPENT_GOAL_CONTINUATION_IDS: "OrderedDict[tuple, None]" = OrderedDict()
 _SPENT_GOAL_CONTINUATION_LIMIT = 64
 
@@ -995,9 +991,7 @@ def pending_goal_continuation_record(session_id: str) -> Optional[Dict[str, Any]
             "prompt": prompt,
             "continuation_id": cid,
             "detached_owned": bool(record.get("detached_owned")),
-            "grace_deadline": float(deadline)
-            if isinstance(deadline, (int, float))
-            else None,
+            "grace_deadline": float(deadline) if isinstance(deadline, (int, float)) else None,
         }
 
 
@@ -1064,8 +1058,8 @@ def dispatch_goal_continuation(
 ) -> bool:
     """Lease the record to a live browser, else keep the server as dispatcher.
 
-    Returns True when the browser must receive ``goal_continue``; False when
-    the server owns the record and starts the turn at teardown.
+    True means the browser must receive ``goal_continue``; False means the
+    server owns the record and starts the turn at teardown.
     """
     cid = str(continuation_id or "").strip()
     if stream_channel_has_subscribers(channel):
@@ -1133,10 +1127,9 @@ def pending_goal_continuation_matches(session_id: str, continuation_id: str) -> 
 
 
 def detached_goal_continuation_skip_reason(session_id: str, continuation_id: str = "") -> str:
-    """Why a detached goal continuation must NOT start, or '' when it may.
+    """Why a detached continuation must NOT start, or '' when it may.
 
-    Pre-flight only: admission re-validates the record and the active goal
-    under the session lock.
+    Pre-flight only: admission re-validates record and goal under the lock.
     """
     sid = str(session_id or "").strip()
     if not sid:
@@ -1193,8 +1186,7 @@ def start_detached_goal_continuation(
 ) -> None:
     """Run a registered continuation server-side (0 SSE subscribers).
 
-    Admission consumes the record by ID; a stopped runner is retried with the
-    same ID by :func:`retry_detached_goal_continuation`.
+    Admission consumes the record by ID; a stopped runner is retried with it.
     """
     sid = str(session_id or "").strip()
     prompt = str(continuation_prompt or "").strip()
@@ -1224,8 +1216,7 @@ def start_detached_goal_continuation(
                 except Exception:
                     status = 0
             if status and status >= 400:
-                # Not a lost cause: the record still owns its dispatcher, so
-                # /goal resume or the next idle teardown retries this ID.
+                # The record still owns its dispatcher: resume/idle retries it.
                 logger.debug(
                     "Detached goal continuation rejected for session %s: status=%s reason=%s",
                     sid,
@@ -1247,11 +1238,7 @@ def start_detached_goal_continuation(
 
 
 def mark_detached_goal_continuation(session_id: str, continuation_id: str) -> bool:
-    """Record that the WebUI server is the SOLE dispatcher of this continuation.
-
-    Ownership is bound to the ID, so a mark arriving after the record was
-    consumed or replaced is ignored.
-    """
+    """Record the WebUI server as the SOLE dispatcher of this continuation."""
     sid = str(session_id or "").strip()
     cid = str(continuation_id or "").strip()
     if not sid or not cid:
@@ -1293,10 +1280,9 @@ def settle_goal_continuation_after_turn(
     *,
     cancelled: bool,
 ) -> None:
-    """Teardown half: start the server-owned continuation, else retry a stopped one.
+    """Start the server-owned continuation, else retry a stopped one.
 
-    A cancelled turn never dispatches; admission still admits at most one turn,
-    so the retry cannot duplicate a live record.
+    A cancelled turn never dispatches; admission still admits one turn.
     """
     if cancelled:
         return

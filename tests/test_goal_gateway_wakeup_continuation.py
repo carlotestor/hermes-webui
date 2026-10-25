@@ -350,8 +350,7 @@ def test_gateway_worker_adopts_in_turn_gateway_goal_evaluation_without_double_ju
     assert eval_calls == []
     assert fake_mgr.state.turns_used == 1
     assert "goal" in event_names
-    # The Agent's own post-turn hook dispatched it; a WebUI dispatch would
-    # be the second continuation the review reproduced.
+    # The Agent's own hook dispatched it; a WebUI dispatch would be a second.
     assert "goal_continue" not in event_names
     assert s.session_id not in PENDING_GOAL_CONTINUATION
     goal_messages = [
@@ -558,7 +557,6 @@ def test_detached_continuation_allowed_resolves_owning_profile(monkeypatch):
     homes = _detached_env(monkeypatch, s)
     assert webui_goals.detached_goal_continuation_skip_reason(s.session_id, s.cid) == ""
     assert homes == ["alice"]
-    # The reader checks the record AND its ID, not set membership.
     assert webui_goals.detached_goal_continuation_skip_reason(s.session_id, "0" * 32) == "not_pending"
 
 
@@ -894,8 +892,7 @@ def test_pause_after_detached_preflight_then_resume_dispatches_once(
         return {"_status": 200, "stream_id": "goal-wakeup-stream", "session_id": sid}
 
     monkeypatch.setattr(routes, "start_session_turn", fake_start_session_turn)
-    # Real preflight, with the session/model/profile seams stubbed: the record
-    # exists, the goal is active after resume, no turn is queued or running.
+    # Real preflight with session/model/profile seams stubbed.
     from api import background_process, profiles
 
     monkeypatch.setattr(models, "get_session", lambda _sid, *a, **k: session)
@@ -908,8 +905,7 @@ def test_pause_after_detached_preflight_then_resume_dispatches_once(
     )
     join_all = _capture_goal_threads(monkeypatch)
     try:
-        # The detached handoff already preflighted; the pause then lands before
-        # admission, so the wakeup is rejected and nothing dispatches.
+        # The pause lands after preflight, before admission: the wakeup is rejected.
         assert (
             routes._handle_goal_command(
                 object(), {"session_id": session.session_id, "args": "pause"}
@@ -1020,7 +1016,6 @@ def _browser_lease_env(tmp_path, monkeypatch, *, stream_id, grace):
     monkeypatch.setattr(
         webui_goals, "evaluate_goal_after_turn", lambda *_a, **_kw: dict(_LEASE_DECISION)
     )
-    # Preflight seams: no queued turn, no running turn, home resolves locally.
     from api import background_process, profiles
 
     monkeypatch.setattr(
