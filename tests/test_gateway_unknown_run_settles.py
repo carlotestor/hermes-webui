@@ -17,7 +17,9 @@ from tests.test_gateway_run_reattach_after_restart import (  # noqa: F401  (fixt
 )
 
 
-def test_reattach_settles_a_run_the_gateway_reports_unknown(isolated_sessions, monkeypatch):
+def test_reattach_settles_a_run_the_gateway_reports_unknown(  # noqa: F811 (pytest fixture import)
+    isolated_sessions, monkeypatch
+):
     sid, _stream_id = _orphaned_gateway_turn()
     polls = []
 
