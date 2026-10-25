@@ -2055,8 +2055,7 @@ def _shared_gateway(monkeypatch, url="http://gw.local:8642", key="shared-root-ke
     if launcher_key:
         monkeypatch.setenv("HERMES_WEBUI_GATEWAY_API_KEY", launcher_key)
     monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {"API_SERVER_KEY", "GW_ROUTE"})
-    # Key precedence on the SHARED URL itself; /p/<name> routing of URL-less named profiles is
-    # covered by tests/test_gateway_profile_endpoint.py.
+    # Key precedence on the SHARED URL itself; /p/<name> routing is covered in test_gateway_profile_endpoint.py.
     monkeypatch.setattr(gateway_chat, "_is_named_profile", lambda name: False)
 
 
@@ -2526,8 +2525,7 @@ def test_shared_url_key_an_explicit_webui_alias_still_wins_on_the_shared_url(tmp
 
 
 def test_shared_url_key_without_any_shared_key_a_profile_sends_its_own(tmp_path, monkeypatch):
-    """No shared key at all (v0.52.492 sent none): the profile's own API_SERVER_KEY is the only candidate, and its
-    own /p/<name> route is where that key belongs (#7877)."""
+    """No shared key at all: the profile's own API_SERVER_KEY is the only candidate, and /p/<name> is its route."""
     _profile_homes(tmp_path, monkeypatch, {"default": {}, "beta": {"API_SERVER_KEY": "beta-key"}}, config_url=None)
 
     assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://127.0.0.1:8642/p/beta", "beta-key")

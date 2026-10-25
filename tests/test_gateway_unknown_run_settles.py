@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 import api.gateway_chat as gateway_chat
-from tests.test_gateway_run_reattach_after_restart import (  # noqa: F401  (fixture)
+from tests.test_gateway_run_reattach_after_restart import (  # noqa: F401  (fixtures and helpers)
     _orphaned_gateway_turn,
     _saved,
     _wait_for_reattach_threads,
@@ -17,9 +17,8 @@ from tests.test_gateway_run_reattach_after_restart import (  # noqa: F401  (fixt
 )
 
 
-def test_reattach_settles_a_run_the_gateway_reports_unknown(  # noqa: F811 (pytest fixture import)
-    isolated_sessions, monkeypatch
-):
+@pytest.mark.usefixtures("isolated_sessions")
+def test_reattach_settles_a_run_the_gateway_reports_unknown(monkeypatch):
     sid, _stream_id = _orphaned_gateway_turn()
     polls = []
 
@@ -40,13 +39,7 @@ def test_reattach_settles_a_run_the_gateway_reports_unknown(  # noqa: F811 (pyte
     assert saved["pending_user_message"] is None
 
 
-def _http_error(code, error_code):
-    body = json.dumps({"error": {"message": error_code, "code": error_code}}).encode()
-    return urllib.error.HTTPError(
-        "http://gw:8642/v1/runs/r/stop", code, "conflict", Message(), io.BytesIO(body))
-
-
-@pytest.mark.parametrize("code, error_code, expected", [
+@pytest.mark.parametrize("code,error_code,expected", [
     (409, "unknown_execution", True),
     (409, "session_busy", False),
     (500, "unknown_execution", False),
@@ -54,7 +47,8 @@ def _http_error(code, error_code):
 def test_stop_treats_only_unknown_execution_as_nothing_left_to_stop(code, error_code, expected):
     class _Opener:
         def open(self, req, *, timeout=None):
-            raise _http_error(code, error_code)
+            body = json.dumps({"error": {"code": error_code}}).encode()
+            raise urllib.error.HTTPError(req.full_url, code, "conflict", Message(), io.BytesIO(body))
 
     with patch("urllib.request.build_opener", return_value=_Opener()), \
          patch("api.gateway_chat.gateway_run_endpoint", return_value=("http://gw:8642", "k")):

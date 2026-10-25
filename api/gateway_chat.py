@@ -483,11 +483,9 @@ def _gateway_http_error_event(
     exc: urllib.error.HTTPError, err_body: str, *, api_key_configured: bool, route_hint: str = "",
 ) -> dict:
     safe = _redact_text(err_body or str(exc))[:500]
-    if route_hint:
-        return {
-            **_gateway_route_error_classification(exc.code, route_hint),
-            "message": f"Gateway returned HTTP {exc.code} for this profile.",
-        }
+    if route_hint:  # the Gateway refused this profile's route: name that fix, not the provider's
+        return {**_gateway_route_error_classification(exc.code, route_hint),
+                "message": f"Gateway returned HTTP {exc.code} for this profile."}
     if exc.code == 401:
         return {
             "label": "Gateway authentication failed",
@@ -1496,10 +1494,9 @@ def _gateway_terminal_message(state: str) -> str:
 def _gateway_error_code(exc) -> str:
     """The OpenAI-style ``error.code`` of a Gateway HTTP error body, or ''."""
     try:
-        body = json.loads(exc.read() or b"{}")
+        err = json.loads(exc.read() or b"{}").get("error") or {}
     except Exception:
         return ""
-    err = body.get("error") if isinstance(body, dict) else None
     return str(err.get("code") or "") if isinstance(err, dict) else ""
 
 
@@ -1528,13 +1525,11 @@ def stop_gateway_run(run_id: str) -> bool:
             final_url = str(getattr(response, "geturl", lambda: req.full_url)() or "")
             status = int(getattr(response, "status", getattr(response, "code", 0)) or 0)
             return 200 <= status < 300 and final_url == req.full_url
-    except urllib.error.HTTPError as exc:
-        # A dead-epoch run has nothing left to stop, so the local stream may be torn down.
-        if exc.code == 409 and _gateway_error_code(exc) == "unknown_execution":
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as exc:
+        # A dead-epoch run has nothing left to stop, so its local stream may be torn down.
+        is_dead = isinstance(exc, urllib.error.HTTPError) and exc.code == 409
+        if is_dead and _gateway_error_code(exc) == "unknown_execution":
             return True
-        logger.debug("Gateway stop failed for run %s", run_id, exc_info=True)
-        return False
-    except (urllib.error.URLError, OSError, ValueError):
         logger.debug("Gateway stop failed for run %s", run_id, exc_info=True)
         return False
 
@@ -2021,9 +2016,8 @@ def _gateway_endpoint_for_profile(profile_name, *, profile_routing: bool = True)
     - Exception (#8432): under a NAMED process profile, a profile with a key but no URL gets the process pair
       (URL and key from one source, as v0.52.492 sends) unless the shared URL is provably the launcher's (an
       export that no profile .env supplied, or an operator config file outside every profile home), because that
-      URL may be a profile's own Gateway and must never receive another profile's key. Only reachable with
-      profile_routing off (a run admitted before routing still resolves to what it was admitted with): with
-      routing on, a URL-less named profile takes the /p/<name> route below instead.
+      URL may be a profile's own Gateway and must never receive another profile's key. Only with profile_routing
+      off, which a pre-routing run's reattach keeps; with routing on it takes the /p/<name> route below instead.
     - Named profile with no URL of its own (and profile_routing): the shared listener serves it under /p/<name>,
       checked against that profile's API_SERVER_KEY only, so that key or none is sent, never a shared one.
     """
@@ -2048,15 +2042,12 @@ def _gateway_endpoint_for_profile(profile_name, *, profile_routing: bool = True)
     if _WEBUI_GATEWAY_API_KEY_ENV in _profiles._loaded_profile_env_keys and not _process_profile_is_root():
         shared_alias = ""
 
+    routed = profile_routing and _is_named_profile(profile_name)
     route_key = str(own_env.get("API_SERVER_KEY") or "").strip()
-    if (not (own_url_env or own_url_cfg) and profile_routing and _is_named_profile(profile_name)
-            and not _session_is_process_profile(home) and not _shared_url_may_belong_to_process_profile(home)
-            and not (own_alias and not route_key)):
-        # An unprefixed request on the shared listener runs as the process profile, never as this one. Route only
-        # where the shared URL is provably shared: the process profile already owns the unprefixed listener, and a
-        # URL that may be another profile's own Gateway serves no /p/<name> route and must never receive this
-        # profile's key (#8432 keeps that case on the process pair, below). A profile holding only an explicit
-        # WebUI alias is configured for the shared URL itself, not for a /p/<name> route that checks API_SERVER_KEY.
+    if (routed and not (own_url_env or own_url_cfg) and not _session_is_process_profile(home)
+            and not _shared_url_may_belong_to_process_profile(home) and not (own_alias and not route_key)):
+        # An unprefixed shared-listener request runs as the process profile, so route only where the shared URL is
+        # provably shared and no explicit WebUI alias (the shared URL's own key) names it.
         return (f"{shared_url}/p/{urllib.parse.quote(str(profile_name).strip(), safe='')}", route_key)
     if not (own_url_env or own_url_cfg or own_key):
         return shared_url, shared_key
@@ -2074,12 +2065,9 @@ def _gateway_endpoint_for_profile(profile_name, *, profile_routing: bool = True)
         finally:
             _thread_ctx.env = previous_env
             _thread_ctx.block_process_env_fallback = previous_block
-        # a launcher-exported URL still outranks config.yaml, as everywhere else, except for a routed named
-        # profile: there the process URL is the SHARED listener, and the profile's config.yaml names its own
-        routed = profile_routing and _is_named_profile(profile_name)
-        url_env = own_url_env
-        if not url_env and not routed:
-            url_env = str(os.environ.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip()
+        # a launcher-exported URL still outranks config.yaml, except for a routed named profile: there the process
+        # URL is the SHARED listener, and the profile's config.yaml names its own.
+        url_env = own_url_env or ("" if routed else str(os.environ.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip())
         url = _gateway_base_url({"webui_gateway_base_url": expanded_url} if expanded_url else {},
                                 {_WEBUI_GATEWAY_BASE_URL_ENV: url_env} if url_env else {})
         if "${" in url:
@@ -2120,9 +2108,7 @@ _GATEWAY_ENDPOINT_ROUTING = "profile-v1"
 
 
 def _gateway_reattach_endpoint(session, run) -> tuple[str, str | None]:
-    """Endpoint a persisted run was admitted on; unmarked records predate profile routing.
-
-    The key is None when the profile's endpoint moved since admission: the current key belongs to the new URL."""
+    """Endpoint a persisted run was admitted on; the key is None if the profile's endpoint has since moved."""
     if run.get("endpoint_routing") != _GATEWAY_ENDPOINT_ROUTING:
         return _gateway_endpoint_for_profile(session.profile, profile_routing=False)
     base_url, api_key = _gateway_endpoint_for_profile(session.profile)
@@ -2130,37 +2116,33 @@ def _gateway_reattach_endpoint(session, run) -> tuple[str, str | None]:
     return saved, (api_key if saved == base_url else None)
 
 
+# The tail every routing refusal shares: name the URL that serves this profile instead.
+_ROUTE_FIX_HINT = "or set HERMES_WEBUI_GATEWAY_BASE_URL in the profile's .env to a Gateway that serves this profile."
+
+
 def _gateway_profile_route_hint(base_url: str, code, keyless_profile: bool = False) -> str:
-    """Tell a named-profile user how to route the profile when its /p/<name> endpoint refuses."""
-    if code == 401 and keyless_profile and not re.search(r"/p/[^/]+$", str(base_url or "")):
-        return (
-            "No Gateway API key was sent: set API_SERVER_KEY in the profile's .env. The root key is reused "
-            "only when the profile's Gateway URL is exactly the root Gateway URL."
-        )
-    if code not in (401, 404) or not re.search(r"/p/[^/]+$", str(base_url or "")):
+    """How to route this profile when its endpoint refuses: a 401 names the key, a 404 names multiplexing."""
+    routed = bool(re.search(r"/p/[^/]+$", str(base_url or "")))
+    if not routed:
+        if code == 401 and keyless_profile:
+            return ("No Gateway API key was sent: set API_SERVER_KEY in the profile's .env. The root key is reused "
+                    "only when the profile's Gateway URL is exactly the root Gateway URL.")
         return ""
-    if code == 401:
-        # The Gateway serves /p/<profile> but rejected the key: multiplexing is already on.
-        return (
-            "The shared Gateway serves this profile under /p/<profile> but rejected the key: set API_SERVER_KEY "
-            "in the profile's .env to the key that profile's Gateway uses, or set HERMES_WEBUI_GATEWAY_BASE_URL "
-            "in the profile's .env to a Gateway that serves this profile."
-        )
-    return (
-        "This profile's turn went to the shared Gateway under /p/<profile>. Enable gateway.multiplex_profiles "
-        "on the Gateway (and set API_SERVER_KEY in the profile's .env), or set HERMES_WEBUI_GATEWAY_BASE_URL "
-        "in the profile's .env to a Gateway that serves this profile."
-    )
+    if code == 401:  # routed and refused: multiplexing is on, so only the key can be wrong
+        return ("The shared Gateway serves this profile under /p/<profile> but rejected the key: set "
+                "API_SERVER_KEY in the profile's .env to that Gateway's key, " + _ROUTE_FIX_HINT)
+    if code == 404:
+        return ("This profile's turn went to the shared Gateway under /p/<profile>: enable "
+                "gateway.multiplex_profiles (and set API_SERVER_KEY in the profile's .env), " + _ROUTE_FIX_HINT)
+    return ""
 
 
 def _gateway_route_error_classification(code, route_hint: str) -> dict:
     """A Gateway routing refusal is not a provider/model error: classify it as the Gateway's."""
     auth = code == 401
-    return {
-        "type": "gateway_auth_error" if auth else "gateway_http_error",
-        "label": "Gateway authentication failed" if auth else "Gateway request failed",
-        "hint": route_hint,
-    }
+    return {"type": "gateway_auth_error" if auth else "gateway_http_error",
+            "label": "Gateway authentication failed" if auth else "Gateway request failed",
+            "hint": route_hint}
 
 
 def _gateway_config_for_profile(profile_name) -> dict | None:
@@ -2965,8 +2947,7 @@ def _run_gateway_chat_streaming(
             logger.debug("Failed to put gateway event to queue")
 
     s = None
-    base_url = api_key = ""
-    keyless_profile = False
+    base_url, api_key, keyless_profile = "", "", False
     final_text = ""
     terminal_error = ""
     usage = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0}
@@ -3050,9 +3031,9 @@ def _run_gateway_chat_streaming(
                 body_extras["reasoning_effort"] = reasoning_effort
             if _gw_overrides.get("service_tier"):
                 body_extras["service_tier"] = _gw_overrides["service_tier"]
-            # A replayed pre-upgrade record keeps its legacy routing so a later restart resolves it the same way.
-            legacy = bool(reattach_run) and reattach_run.get("endpoint_routing") != _GATEWAY_ENDPOINT_ROUTING
-            routing = {} if legacy else {"endpoint_routing": _GATEWAY_ENDPOINT_ROUTING, "base_url": base_url}
+            # A replayed pre-upgrade record keeps its legacy routing, so a later restart resolves it as before.
+            routing = {} if reattach_run and reattach_run.get("endpoint_routing") != _GATEWAY_ENDPOINT_ROUTING else {
+                "endpoint_routing": _GATEWAY_ENDPOINT_ROUTING, "base_url": base_url}
 
             def record_run(run_id, request=None):
                 _record_gateway_run(
@@ -3544,10 +3525,8 @@ def _run_gateway_chat_streaming(
             err_body = ""
         put_gateway_event(
             "apperror",
-            _gateway_http_error_event(
-                exc, err_body, api_key_configured=bool(api_key),
-                route_hint=_gateway_profile_route_hint(base_url, exc.code, keyless_profile),
-            ),
+            _gateway_http_error_event(exc, err_body, api_key_configured=bool(api_key),
+                                      route_hint=_gateway_profile_route_hint(base_url, exc.code, keyless_profile)),
         )
     except Exception as exc:
         safe = _redact_text(str(exc))[:500]
