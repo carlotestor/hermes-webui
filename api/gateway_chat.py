@@ -1228,7 +1228,7 @@ def _run_gateway_runs_api_streaming(
         if state in ("cancelled", "interrupted"):
             return "cancel", None
         if state != "completed":
-            return "raise", RuntimeError(str(status.get("error") or f"Gateway run {state}"))
+            return "raise", RuntimeError(str(status.get("error") or _gateway_terminal_message(state)))
         output = str(status.get("output") or "")
         if not output:
             # Round-4 review (Greptile item 1): the settle path is
@@ -1487,6 +1487,22 @@ def _run_gateway_runs_api_streaming(
     return final_text, usage
 
 
+def _gateway_terminal_message(state: str) -> str:
+    if state == "unknown":
+        return "Gateway lost this run (its worker exited before finishing); send the message again"
+    return f"Gateway run {state}"
+
+
+def _gateway_error_code(exc) -> str:
+    """The OpenAI-style ``error.code`` of a Gateway HTTP error body, or ''."""
+    try:
+        body = json.loads(exc.read() or b"{}")
+    except Exception:
+        return ""
+    err = body.get("error") if isinstance(body, dict) else None
+    return str(err.get("code") or "") if isinstance(err, dict) else ""
+
+
 def stop_gateway_run(run_id: str) -> bool:
     """Request gateway interruption and report whether it was acknowledged."""
     run_id = str(run_id or "").strip()
@@ -1512,7 +1528,13 @@ def stop_gateway_run(run_id: str) -> bool:
             final_url = str(getattr(response, "geturl", lambda: req.full_url)() or "")
             status = int(getattr(response, "status", getattr(response, "code", 0)) or 0)
             return 200 <= status < 300 and final_url == req.full_url
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
+    except urllib.error.HTTPError as exc:
+        # A dead-epoch run has nothing left to stop, so the local stream may be torn down.
+        if exc.code == 409 and _gateway_error_code(exc) == "unknown_execution":
+            return True
+        logger.debug("Gateway stop failed for run %s", run_id, exc_info=True)
+        return False
+    except (urllib.error.URLError, OSError, ValueError):
         logger.debug("Gateway stop failed for run %s", run_id, exc_info=True)
         return False
 
@@ -1589,7 +1611,8 @@ def _relay_gateway_pending_steer(session_id, payload, put_gateway_event) -> None
         put_gateway_event("pending_steer_leftover", {"session_id": session_id, "text": text})
 
 
-_GATEWAY_RUN_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+# "unknown": the owning worker epoch is gone and the Gateway can neither resume nor stop it.
+_GATEWAY_RUN_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted", "unknown"})
 GATEWAY_REATTACH_POLL_INTERVAL = 2.0
 # Consecutive unreachable polls tolerated before the reattached turn is failed (~5 min at 2s).
 GATEWAY_REATTACH_MAX_POLL_FAILURES = 150
@@ -1777,7 +1800,7 @@ def _await_gateway_run_result(
                 put_gateway_event("cancel", {"message": "Cancelled by gateway"})
                 return None, {}
             if state != "completed":
-                raise RuntimeError(str(status.get("error") or f"Gateway run {state}"))
+                raise RuntimeError(str(status.get("error") or _gateway_terminal_message(state)))
             output = str(status.get("output") or "")
             if output and stream_id in STREAM_PARTIAL_TEXT:
                 STREAM_PARTIAL_TEXT[stream_id] = output
