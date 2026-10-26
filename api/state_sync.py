@@ -396,16 +396,40 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
             logger.debug("Failed to close state.db")
 
 
-# Desktop or the CLI can hold the state.db write lock, so a pin mirror waits at most ~0.5 s.
+# Desktop or the CLI can hold the state.db write lock, so a mirror waits at most ~0.5 s.
 PIN_MIRROR_TIMEOUT_S = 0.5
 
+# Compression lineage, as the Agent's ``set_session_archived`` walks it (ancestors + descendants).
+_LINEAGE_SQL = (
+    "WITH RECURSIVE anc(id) AS (SELECT ? UNION SELECT p.id FROM anc a"
+    " JOIN sessions c ON c.id = a.id JOIN sessions p ON p.id = c.parent_session_id"
+    " WHERE p.end_reason = 'compression'),"
+    " des(id) AS (SELECT ? UNION SELECT c.id FROM des d JOIN sessions p ON p.id = d.id"
+    " JOIN sessions c ON c.parent_session_id = p.id WHERE p.end_reason = 'compression')"
+)
+# field -> (UPDATE statement, params for (session_id, value))
+_MIRROR_UPDATES = {
+    "pinned": ("UPDATE sessions SET pinned = ? WHERE id = ?", lambda sid, v: (int(bool(v)), sid)),
+    "archived": (
+        _LINEAGE_SQL + " UPDATE sessions SET archived = ?, auto_archived = 0"
+        " WHERE id IN (SELECT id FROM anc UNION SELECT id FROM des)",
+        lambda sid, v: (sid, sid, int(bool(v))),
+    ),
+    "title": (
+        "UPDATE sessions SET title = ?, title_source = 'user' WHERE id = ?",
+        lambda sid, v: (str(v), sid),
+    ),
+}
 
-def sync_session_pinned(session_id: str, pinned: bool, profile: Optional[str] = None) -> bool:
-    """Mirror a pin into *profile*'s ``sessions.pinned``, the flag Desktop and the CLI share.
+
+def sync_session_field(session_id: str, field: str, value, profile: Optional[str] = None) -> bool:
+    """Mirror a pin, archive or manual title into *profile*'s state.db row; True when it landed.
 
     Best-effort and never raises: the sidecar is the authority and is already saved, so a
-    missing row or column, or a lock held elsewhere, only costs the other app this update.
+    missing row or column, a title clash, or a lock held elsewhere only costs the other app
+    this update.
     """
+    sql, params = _MIRROR_UPDATES[field]
     try:
         db_path = _resolve_state_db_path(profile)
         if db_path is None:
@@ -416,30 +440,36 @@ def sync_session_pinned(session_id: str, pinned: bool, profile: Optional[str] = 
             timeout=PIN_MIRROR_TIMEOUT_S,
             isolation_level=None,
         )) as conn:
-            cur = conn.execute("UPDATE sessions SET pinned = ? WHERE id = ?", (int(bool(pinned)), session_id))
+            before = conn.total_changes  # cursor.rowcount is -1 for a WITH ... UPDATE
+            conn.execute(sql, params(session_id, value))
             conn.commit()
-            return cur.rowcount > 0
+            return conn.total_changes > before
     except Exception:
-        logger.debug("Failed to mirror pin state for %s into state.db", session_id, exc_info=True)
+        logger.debug("Failed to mirror %s for %s into state.db", field, session_id, exc_info=True)
         return False
 
 
-def read_state_db_pinned_ids(profile: Optional[str] = None) -> set[str]:
-    """Ids pinned in *profile*'s own state.db; empty when unreadable or without the column.
+def read_state_db_flags(profile: Optional[str] = None) -> dict[str, dict]:
+    """``{id: {pinned, archived}}`` from *profile*'s own state.db; ``{}`` when unreadable.
 
     Read-only, and never another profile's database: a missing state.db contributes
-    nothing instead of falling back to the active profile (#2762).
+    nothing instead of falling back to the active profile (#2762). Columns an older
+    Agent lacks are left out of each row.
     """
     try:
         db_path = _resolve_state_db_path(profile)
         if db_path is None:
-            return set()
+            return {}
         with closing(open_state_db_readonly(db_path)) as conn:
+            have = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            cols = [c for c in ("pinned", "archived") if c in have]
+            if not cols:
+                return {}
             return {
-                str(row[0]).strip()
-                for row in conn.execute("SELECT id FROM sessions WHERE pinned")
+                str(row[0]).strip(): {c: bool(row[i + 1]) for i, c in enumerate(cols)}
+                for row in conn.execute(f"SELECT id, {', '.join(cols)} FROM sessions")
                 if row[0]
             }
     except Exception:
-        logger.debug("Failed to read pinned sessions from %s", profile, exc_info=True)
-        return set()
+        logger.debug("Failed to read session flags from %s", profile, exc_info=True)
+        return {}

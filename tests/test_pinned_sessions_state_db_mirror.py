@@ -1,8 +1,8 @@
-"""Pins are WebUI sidecar data, mirrored best-effort into the Agent's state.db.
+"""Pins, archive and manual titles are WebUI sidecar data, mirrored best-effort into state.db.
 
-``/api/session/pin`` saves the sidecar as before, so the mirror never fails the response.
-The sidebar reads ``state.db.sessions.pinned`` as an extra input, so a pin made in
-Desktop or the CLI shows here without ever clearing a WebUI pin.
+The routes save the sidecar as before, so the mirror never fails the response. The sidebar
+reads ``sessions.pinned``/``archived``: a Desktop/CLI change shows here, and a flag whose
+mirror never landed is never lost (the sidecar records what it last mirrored).
 """
 
 import sqlite3
@@ -20,7 +20,11 @@ def _make_state_db(path, *, rows=(("s1", 0),), pinned_column=True):
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(str(path))) as conn:
         if pinned_column:
-            conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, pinned INTEGER NOT NULL DEFAULT 0)")
+            conn.execute(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, pinned INTEGER NOT NULL DEFAULT 0,"
+                " archived INTEGER NOT NULL DEFAULT 0, auto_archived INTEGER NOT NULL DEFAULT 0,"
+                " title TEXT, title_source TEXT, parent_session_id TEXT, end_reason TEXT)"
+            )
             conn.executemany("INSERT INTO sessions (id, pinned) VALUES (?, ?)", list(rows))
         else:
             conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
@@ -61,6 +65,7 @@ class _PinSession:
 
     def __init__(self, sid, profile="default"):
         self.session_id, self.profile, self.pinned = sid, profile, False
+        self.state_db_mirror = {}
 
     def compact(self):
         return {"session_id": self.session_id, "pinned": bool(self.pinned), "profile": self.profile}
@@ -120,7 +125,7 @@ def _pin_setup(tmp_path, monkeypatch, **db_kwargs):
     return db, sessions, _pin_endpoint(monkeypatch, sessions)
 
 
-def _sidebar_payload(monkeypatch, rows, *, active_profile="default", all_profiles=False):
+def _sidebar_payload(monkeypatch, rows, *, active_profile="default", all_profiles=False, include_archived=False):
     """Build the sidebar payload over *rows* with listing and pruning stubbed out.
 
     Returns the row list in payload order, so two profiles keeping the same session id
@@ -142,7 +147,7 @@ def _sidebar_payload(monkeypatch, rows, *, active_profile="default", all_profile
         show_cli_sessions=False,
         show_previous_messaging_sessions=False,
         show_cron_sessions=False,
-        include_archived=False,
+        include_archived=include_archived,
     )["sessions"]
 
 
@@ -258,13 +263,13 @@ def test_profile_a_sidebar_never_reads_or_writes_profile_b(tmp_path, monkeypatch
     _make_state_db(db_a, rows=(("s1", 0), ("s2", 1)))
     _make_state_db(db_b, rows=(("s1", 1), ("b_only", 1)))
     opened, before_b = [], (db_b.read_bytes(), _db_snapshot(db_b))
-    real_read = state_sync.read_state_db_pinned_ids
+    real_read = state_sync.read_state_db_flags
 
     def spy(profile=None):
         opened.append(str(state_sync._resolve_state_db_path(profile)))
         return real_read(profile)
 
-    monkeypatch.setattr(state_sync, "read_state_db_pinned_ids", spy)
+    monkeypatch.setattr(state_sync, "read_state_db_flags", spy)
 
     rows = _sidebar_rows(monkeypatch, _webui_rows(("s1", "default", False), ("s2", "default", False)))
 
@@ -351,3 +356,98 @@ def test_agent_projection_carries_the_state_db_pin(tmp_path, monkeypatch):
 
     assert rows["cli_pinned"]["pinned"] is True
     assert rows["cli_plain"]["pinned"] is False
+
+
+# ── Desktop/CLI unpin and archive reach the sidebar; archive and title are mirrored ──
+
+def _flag_row(sid, **extra):
+    return {**_webui_rows((sid, "default", False))[0], **extra}
+
+
+def test_desktop_unpin_after_a_webui_mirror_is_honoured(tmp_path, monkeypatch):
+    homes = _homes(tmp_path, monkeypatch)
+    _make_state_db(homes["default"] / "state.db", rows=(("s1", 0),))
+    row = _flag_row("s1", pinned=True, state_db_mirror={"pinned": True})
+
+    assert _sidebar_rows(monkeypatch, [row])["s1"]["pinned"] is False
+
+
+@pytest.mark.parametrize("mirror", [{}, {"pinned": False}], ids=["never-mirrored", "last-mirrored-unpinned"])
+def test_a_webui_pin_the_mirror_missed_is_not_unpinned(tmp_path, monkeypatch, mirror):
+    homes = _homes(tmp_path, monkeypatch)
+    _make_state_db(homes["default"] / "state.db", rows=(("s1", 0),))
+    row = _flag_row("s1", pinned=True, state_db_mirror=mirror)
+
+    assert _sidebar_rows(monkeypatch, [row])["s1"]["pinned"] is True
+
+
+def test_pin_route_records_only_a_mirror_that_landed(tmp_path, monkeypatch):
+    db, sessions, post = _pin_setup(tmp_path, monkeypatch, rows=(("s1", 0),))
+    assert post("s1", True)[0] == 200
+    assert sessions["s1"].state_db_mirror == {"pinned": True}
+
+    holder = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        assert post("s1", False)[0] == 200
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert sessions["s1"].state_db_mirror == {"pinned": True}  # the unpin never landed
+
+
+def test_desktop_archive_and_unarchive_reach_the_sidebar(tmp_path, monkeypatch):
+    homes = _homes(tmp_path, monkeypatch)
+    _make_state_db(homes["default"] / "state.db", rows=(("arch", 0), ("unarch", 0)))
+    with closing(sqlite3.connect(str(homes["default"] / "state.db"))) as conn:
+        conn.execute("UPDATE sessions SET archived = 1 WHERE id = 'arch'")
+        conn.commit()
+    rows = [
+        _flag_row("arch", archived=False),
+        _flag_row("unarch", archived=True, state_db_mirror={"archived": True}),
+    ]
+
+    got = {r["session_id"]: r["archived"] for r in _sidebar_payload(monkeypatch, rows, include_archived=True)}
+
+    assert got == {"arch": True, "unarch": False}
+
+
+def test_archive_mirrors_across_the_compression_lineage_and_title_mirrors_as_user_title(tmp_path, monkeypatch):
+    from api import routes
+
+    homes = _homes(tmp_path, monkeypatch)
+    db = homes["default"] / "state.db"
+    _make_state_db(db, rows=(("root", 0), ("tip", 0), ("other", 0)))
+    with closing(sqlite3.connect(str(db))) as conn:
+        conn.execute("UPDATE sessions SET end_reason = 'compression' WHERE id = 'root'")
+        conn.execute("UPDATE sessions SET parent_session_id = 'root' WHERE id = 'tip'")
+        conn.commit()
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda _sid: threading.RLock())
+    tip = _PinSession("tip")
+
+    routes._mirror_to_state_db(tip, "archived", True)
+    routes._mirror_to_state_db(tip, "title", "Manual name")
+
+    with closing(sqlite3.connect(str(db))) as conn:
+        archived = dict(conn.execute("SELECT id, archived FROM sessions"))
+        title = conn.execute("SELECT title, title_source FROM sessions WHERE id = 'tip'").fetchone()
+    assert archived == {"root": 1, "tip": 1, "other": 0}
+    assert title == ("Manual name", "user")
+    assert tip.state_db_mirror == {"archived": True, "title": "Manual name"}
+
+
+def test_title_clash_or_missing_row_never_raises_and_is_not_recorded(tmp_path, monkeypatch):
+    from api import routes
+
+    homes = _homes(tmp_path, monkeypatch)
+    db = homes["default"] / "state.db"
+    _make_state_db(db, rows=(("s1", 0),))
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda _sid: threading.RLock())
+    with closing(sqlite3.connect(str(db))) as conn:
+        conn.execute("CREATE UNIQUE INDEX t ON sessions(title) WHERE title IS NOT NULL")
+        conn.execute("INSERT INTO sessions (id, title) VALUES ('s2', 'Taken')")
+        conn.commit()
+    for sid, title in (("s1", "Taken"), ("ghost", "Anything")):
+        session = _PinSession(sid)
+        routes._mirror_to_state_db(session, "title", title)
+        assert session.state_db_mirror == {}

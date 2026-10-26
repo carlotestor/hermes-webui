@@ -1772,6 +1772,9 @@ class Session:
         self.updated_at = updated_at or time.time()
         self.pinned = bool(pinned)
         self.archived = bool(archived)
+        # Last pinned/archived/title values written to state.db; tells a Desktop/CLI edit from a lost mirror.
+        _mirror = kwargs.get('state_db_mirror')
+        self.state_db_mirror = dict(_mirror) if isinstance(_mirror, dict) else {}
         self.project_id = project_id or None
         self.profile = profile
         self.input_tokens = input_tokens or 0
@@ -1932,7 +1935,7 @@ class Session:
         # Fields are listed in the order they should appear in the JSON file.
         METADATA_FIELDS = [
             'session_id', 'title', 'workspace', 'created_workspace', 'model', 'model_provider', 'model_explicit_pick_signature', 'created_at', 'updated_at',
-            'pinned', 'archived', 'project_id', 'profile',
+            'pinned', 'archived', 'state_db_mirror', 'project_id', 'profile',
             'input_tokens', 'output_tokens', 'estimated_cost',
             'cache_read_tokens', 'cache_write_tokens',
             'personality', 'active_stream_id',
@@ -2481,6 +2484,7 @@ class Session:
             'transcript_generation_baseline': self.transcript_generation_baseline,
             'pinned': self.pinned,
             'archived': self.archived,
+            'state_db_mirror': self.state_db_mirror,
             'project_id': self.project_id,
             'profile': self.profile,
             'input_tokens': self.input_tokens,
@@ -7452,7 +7456,7 @@ def _refresh_index_rows_from_sidecar_metadata(
         refreshed = dict(session)
         for key in (
             'message_count', 'updated_at', 'last_message_at', 'title', 'workspace',
-            'model', 'model_provider', 'created_at', 'pinned', 'archived', 'project_id',
+            'model', 'model_provider', 'created_at', 'pinned', 'archived', 'state_db_mirror', 'project_id',
             'profile', 'pre_compression_snapshot', 'parent_session_id', 'source_tag',
             'raw_source', 'session_source', 'source_label', 'active_stream_id',
             'has_pending_user_message', 'pending_user_message', 'pending_started_at',
