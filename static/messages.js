@@ -6684,7 +6684,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(key && typeof t==='function'){
         try{
           const translated=String(t(key,...args));
-          if(translated && translated!==key)return translated;
+          // A templated key rendered without its args yields "undefined"; keep the server text.
+          if(translated && translated!==key && !(raw && /\bundefined\b/.test(translated)))return translated;
         }catch(_){}
       }
       return raw;

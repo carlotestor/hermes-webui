@@ -17645,6 +17645,7 @@ def _run_agent_streaming(
             # STREAM_GOAL_RELATED or goal_related parameter).
             try:
                 from api.goals import (
+                    goal_message_key as _goal_message_key,
                     dispatch_goal_continuation,
                     evaluate_goal_after_turn,
                     has_active_goal,
@@ -17689,7 +17690,7 @@ def _run_agent_streaming(
                         'session_id': session_id,
                         'state': 'continuing' if decision.get('should_continue') else 'idle',
                         'message': _goal_message,
-                        'message_key': decision.get('message_key') or ('goal_continuing' if _goal_message else ''),
+                        'message_key': _goal_message_key(decision),
                         'message_args': decision.get('message_args') or [],
                         'decision': decision,
                     })
@@ -17721,7 +17722,7 @@ def _run_agent_streaming(
                                 'continuation_id': continuation_id,
                                 'text': continuation_prompt,
                                 'message': _goal_message,
-                                'message_key': decision.get('message_key') or 'goal_continuing',
+                                'message_key': _goal_message_key(decision),
                                 'message_args': decision.get('message_args') or [],
                                 'decision': decision,
                             })

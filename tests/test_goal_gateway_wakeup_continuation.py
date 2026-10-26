@@ -1575,3 +1575,21 @@ console.log(JSON.stringify({calls,inflight:'s1' in INFLIGHT}));
     assert "queue" not in out["calls"], "a refused continuation must never auto-resend"
     # Draft clear happens before restore, so the restore is not overwritten.
     assert out["calls"].index("clearInflight") < len(out["calls"]) - 1
+
+def test_waiting_goal_event_never_uses_the_templated_continuing_key():
+    """A wait decision has no turn args, so the goal_continuing template would render 'undefined'."""
+    from api.goals import goal_message_key
+
+    wait = {"verdict": "wait", "message": "⏳ Goal waiting on 5 running subagent(s); resumes when they finish.",
+            "message_key": "", "message_args": []}
+    assert goal_message_key(wait) == ""
+    assert goal_message_key({"message_key": "", "message_args": [3, 100, "r"]}) == "goal_continuing"
+    assert goal_message_key({"message_key": "goal_done", "message_args": []}) == "goal_done"
+
+
+def test_client_keeps_server_text_when_template_renders_undefined():
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text()
+    body = src[src.index("function _resolveGoalMessage"):][:700]
+    assert "undefined" in body and "return raw" in body

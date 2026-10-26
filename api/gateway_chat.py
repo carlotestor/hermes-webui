@@ -3352,6 +3352,7 @@ def _run_gateway_chat_streaming(
             success_writeback_committed = True
         try:
             from api.goals import (
+                goal_message_key as _goal_message_key,
                 dispatch_goal_continuation,
                 evaluate_goal_after_turn,
                 gateway_evaluated_goal_in_turn,
@@ -3392,9 +3393,7 @@ def _run_gateway_chat_streaming(
                         "session_id": session_id,
                         "state": "continuing" if decision.get("should_continue") else "idle",
                         "message": goal_message,
-                        "message_key": decision.get("message_key") or (
-                            "goal_continuing" if goal_message else ""
-                        ),
+                        "message_key": _goal_message_key(decision),
                         "message_args": decision.get("message_args") or [],
                         "decision": decision,
                     })
@@ -3423,7 +3422,7 @@ def _run_gateway_chat_streaming(
                                 "continuation_id": continuation_id,
                                 "text": continuation_prompt,
                                 "message": goal_message,
-                                "message_key": decision.get("message_key") or "goal_continuing",
+                                "message_key": _goal_message_key(decision),
                                 "message_args": decision.get("message_args") or [],
                                 "decision": decision,
                             })

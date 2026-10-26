@@ -792,6 +792,14 @@ def _state_db_live_delegations(session_id: str, profile_home: str | Path | None)
         return 0
 
 
+def goal_message_key(decision: Dict[str, Any]) -> str:
+    """i18n key for a goal event; the templated default needs its turns/max/reason args."""
+    key = str(decision.get("message_key") or "")
+    if key or not decision.get("message_args"):
+        return key
+    return "goal_continuing"
+
+
 def _hold_while_delegations_run(decision: Dict[str, Any], session_id: str, profile_home) -> Dict[str, Any]:
     """Defer a continuation while subagents run; their completion wakeup re-evaluates the goal."""
     if not decision.get("should_continue"):
