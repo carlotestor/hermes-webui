@@ -420,9 +420,26 @@ def _mirror_to_state_db(session, field: str, value) -> None:
     sid = str(_session_field(session, "session_id", "") or "").strip()
     if not sync_session_field(sid, field, value, profile=_session_field(session, "profile", None)):
         return
-    with _get_session_agent_lock(sid):
-        session.state_db_mirror = {**(getattr(session, "state_db_mirror", None) or {}), field: value}
-        session.save(touch_updated_at=False)
+    # The acknowledgement is bookkeeping for a write that already landed in both stores:
+    # it must never fail the request, and must never save a stale captured object.
+    try:
+        with _get_session_agent_lock(sid):
+            with LOCK:
+                current = SESSIONS.get(sid)
+            if current is None:
+                current = Session.load(sid) if sid else None
+            if current is None:
+                current = session  # nothing persisted anywhere, so nothing newer can exist
+            else:
+                current = _ensure_full_session_before_mutation(sid, current)
+            norm = bool if field in ("pinned", "archived") else (lambda v: v)
+            held = _session_field(current, field)
+            if held is not None and norm(held) != norm(value):
+                return  # superseded by a newer operation: do not record this value
+            current.state_db_mirror = {**(getattr(current, "state_db_mirror", None) or {}), field: value}
+            current.save(touch_updated_at=False)
+    except Exception:
+        logger.warning("state.db mirror acknowledgement not saved for %s.%s", sid, field, exc_info=True)
 
 
 def _adopt_state_db_flag(sidecar: bool, mirrored, db: bool) -> bool:

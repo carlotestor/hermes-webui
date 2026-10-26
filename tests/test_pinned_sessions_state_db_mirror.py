@@ -5,6 +5,7 @@ reads ``sessions.pinned``/``archived``: a Desktop/CLI change shows here, and a f
 mirror never landed is never lost (the sidecar records what it last mirrored).
 """
 
+import collections
 import sqlite3
 import threading
 import time
@@ -451,3 +452,83 @@ def test_title_clash_or_missing_row_never_raises_and_is_not_recorded(tmp_path, m
         session = _PinSession(sid)
         routes._mirror_to_state_db(session, "title", title)
         assert session.state_db_mirror == {}
+
+
+def _real_session_pin_endpoint(tmp_path, monkeypatch, sid="s1"):
+    """Pin route over REAL Session persistence, the real SESSIONS LRU and per-session lock."""
+    import api.models as models
+    from api import routes
+    from api.models import Session
+
+    homes = _homes(tmp_path, monkeypatch)
+    _make_state_db(homes["default"] / "state.db", rows=((sid, 0),))
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    for mod in (models, routes):
+        monkeypatch.setattr(mod, "SESSION_DIR", sdir, raising=False)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", sdir / "_index.json", raising=False)
+    monkeypatch.setattr(models, "SESSIONS_MAX", 1)
+    monkeypatch.setattr(models._cfg, "get_sessions_cache_max", lambda *a, **k: 1)
+    live = Session(session_id=sid, title="Old title", messages=[{"role": "user", "content": "one"}])
+    live.save()
+    cache = collections.OrderedDict({sid: live})
+    monkeypatch.setattr(models, "SESSIONS", cache)
+    monkeypatch.setattr(routes, "SESSIONS", cache)
+    sessions = {}
+    post = _pin_endpoint(monkeypatch, sessions)
+    from api.config import _get_session_agent_lock as real_lock
+    monkeypatch.setattr(routes, "_get_session_agent_lock", real_lock)
+    monkeypatch.setattr(routes, "get_session", lambda s, **kw: cache[s])
+    return live, cache, sdir, post, Session
+
+
+def test_mirror_ack_after_eviction_and_cold_writer_keeps_new_title_and_transcript(tmp_path, monkeypatch):
+    import json
+    import api.models as models
+    from api import routes
+
+    live, cache, sdir, post, Session = _real_session_pin_endpoint(tmp_path, monkeypatch)
+    real_sync = __import__("api.state_sync", fromlist=["x"]).sync_session_field
+
+    def sync_then_cold_write(*args, **kwargs):
+        landed = real_sync(*args, **kwargs)  # the state.db mirror completes ...
+        with models.LOCK:  # ... real cap-1 LRU eviction of the resident instance ...
+            cache["other"] = Session(session_id="other", title="x", messages=[])
+            models._evict_sessions_over_cap(1)
+        assert "s1" not in cache
+        cold = Session.load("s1")  # ... a distinct cold instance saves newer state
+        cold.title, cold.manual_title = "New manual title", True
+        cold.messages.append({"role": "assistant", "content": "two"})
+        cold.save()
+        cache["s1"] = cold
+        return landed
+
+    monkeypatch.setattr("api.state_sync.sync_session_field", sync_then_cold_write)
+    assert post("s1", True)[0] == 200
+
+    data = json.loads((sdir / "s1.json").read_text())
+    assert data["title"] == "New manual title"
+    assert [m["content"] for m in data["messages"]] == ["one", "two"]
+    assert data["pinned"] is True and data["state_db_mirror"] == {"pinned": True}
+
+
+def test_mirror_ack_save_failure_still_returns_200_with_both_stores_pinned(tmp_path, monkeypatch):
+    import json
+    from api.models import Session
+
+    live, cache, sdir, post, _ = _real_session_pin_endpoint(tmp_path, monkeypatch)
+    real_save = Session.save
+    calls = []
+
+    def save(self, touch_updated_at=True):
+        calls.append(touch_updated_at)
+        if touch_updated_at is False:
+            raise PermissionError("sidecar dir is read-only")
+        return real_save(self, touch_updated_at)
+
+    monkeypatch.setattr(Session, "save", save)
+    assert post("s1", True)[0] == 200
+    assert False in calls  # the acknowledgement save was attempted and failed
+    assert json.loads((sdir / "s1.json").read_text())["pinned"] is True
+    db = tmp_path / "default" / "state.db"
+    assert _db_snapshot(db)[1] == {"s1": True}
