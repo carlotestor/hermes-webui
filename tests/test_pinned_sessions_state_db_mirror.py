@@ -485,7 +485,6 @@ def _real_session_pin_endpoint(tmp_path, monkeypatch, sid="s1"):
 def test_mirror_ack_after_eviction_and_cold_writer_keeps_new_title_and_transcript(tmp_path, monkeypatch):
     import json
     import api.models as models
-    from api import routes
 
     live, cache, sdir, post, Session = _real_session_pin_endpoint(tmp_path, monkeypatch)
     real_sync = __import__("api.state_sync", fromlist=["x"]).sync_session_field
