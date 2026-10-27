@@ -1197,6 +1197,13 @@ def detached_goal_continuation_skip_reason(session_id: str, continuation_id: str
         s = get_session(sid)
     except Exception:
         return "session_unavailable"
+    try:
+        from api.compression_continuation import durable_compression_continuation
+
+        if durable_compression_continuation(s)[0]:
+            return "sealed_parent"
+    except Exception:
+        return "lineage_unknown"
     owner = getattr(s, "profile", None)
     try:
         from api.profiles import (
@@ -1260,6 +1267,9 @@ def start_detached_goal_continuation(
                     sid,
                     reason,
                 )
+                if reason == "sealed_parent":
+                    # A turn must never start on the compressed parent; retries would loop.
+                    clear_pending_goal_continuation(sid)
                 return
             result = start_session_turn(
                 sid, prompt, source="goal_wakeup", goal_continuation_id=cid

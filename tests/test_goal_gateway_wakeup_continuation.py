@@ -595,6 +595,33 @@ def test_detached_continuation_skip_reasons(monkeypatch, case, expected):
     assert webui_goals.detached_goal_continuation_skip_reason(s.session_id, s.cid) == expected
 
 
+def test_detached_continuation_on_sealed_parent_starts_no_turn_and_drops_record(monkeypatch):
+    import threading
+
+    from api import compression_continuation
+
+    s = _sess()
+    _detached_env(monkeypatch, s)
+    monkeypatch.setattr(compression_continuation, "durable_compression_continuation", lambda _s: (True, "tip-sid"))
+    assert webui_goals.detached_goal_continuation_skip_reason(s.session_id, s.cid) == "sealed_parent"
+    started = []
+    monkeypatch.setattr(routes, "start_session_turn", lambda *a, **k: started.append(a))
+    threads = []
+    real_thread = threading.Thread
+
+    def _thread(*a, **k):
+        t = real_thread(*a, **k)
+        threads.append(t)
+        return t
+
+    monkeypatch.setattr(webui_goals.threading, "Thread", _thread)
+    webui_goals.start_detached_goal_continuation(s.session_id, "continue", s.cid)
+    for t in threads:
+        t.join(5)
+    assert started == []
+    assert not webui_goals.pending_goal_continuation_matches(s.session_id, s.cid)
+
+
 def test_start_detached_goal_continuation_does_not_start_when_skipped(monkeypatch):
     import threading
 
@@ -1575,6 +1602,46 @@ console.log(JSON.stringify({calls,inflight:'s1' in INFLIGHT}));
     assert "queue" not in out["calls"], "a refused continuation must never auto-resend"
     # Draft clear happens before restore, so the restore is not overwritten.
     assert out["calls"].index("clearInflight") < len(out["calls"]) - 1
+
+@pytest.mark.parametrize("label", ["goal_continuation_stale", "goal_continuation_already_dispatched"])
+def test_refused_continuation_does_not_drain_queued_followup_over_restored_draft(label):
+    """Real setBusy + real rejection branch: a queued follow-up must not overwrite the restored draft."""
+    import json, shutil, subprocess
+    from pathlib import Path
+
+    if not shutil.which("node"):
+        pytest.skip("node not available")
+    root = Path(__file__).parents[1] / "static"
+    msgs = root.joinpath("messages.js").read_text(encoding="utf-8")
+    ui = root.joinpath("ui.js").read_text(encoding="utf-8")
+    start = msgs.index("    // Refused continuation token:")
+    body = msgs[start : msgs.index("      return;\n    }", start)] + "      return;\n    }"
+    set_busy = ui[ui.index("function setBusy(") : ui.index("// ── Queue chip display")]
+    script = """
+const INFLIGHT={s1:1};const activeSid='s1';const e={status:409};const errMsg=%s;
+const _failedSendDraftText='edited text';const _failedSendFilesSnapshot=[{name:'user-notes.txt'}];
+const _composerDraftClearPromise=Promise.resolve();
+let _queueDrainSid=null;const sent=[];const el={value:''};
+const S={busy:true,pendingFiles:[],session:{session_id:'s1',model:'m'}};
+const Q=[{text:'queued followup',files:[]}];
+function shiftQueuedSessionMessage(){return Q.shift()||null}function queueSessionMessage(_s,p){Q.push(p)}
+const $=id=>id==='msg'?el:null;
+function updateSendBtn(){}function setStatus(){}function setComposerStatus(){}function updateQueueBadge(){}
+function autoResize(){}function renderTray(){}function showToast(){}function renderSessionList(){}
+function clearInflightState(){}function removeThinking(){}
+function send(){sent.push(el.value);el.value='';S.pendingFiles=[]}
+function _restoreComposerDraftAfterFailedSend(t,f){el.value=t;S.pendingFiles=f}
+%s
+(function(){%s})();
+setTimeout(()=>console.log(JSON.stringify({text:el.value,files:S.pendingFiles.map(x=>x.name),sent,queued:Q.map(x=>x.text),busy:S.busy})),400);
+""" % (json.dumps(label), set_busy, body)
+    out = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
+    assert out["text"] == "edited text"
+    assert out["files"] == ["user-notes.txt"]
+    assert out["sent"] == []
+    assert out["queued"] == ["queued followup"]
+    assert out["busy"] is False
+
 
 def test_waiting_goal_event_never_uses_the_templated_continuing_key():
     """A wait decision has no turn args, so the goal_continuing template would render 'undefined'."""

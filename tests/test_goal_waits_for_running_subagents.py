@@ -41,6 +41,8 @@ def test_missing_state_db_never_blocks(tmp_path):
 def test_evaluate_goal_after_turn_holds_with_live_delegation(tmp_path, monkeypatch):
     _db(tmp_path, [("d1", "k", "sid", "sid", "running")])
 
+    seen = []
+
     class Mgr:
         state = None
 
@@ -48,9 +50,12 @@ def test_evaluate_goal_after_turn_holds_with_live_delegation(tmp_path, monkeypat
             return True
 
         def evaluate_after_turn(self, last_response, **kw):
-            assert kw.get("active_delegations", 0) >= 1
+            seen.append(kw.get("active_delegations", 0))
             return dict(CONTINUE)
 
     monkeypatch.setattr(goals, "_manager", lambda sid, profile_home=None: Mgr())
     out = goals.evaluate_goal_after_turn("sid", "status report", profile_home=tmp_path)
+    # Asserted here, not in the evaluator: production swallows evaluator exceptions.
+    assert seen and seen[0] >= 1
+    assert out["verdict"] == "wait"
     assert out["should_continue"] is False

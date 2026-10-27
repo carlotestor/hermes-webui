@@ -2106,7 +2106,7 @@ async function send(){
     if(e&&e.status===409&&/goal_continuation_(stale|already_dispatched)/.test(errMsg)){
       delete INFLIGHT[activeSid];
       if(typeof clearInflightState==='function') clearInflightState(activeSid);
-      removeThinking();setBusy(false);setComposerStatus('');
+      removeThinking();setBusy(false,{drainQueue:false});setComposerStatus('');
       if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
       _restoreComposerDraftAfterFailedSend(_failedSendDraftText,_failedSendFilesSnapshot,activeSid,_composerDraftClearPromise,'');
       showToast('That goal continuation was already sent. Your message is kept.',3200);
