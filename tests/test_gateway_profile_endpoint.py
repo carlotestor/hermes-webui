@@ -76,6 +76,49 @@ def test_a_profile_owned_gateway_url_is_used_verbatim_with_only_its_own_key(
     assert gateway_chat._gateway_endpoint_for_profile("work") == ("http://work-gw:9000", expected_key)
 
 
+def test_an_open_worker_scope_of_another_profile_does_not_pick_the_destination_for_a_profiles_key(work_profile):
+    """profile_env_for_background_worker() mirrors alpha's .env into os.environ for the worker body; resolving
+    ``work`` meanwhile must still route to the launcher's shared URL, never alpha's Gateway, with work's key."""
+    alpha = work_profile.parent / "alpha"
+    alpha.mkdir()
+    (alpha / ".env").write_text("HERMES_WEBUI_GATEWAY_BASE_URL=http://alpha-gw:9000\nAPI_SERVER_KEY=alpha-key\n")
+
+    with profiles.profile_env_for_background_worker("alpha"):
+        assert gateway_chat.os.environ["HERMES_WEBUI_GATEWAY_BASE_URL"] == "http://alpha-gw:9000"  # the mirror is open
+        assert gateway_chat._gateway_endpoint_for_profile("work") == (f"{SHARED}/p/work", WORK_KEY)
+        assert gateway_chat._gateway_endpoint_for_profile("alpha") == ("http://alpha-gw:9000", "alpha-key")
+
+    assert gateway_chat.os.environ["HERMES_WEBUI_GATEWAY_BASE_URL"] == SHARED
+    assert profiles._WORKER_ENV_BASELINE == {}
+
+
+def test_nested_worker_scopes_restore_the_process_environ_view(work_profile):
+    alpha = work_profile.parent / "alpha"
+    alpha.mkdir()
+    (alpha / ".env").write_text("HERMES_WEBUI_GATEWAY_BASE_URL=http://alpha-gw:9000\n")
+
+    with profiles.profile_env_for_background_worker("alpha"):
+        with profiles.profile_env_for_background_worker("alpha"):
+            assert profiles.process_environ_without_worker_overlays()["HERMES_WEBUI_GATEWAY_BASE_URL"] == SHARED
+        assert profiles.process_environ_without_worker_overlays()["HERMES_WEBUI_GATEWAY_BASE_URL"] == SHARED
+    assert profiles._WORKER_ENV_BASELINE == {}
+
+
+def test_a_profile_with_only_a_webui_alias_is_not_routed_and_keeps_the_unprefixed_listener(work_profile):
+    """Pinned (#7877): the alias is the shared URL's own key, so /p/<name> would be a 401; the profile's own
+    credential goes to the trusted shared listener, exactly as before routing."""
+    (work_profile / ".env").write_text(f"HERMES_WEBUI_GATEWAY_API_KEY={WORK_KEY}\n")
+
+    assert gateway_chat._gateway_endpoint_for_profile("work") == (SHARED, WORK_KEY)
+
+
+def test_a_shared_url_already_naming_a_profile_route_is_refused_not_doubled(work_profile, monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", f"{SHARED}/p/alpha")
+
+    with pytest.raises(RuntimeError, match="already names a profile route"):
+        gateway_chat._gateway_endpoint_for_profile("work")
+
+
 def test_shared_url_loaded_from_root_env_reaches_named_profile(work_profile, monkeypatch):
     root = work_profile.parents[1]
     (root / ".env").write_text(f"HERMES_WEBUI_GATEWAY_BASE_URL=http://shared-gw:7000\nAPI_SERVER_KEY={ROOT_KEY}\n")
