@@ -50,10 +50,14 @@ def _wakeup_outcome(messages, turn):
         # Stop's recovered row carries the same token; a pre-upgrade row only the exact pending time.
         if m.get("role") == "user" and ((token and m.get("_active_turn_token") == token)
                                         or (at and m.get("timestamp") == at)):
-            end = next((j for j in range(i + 1, len(msgs)) if msgs[j].get("role") == "user"), len(msgs))
+            # Mid-run Steer rows and Stop's same-token recovery row belong to this turn; only a
+            # real user row (a new execution boundary) ends it.
+            end = next((j for j in range(i + 1, len(msgs)) if msgs[j].get("role") == "user"
+                        and msgs[j].get("display_kind") != "steer"
+                        and not (token and msgs[j].get("_active_turn_token") == token)), len(msgs))
             rows = msgs[i + 1:end]
             replies = [n for n in rows if n.get("role") == "assistant"]
-            return (_session_has_cancel_marker(SimpleNamespace(messages=rows)),
+            return (_session_has_cancel_marker(SimpleNamespace(messages=[n for n in rows if n.get("role") != "user"])),
                     str(replies[-1].get("content") or "") if replies else "")
     return False, ""
 

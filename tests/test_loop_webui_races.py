@@ -216,6 +216,30 @@ def test_stop_on_wakeup_pauses_loop_after_reload(tmp_path, monkeypatch, session_
     assert len(started) == 1  # no further provider call after a forced due
 
 
+@requires_agent_modules
+@pytest.mark.parametrize("tail,status,reason", [
+    ([{"role": "assistant", "content": "done\nLOOP_COMPLETE"}], "done", None),  # Steer, then complete
+    ([{"role": "user", "content": "check", "_recovered": True, "_steered_tok": True},  # Steer, then Stop
+      {"role": "assistant", "content": "Task cancelled."}], "paused", "user-interrupted (Stop)"),
+])
+def test_steer_during_wakeup_keeps_its_outcome(tmp_path, monkeypatch, tail, status, reason):
+    """A typed Steer row (and Stop's same-token recovery row) must not cut the wakeup's outcome short."""
+    session = NS(session_id="s1", profile=None, messages=[])
+    agent, loops, started = _setup(tmp_path, monkeypatch, session)
+    loops.run_due_loops()
+    token = session.messages[0]["_active_turn_token"]
+    session.messages.append({"role": "user", "content": "also check logs", "display_kind": "steer", "timestamp": 1500})
+    for row in tail:
+        row = dict(row)
+        if row.pop("_steered_tok", False):
+            row["_active_turn_token"] = token
+        session.messages.append(row)
+    loops.run_due_loops()
+    s = _loop(agent, loops)
+    assert (s.status, s.paused_reason) == (status, reason) and len(started) == 1
+    assert not s.awaiting_response
+
+
 def test_loop_scheduler_kill_switch(monkeypatch):
     from api import loops
     spawned = []
@@ -290,10 +314,13 @@ def test_loop_js_wiring_is_session_scoped_and_chat_bound():
     body = _src("static/commands.js")
     body = body[body.index("async function _runAgentCommandTransport"):]
     body = body[:body.index("\n}\n")]
-    assert "/^\\/?loop(\\s|$)/i.test(command)?{command,session_id:" in body and ":{command})" in body
+    assert "/^\\/?loop(\\s|$)/i.test(transportCommand)?{command:transportCommand,session_id:" in body and ":{command:transportCommand})" in body
     busy = _src("static/messages.js")
-    busy = busy[busy.index("_pc.name==='loop'"):busy.index("const defaultMessageMode=")]
+    busy = busy[busy.index("const _pcMeta="):busy.index("const defaultMessageMode=")]
     busy = busy[:busy.index("return;")]
-    assert "executeAgentCommand(text,{name:'loop'})" in busy and "_loopMsgs=S.messages" in busy
+    assert "executeAgentCommand(text,_pcMeta||{name:'loop'})" in busy and "_loopMsgs=S.messages" in busy
+    # The advertised alias (/proactive) resolves through the registry before the busy check.
+    assert "getAgentCommandMetadata(_pc.name)" in busy and "(_pcMeta&&_pcMeta.name||_pc.name)==='loop'" in busy
+    assert '("/loop", "loop", "/proactive", "proactive")' in _src("api/routes.py")  # raw /api/commands/exec too
     assert "_loopMsgs.push({role:'assistant'" in busy and "S.messages.push({role:'assistant'" not in busy
     assert "S.messages===_loopMsgs&&(S.session&&S.session.session_id)===_loopSid" in busy
