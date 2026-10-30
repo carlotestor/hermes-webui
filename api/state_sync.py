@@ -399,24 +399,42 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
 # Desktop or the CLI can hold the state.db write lock, so a mirror waits at most ~0.5 s.
 PIN_MIRROR_TIMEOUT_S = 0.5
 
-# Compression lineage, as the Agent's ``set_session_archived`` walks it (ancestors + descendants).
-_LINEAGE_SQL = (
-    "WITH RECURSIVE anc(id) AS (SELECT ? UNION SELECT p.id FROM anc a"
-    " JOIN sessions c ON c.id = a.id JOIN sessions p ON p.id = c.parent_session_id"
-    " WHERE p.end_reason = 'compression'),"
-    " des(id) AS (SELECT ? UNION SELECT c.id FROM des d JOIN sessions p ON p.id = d.id"
-    " JOIN sessions c ON c.parent_session_id = p.id WHERE p.end_reason = 'compression')"
-)
-# field -> (UPDATE statement, params for (session_id, value))
+# Compression lineage, as the Agent's ``_LINEAGE_CTE_SQL`` walks it (ancestors + descendants).
+# Like the Agent, a branch/delegate/reset fork or a tool child is NOT a continuation: the
+# exclusions bind each marker to the parent id (continuations inherit ``model_config``).
+def _lineage_sql(columns: set) -> str:
+    skip = ""
+    if "model_config" in columns:
+        for marker in ("_branched_from", "_delegate_from", "_reset_from"):
+            skip += (
+                " AND COALESCE(json_extract(CASE WHEN json_valid(c.model_config)"
+                f" THEN c.model_config ELSE json_object() END, '$.{marker}'), '') != p.id"
+            )
+    if "source" in columns:
+        skip += " AND COALESCE(c.source, '') != 'tool'"
+    return (
+        "WITH RECURSIVE anc(id) AS (SELECT ? UNION SELECT p.id FROM anc a"
+        " JOIN sessions c ON c.id = a.id JOIN sessions p ON p.id = c.parent_session_id"
+        f" WHERE p.end_reason = 'compression'{skip}),"
+        " des(id) AS (SELECT ? UNION SELECT c.id FROM des d JOIN sessions p ON p.id = d.id"
+        f" JOIN sessions c ON c.parent_session_id = p.id WHERE p.end_reason = 'compression'{skip})"
+    )
+
+
+# field -> (columns -> UPDATE statement, params for (session_id, value))
 _MIRROR_UPDATES = {
-    "pinned": ("UPDATE sessions SET pinned = ? WHERE id = ?", lambda sid, v: (int(bool(v)), sid)),
+    "pinned": (
+        lambda cols: _lineage_sql(cols)
+        + " UPDATE sessions SET pinned = ? WHERE id IN (SELECT id FROM anc UNION SELECT id FROM des)",
+        lambda sid, v: (sid, sid, int(bool(v))),
+    ),
     "archived": (
-        _LINEAGE_SQL + " UPDATE sessions SET archived = ?, auto_archived = 0"
+        lambda cols: _lineage_sql(cols) + " UPDATE sessions SET archived = ?, auto_archived = 0"
         " WHERE id IN (SELECT id FROM anc UNION SELECT id FROM des)",
         lambda sid, v: (sid, sid, int(bool(v))),
     ),
     "title": (
-        "UPDATE sessions SET title = ?, title_source = 'user' WHERE id = ?",
+        lambda cols: "UPDATE sessions SET title = ?, title_source = 'user' WHERE id = ?",
         lambda sid, v: (str(v), sid),
     ),
 }
@@ -429,7 +447,7 @@ def sync_session_field(session_id: str, field: str, value, profile: Optional[str
     missing row or column, a title clash, or a lock held elsewhere only costs the other app
     this update.
     """
-    sql, params = _MIRROR_UPDATES[field]
+    build_sql, params = _MIRROR_UPDATES[field]
     try:
         db_path = _resolve_state_db_path(profile)
         if db_path is None:
@@ -440,6 +458,8 @@ def sync_session_field(session_id: str, field: str, value, profile: Optional[str
             timeout=PIN_MIRROR_TIMEOUT_S,
             isolation_level=None,
         )) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            sql = build_sql(columns)
             before = conn.total_changes  # cursor.rowcount is -1 for a WITH ... UPDATE
             conn.execute(sql, params(session_id, value))
             conn.commit()

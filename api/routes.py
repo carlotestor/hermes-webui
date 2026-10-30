@@ -420,33 +420,49 @@ def _session_counts_toward_pin_quota(session) -> bool:
 def _mirror_to_state_db(session, field: str, value) -> None:
     """Best-effort: the sidecar is authoritative; Desktop and the CLI read ``state.db``.
 
-    A landed write is recorded on the sidecar so the sidebar can tell a Desktop/CLI edit
-    (state.db moved off the recorded value) from a mirror that never landed.
+    Runs under the session lock: the current sidecar value is resolved first and a
+    superseded value is dropped BEFORE state.db is written, so an older mirror can never
+    reverse the latest action. A session deleted meanwhile is left alone (neither store is
+    written, nothing is re-saved). A landed write is recorded on the sidecar so the sidebar
+    can tell a Desktop/CLI edit (state.db moved off the recorded value) from a lost mirror.
     """
     from api.state_sync import sync_session_field
     sid = str(_session_field(session, "session_id", "") or "").strip()
-    if not sync_session_field(sid, field, value, profile=_session_field(session, "profile", None)):
-        return
-    # The acknowledgement is bookkeeping for a write that already landed in both stores:
-    # it must never fail the request, and must never save a stale captured object.
+    profile = _session_field(session, "profile", None)
     try:
-        with _get_session_agent_lock(sid):
+        def resolve():
             with LOCK:
-                current = SESSIONS.get(sid)
+                found = SESSIONS.get(sid)
+            if found is None:
+                found = Session.load(sid) if sid else None
+            return _ensure_full_session_before_mutation(sid, found) if found is not None else None
+
+        norm = bool if field in ("pinned", "archived") else (lambda v: v)
+
+        def superseded(found) -> bool:
+            held = _session_field(found, field)
+            return held is not None and norm(held) != norm(value)
+
+        with _get_session_agent_lock(sid):
+            current = resolve()
             if current is None:
-                current = Session.load(sid) if sid else None
-            if current is None:
-                current = session  # nothing persisted anywhere, so nothing newer can exist
-            else:
-                current = _ensure_full_session_before_mutation(sid, current)
-            norm = bool if field in ("pinned", "archived") else (lambda v: v)
-            held = _session_field(current, field)
-            if held is not None and norm(held) != norm(value):
-                return  # superseded by a newer operation: do not record this value
+                return  # deleted (or never persisted): do not resurrect it anywhere
+            if superseded(current):
+                return  # a newer operation owns the field: do not write or record this value
+            if not sync_session_field(sid, field, value, profile=profile):
+                return
+            # Bookkeeping for a write that already landed in both stores: it must never
+            # fail the request, and never saves a stale or deleted object.
+            current = resolve()  # the resident copy may have been evicted/replaced meanwhile
+            if current is None or superseded(current):
+                return
             current.state_db_mirror = {**(getattr(current, "state_db_mirror", None) or {}), field: value}
-            current.save(touch_updated_at=False)
+            try:
+                current.save(touch_updated_at=False)
+            except Exception:
+                logger.warning("state.db mirror acknowledgement not saved for %s.%s", sid, field, exc_info=True)
     except Exception:
-        logger.warning("state.db mirror acknowledgement not saved for %s.%s", sid, field, exc_info=True)
+        logger.warning("state.db mirror skipped for %s.%s", sid, field, exc_info=True)
 
 
 def _adopt_state_db_flag(sidecar: bool, mirrored, db: bool) -> bool:

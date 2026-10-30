@@ -98,7 +98,7 @@ def _pin_endpoint(monkeypatch, sessions, *, limit=10):
     monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda _sid, s: s)
     monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda _sid: False)
     monkeypatch.setattr(routes, "all_sessions", lambda *a, **kw: [])
-    monkeypatch.setattr(routes, "SESSIONS", {})
+    monkeypatch.setattr(routes, "SESSIONS", sessions)  # resident, like a live session
     monkeypatch.setattr(routes, "list_profiles_api", lambda *a, **kw: [{"name": "default", "is_default": True}])
     monkeypatch.setattr(routes, "_root_profile_names_snapshot", lambda: {"default"})
     monkeypatch.setattr(routes, "load_settings", lambda: {"pinned_sessions_limit": limit})
@@ -425,6 +425,7 @@ def test_archive_mirrors_across_the_compression_lineage_and_title_mirrors_as_use
         conn.commit()
     monkeypatch.setattr(routes, "_get_session_agent_lock", lambda _sid: threading.RLock())
     tip = _PinSession("tip")
+    monkeypatch.setattr(routes, "SESSIONS", {"tip": tip})
 
     routes._mirror_to_state_db(tip, "archived", True)
     routes._mirror_to_state_db(tip, "title", "Manual name")
@@ -531,3 +532,98 @@ def test_mirror_ack_save_failure_still_returns_200_with_both_stores_pinned(tmp_p
     assert json.loads((sdir / "s1.json").read_text())["pinned"] is True
     db = tmp_path / "default" / "state.db"
     assert _db_snapshot(db)[1] == {"s1": True}
+
+
+# ── review 5670121894: delete, lineage boundaries, stale mirrors ────────────
+
+def _lineage_db(path):
+    """root(compressed) -> tip (continuation), fork (_branched_from), tool child."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(str(path))) as conn:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, pinned INTEGER NOT NULL DEFAULT 0,"
+            " archived INTEGER NOT NULL DEFAULT 0, auto_archived INTEGER NOT NULL DEFAULT 0,"
+            " title TEXT, title_source TEXT, parent_session_id TEXT, end_reason TEXT,"
+            " model_config TEXT, source TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO sessions (id, parent_session_id, end_reason, model_config, source) VALUES (?,?,?,?,?)",
+            [
+                ("root", None, "compression", None, "webui"),
+                ("tip", "root", None, None, "webui"),
+                ("fork", "root", None, '{"_branched_from": "root"}', "webui"),
+                ("tool", "root", None, None, "tool"),
+            ],
+        )
+        conn.commit()
+
+
+def _column(path, column):
+    with closing(sqlite3.connect(str(path))) as conn:
+        return dict(conn.execute(f"SELECT id, {column} FROM sessions"))
+
+
+@pytest.mark.parametrize("field,column", [("archived", "archived"), ("pinned", "pinned")])
+def test_lineage_mirror_follows_compression_but_not_forks_or_tool_children(tmp_path, monkeypatch, field, column):
+    from api.state_sync import sync_session_field
+
+    homes = _homes(tmp_path, monkeypatch)
+    db = homes["default"] / "state.db"
+    _lineage_db(db)
+
+    assert sync_session_field("root", field, True)  # root-issued
+    assert _column(db, column) == {"root": 1, "tip": 1, "fork": 0, "tool": 0}
+    assert sync_session_field("root", field, False)
+    assert sync_session_field("fork", field, True)  # fork-issued never reaches its parent
+    assert _column(db, column) == {"root": 0, "tip": 0, "fork": 1, "tool": 0}
+
+
+def test_pin_and_unpin_of_the_tip_reach_the_whole_compression_lineage(tmp_path, monkeypatch):
+    from api.state_sync import sync_session_field
+
+    homes = _homes(tmp_path, monkeypatch)
+    db = homes["default"] / "state.db"
+    _lineage_db(db)
+
+    assert sync_session_field("tip", "pinned", True)
+    assert _column(db, "pinned") == {"root": 1, "tip": 1, "fork": 0, "tool": 0}
+    assert sync_session_field("tip", "pinned", False)
+    assert _column(db, "pinned") == {"root": 0, "tip": 0, "fork": 0, "tool": 0}
+
+
+def test_completed_delete_is_not_undone_by_the_mirror_acknowledgement(tmp_path, monkeypatch):
+    import api.models as models
+    import api.state_sync as state_sync
+
+    live, cache, sdir, post, _ = _real_session_pin_endpoint(tmp_path, monkeypatch)
+    real_sync = state_sync.sync_session_field
+
+    def sync_then_delete(*args, **kwargs):
+        landed = real_sync(*args, **kwargs)
+        cache.pop("s1", None)  # the real delete endpoint finished: cache entry and sidecar gone
+        (sdir / "s1.json").unlink()
+        return landed
+
+    monkeypatch.setattr(state_sync, "sync_session_field", sync_then_delete)
+    assert post("s1", True)[0] == 200
+    assert not (sdir / "s1.json").exists()
+    assert "s1" not in cache
+
+
+@pytest.mark.parametrize("sidecar_pinned,stale_value", [(False, True), (True, False)], ids=["pin-then-unpin", "unpin-then-pin"])
+def test_superseded_mirror_never_reaches_state_db(tmp_path, monkeypatch, sidecar_pinned, stale_value):
+    from api import routes
+
+    homes = _homes(tmp_path, monkeypatch)
+    db = homes["default"] / "state.db"
+    _make_state_db(db, rows=(("s1", int(sidecar_pinned)),))  # the newer action already mirrored
+    session = _PinSession("s1")
+    session.pinned = sidecar_pinned
+    monkeypatch.setattr(routes, "SESSIONS", {"s1": session})
+    monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", lambda _sid, s: s)
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda _sid: threading.RLock())
+
+    routes._mirror_to_state_db(session, "pinned", stale_value)  # the older action's mirror arrives late
+
+    assert _db_snapshot(db)[1] == {"s1": sidecar_pinned}
+    assert session.state_db_mirror == {}
