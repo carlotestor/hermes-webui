@@ -82,6 +82,13 @@ from api.run_journal import RunJournalWriter
 from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
+from api.memory_profile_scope import (
+    agent_has_memory,
+    call_as_session_owner,
+    construct_profile_scoped_agent,
+    session_profile_home_or_empty,
+    turn_memory_reason,
+)
 from api.models import (
     StateDBSessionMessagesSnapshot,
     _cancelled_journal_turn_owner,
@@ -3737,11 +3744,13 @@ def _resolve_streaming_hermes_home_override():
     global _streaming_hermes_home_override_available
     import sys as _sys
 
-    if _streaming_hermes_home_override_available is False:
-        return None
-
+    # #8517 all-r1: a cached negative answer is never trusted. A stale False (an
+    # early failed import, a module swapped later) left the turn-level override
+    # off for the life of the process while construction was still scoped, so
+    # run_conversation, its memory hooks and built-in MEMORY.md writes followed
+    # the shared env mirror (another profile's home). Once loaded this is a dict lookup.
     mod = _sys.modules.get('hermes_constants')
-    if mod is None and _streaming_hermes_home_override_available is None:
+    if mod is None:
         try:
             import hermes_constants  # noqa: F401
             mod = _sys.modules.get('hermes_constants')
@@ -9027,6 +9036,74 @@ def _is_active_turn_checkpoint_row(row, active_turn_identity, msg_text):
     )
 
 
+def _stable_message_ownership_id(message) -> tuple[str | None, bool]:
+    """Canonical stable id restricted to the ownership-granting shape.
+
+    #6310 (nesquena-hermes 2026-08-03): only a valid NON-NEGATIVE INTEGER
+    message id may prove independent ownership in the context dedupe. The
+    broadly shared ``_stable_message_identity_details`` canonicaliser accepts
+    any non-empty int/str/float — ``-7``, ``3.5`` and ``abc`` all canonicalise
+    — which is right for alias reconciliation but too permissive as an
+    ownership signal. A malformed, negative or non-integer id must fail safely
+    to the legacy content-identity collapse instead of splitting a turn.
+    """
+    stable_id, canonical_valid = _stable_message_identity_details(message)
+    if not canonical_valid or stable_id is None:
+        return None, False
+    if not stable_id.isdigit():
+        return None, False
+    return stable_id, True
+
+
+def _independently_owned_user_pair(prior_row, candidate_row) -> bool:
+    """Return True when two same-text user rows are independently owned turns.
+
+    #6310 (nesquena-hermes 2026-08-03): the dedup-local handling prefers a
+    valid non-negative integer message id when one is available. The user
+    exact-index inside ``_deduplicate_context_messages`` keys on
+    content+timestamp+source+attachments and knows nothing about durable ids,
+    so two committed turns that repeat text verbatim inside one timestamp
+    bucket collapse there before the stable-id ownership path can tell them
+    apart. When BOTH rows carry valid DISTINCT durable ids the pair is
+    independently owned and the exact index must defer to that path. Every
+    other shape — an id-less row, a matching id, or an invalid/boolean/
+    negative/non-integer id — keeps the legacy collapse unchanged.
+    """
+    prior_id, prior_valid = _stable_message_ownership_id(prior_row)
+    candidate_id, candidate_valid = _stable_message_ownership_id(candidate_row)
+    return bool(
+        prior_valid
+        and candidate_valid
+        and prior_id is not None
+        and candidate_id is not None
+        and prior_id != candidate_id
+    )
+
+
+def _register_seen_stable_id(key, msg, seen_stable_by_key) -> None:
+    """Append ``msg``'s durable stable id to the per-key kept-id registry.
+
+    #6310 bookkeeping: a row admitted through an active-turn path must
+    register its id, or a later replay of that same record (its timestamp
+    shifted across a load, so the exact index no longer matches) reaches the
+    stable-id ownership path with a registry that never saw the id and
+    survives as a duplicate the model would be sent twice. Append-only on
+    purpose: a superseded id stays in the registry so a replay of the replaced
+    record still collapses against it.
+    """
+    if key is None:
+        return
+    stable_id, stable_valid = _stable_message_ownership_id(msg)
+    if not (stable_valid and stable_id is not None):
+        return
+    kept = seen_stable_by_key.get(key)
+    if not isinstance(kept, list):
+        kept = []
+        seen_stable_by_key[key] = kept
+    if stable_id not in kept:
+        kept.append(stable_id)
+
+
 def _deduplicate_context_messages(messages, protected_rows=None):
     """Remove duplicate messages from context by identity, keeping first occurrence.
 
@@ -9079,6 +9156,16 @@ def _deduplicate_context_messages(messages, protected_rows=None):
         # Keep the display identity unchanged so ordinary transcript dedup still
         # collapses the same visible row.
         key = _message_replay_key(msg)
+        # #6310 bookkeeping (PR #8519 round 1): the exact-key index may only
+        # ever name a row that was actually RETAINED, and it is published
+        # after retention is decided. The historical code published the
+        # prospective append slot (``len(deduped)``) before the stable-id
+        # branch could drop the row, so a discarded replay left the index
+        # pointing past the list and the next same-key lookup dereferenced a
+        # slot that was never filled. ``retained_exact_key`` carries the key
+        # to the publish site at the bottom of the loop; a dropped row simply
+        # never publishes, and the previously retained owner stays indexed.
+        retained_exact_key = None
         if isinstance(msg, dict) and msg.get('role') == 'user' and key is not None:
             user_exact_key = (
                 key,
@@ -9087,18 +9174,32 @@ def _deduplicate_context_messages(messages, protected_rows=None):
                 msg.get('_source') or 'webui',
                 json.dumps(msg.get('attachments') or [], sort_keys=True, ensure_ascii=False),
             )
+            retained_exact_key = user_exact_key
             prior_exact_idx = user_exact_index.get(user_exact_key)
             if msg.get('_active_turn_token'):
                 if prior_exact_idx is not None:
                     deduped[prior_exact_idx] = msg
+                    _register_seen_stable_id(key, msg, seen_stable_by_key)
                     continue
                 if key in seen:
                     deduped.append(msg)
+                    _register_seen_stable_id(key, msg, seen_stable_by_key)
                     user_exact_index[user_exact_key] = len(deduped) - 1
                     continue
             elif prior_exact_idx is not None:
-                continue
-            user_exact_index[user_exact_key] = len(deduped)
+                # #6310 (nesquena-hermes 2026-08-03): this exact index keys on
+                # content+timestamp+source+attachments and knows nothing about
+                # durable ids, so two independently settled turns repeating
+                # text verbatim inside one timestamp bucket would collapse here
+                # before the stable-id ownership path below could tell them
+                # apart. When BOTH rows carry valid DISTINCT stable ids the id
+                # is the preferred ownership signal — defer to that path. An
+                # id-less, id-matching or invalid-id row keeps the legacy
+                # collapse exactly as before. Every stored index names a
+                # retained row (see the publish site below), so this lookup is
+                # always in range.
+                if not _independently_owned_user_pair(deduped[prior_exact_idx], msg):
+                    continue
         if key is not None and key in seen:
             # #7237 round 7 finding 2 (nesquena-hermes 2026-10-14): a content
             # collision is a replay of an already-kept row UNLESS this row and
@@ -9110,8 +9211,10 @@ def _deduplicate_context_messages(messages, protected_rows=None):
             # occurrence from the outbound history and from the cold
             # ``context_messages``. Distinct durable ids prove the rows are
             # different turns; a missing/matching id stays conservative and
-            # collapses exactly like before.
-            stable_id, stable_valid = _stable_message_identity_details(msg)
+            # collapses exactly like before. #6310 (2026-08-03): the ownership
+            # signal is a valid NON-NEGATIVE INTEGER id — a malformed,
+            # negative or non-integer id fails safely to this legacy collapse.
+            stable_id, stable_valid = _stable_message_ownership_id(msg)
             kept_ids = seen_stable_by_key.get(key) or [None]
             if not (
                 stable_valid
@@ -9125,11 +9228,16 @@ def _deduplicate_context_messages(messages, protected_rows=None):
             kept_ids.append(stable_id)
         if key is not None and key not in seen:
             seen.add(key)
-            stable_id, stable_valid = _stable_message_identity_details(msg)
+            stable_id, stable_valid = _stable_message_ownership_id(msg)
             seen_stable_by_key[key] = [
                 stable_id if (stable_valid and stable_id is not None) else None
             ]
         deduped.append(msg)
+        # #6310 bookkeeping: publish the exact-key index only now that the row
+        # is retained, and name the slot it actually occupies. A dropped row
+        # never reaches this site, so no index can outlive its row.
+        if retained_exact_key is not None:
+            user_exact_index[retained_exact_key] = len(deduped) - 1
     return deduped
 
 
@@ -9487,6 +9595,16 @@ def _hard_prune_post_compression_tool_results(messages, *, compressor=None):
         )
         msg[_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG] = True
     return pruned, len(replacements)
+
+
+def _should_prune_tool_results_after_compression(agent) -> bool:
+    """True when the active context engine is the native ContextCompressor (or absent)."""
+    _compressor = getattr(agent, 'context_compressor', None)
+    try:
+        from agent.context_compressor import ContextCompressor as _NativeCC
+    except ImportError:
+        return True
+    return (_compressor is None) or isinstance(_compressor, _NativeCC)
 
 
 def _prune_context_tool_results_after_compression(agent, context_messages):
@@ -13448,6 +13566,14 @@ def _close_evicted_agent_at_session_boundary(session_id: str, agent) -> bool:
         return True
 
     should_close_evicted_agent = True
+    # #8517: the owner's profile, captured before a clean commit discards the
+    # lifecycle entry; the provider shutdown below must run as that profile too.
+    _owner_home = ''
+    try:
+        from api.session_lifecycle import recorded_owner_profile_home
+        _owner_home = recorded_owner_profile_home(session_id)
+    except Exception:
+        logger.debug("No recorded owner profile for evicted session %s", session_id, exc_info=True)
     try:
         _lifecycle_commit_session_memory(session_id, agent=agent, wait=True)
         if not _lifecycle_has_uncommitted_work(session_id):
@@ -13469,7 +13595,13 @@ def _close_evicted_agent_at_session_boundary(session_id: str, agent) -> bool:
         shutdown_memory_provider = getattr(agent, 'shutdown_memory_provider', None)
         if callable(shutdown_memory_provider):
             session_messages = vars(agent).get('_session_messages', [])
-            shutdown_memory_provider(session_messages)
+            call_as_session_owner(
+                agent,
+                lambda: shutdown_memory_provider(session_messages),
+                session_id=session_id,
+                owner_home=_owner_home,
+                what="memory provider shutdown",
+            )
     except Exception:
         logger.debug("Failed to shut down evicted agent memory provider for session %s", session_id, exc_info=True)
 
@@ -14191,6 +14323,9 @@ def _run_agent_streaming(
     _streaming_cron_profile_home_token = None
     _turn_pending_source = 'webui'
     _streaming_hermes_home_override_ctx = (None, None, False)
+    # #8517 all-r2 finding 2: memory runs only on a turn that verifiably holds its
+    # session's profile home; set right after the turn-level override below.
+    _turn_memory_reason = 'the turn-level profile home was not established'
     _streaming_skill_home_snapshot = None
     _restore_streaming_skill_home_modules = False
     _acquired_streaming_skill_home_patch_lock = False
@@ -14366,7 +14501,9 @@ def _run_agent_streaming(
             _profile_runtime_env = get_profile_runtime_env(_profile_home_path)
             _safe_profile_runtime_env = filter_runtime_env_for_gateway_parity(_profile_runtime_env)
         except ImportError:
-            _profile_home = os.environ.get('HERMES_HOME', '')
+            # #8517: never the shared HERMES_HOME env mirror (another profile's
+            # worker may hold it); '' turns memory off for the turn.
+            _profile_home = session_profile_home_or_empty(s)
             _profile_runtime_env = {}
             _safe_profile_runtime_env = {}
             patch_skill_home_modules = None
@@ -14429,6 +14566,17 @@ def _run_agent_streaming(
             _profile_home,
         )
         _streaming_hermes_home_override_ctx = _set_streaming_hermes_home_override(_profile_home)
+        # #8517 all-r2 finding 2: the override set here is held until the outermost
+        # finally, across construction AND run_conversation (memory hooks, built-in
+        # MEMORY.md writes). A construction-time scope alone does not cover the turn,
+        # and a cached agent runs no constructor at all, so the decision is made once
+        # for the whole turn: when the override is not set or not effective, every
+        # construction below builds without memory (not cached, unless the Agent has
+        # no override at all: construct_profile_scoped_agent) and a memory-enabled
+        # cached agent is not reused for this turn.
+        _turn_memory_reason = turn_memory_reason(
+            _profile_home, override_installed=bool(_streaming_hermes_home_override_ctx[2]),
+        )
         _set_thread_env(**_thread_env)
         # process_complete agent-wakeup wiring (ours-original, Option B): bind
         # this session's HERMES_SESSION_KEY to its WebUI session_id so the
@@ -15595,7 +15743,11 @@ def _run_agent_streaming(
             # injectionFrequency: "first-turn" actually suppresses after turn 1.
             _cache_new_agent = False
             if ephemeral:
-                agent = _AIAgent(**_agent_kwargs)
+                agent, _ = construct_profile_scoped_agent(
+                    _AIAgent, _agent_kwargs, profile_home=_profile_home,
+                    agent_params=_agent_params, session_id=session_id,
+                    fail_closed_reason=_turn_memory_reason,
+                )
                 logger.debug('[webui] Created ephemeral agent for session %s', session_id)
             else:
                 from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
@@ -15622,14 +15774,22 @@ def _run_agent_streaming(
 
                 agent = None
                 _identity_mismatch_entry = None
+                _bypassed_memory_agent = False
                 with SESSION_AGENT_CACHE_LOCK:
                     _cached = SESSION_AGENT_CACHE.get(session_id)
                     if _cached and _cached[1] == _agent_sig:
                         _cached_agent = _cached[0]
                         if _cached_agent_matches_session(_cached_agent, session_id):
-                            agent = _cached_agent
-                            SESSION_AGENT_CACHE.move_to_end(session_id)  # LRU: mark as recently used
-                            logger.debug('[webui] Reusing cached agent for session %s', session_id)
+                            if _turn_memory_reason and agent_has_memory(_cached_agent):
+                                # #8517 all-r2 finding 2: this turn cannot hold its
+                                # profile home, and a cached agent keeps its memory.
+                                # Leave it cached for the next scoped turn; this turn
+                                # gets a memoryless, uncached agent built below.
+                                _bypassed_memory_agent = True
+                            else:
+                                agent = _cached_agent
+                                SESSION_AGENT_CACHE.move_to_end(session_id)  # LRU: mark as recently used
+                                logger.debug('[webui] Reusing cached agent for session %s', session_id)
                         else:
                             _identity_mismatch_entry = SESSION_AGENT_CACHE.pop(session_id, None)
                             logger.warning(
@@ -15637,6 +15797,13 @@ def _run_agent_streaming(
                                 session_id,
                                 _cached_agent_session_identity(_cached_agent),
                             )
+
+                if _bypassed_memory_agent:
+                    logger.warning(
+                        '[webui] #8517: cached agent for session %s not reused this turn: %s '
+                        '(profile home %r). The turn runs without memory.',
+                        session_id, _turn_memory_reason, _profile_home,
+                    )
 
                 if _identity_mismatch_entry is not None:
                     try:
@@ -15705,8 +15872,12 @@ def _run_agent_streaming(
                     if hasattr(agent, '_interrupt_message'):
                         agent._interrupt_message = None
                 else:
-                    agent = _AIAgent(**_agent_kwargs)
-                    _cache_new_agent = True
+                    # #8517: memory bound to this session's profile, else not cached.
+                    agent, _cache_new_agent = construct_profile_scoped_agent(
+                        _AIAgent, _agent_kwargs, profile_home=_profile_home,
+                        agent_params=_agent_params, session_id=session_id,
+                        fail_closed_reason=_turn_memory_reason,
+                    )
 
             if not _register_agent_if_current(agent, _agent_sig if _cache_new_agent else None):
                 with _agent_lock:
@@ -16547,7 +16718,11 @@ def _run_agent_streaming(
                                 _agent_kwargs['acp_args'] = _runtime_bundle['acp_args']
                             if 'credential_pool' in _agent_params:
                                 _agent_kwargs['credential_pool'] = _runtime_bundle['credential_pool']
-                            agent = _AIAgent(**_agent_kwargs)
+                            agent, _heal_cacheable = construct_profile_scoped_agent(
+                                _AIAgent, _agent_kwargs, profile_home=_profile_home,
+                                agent_params=_agent_params, session_id=session_id,
+                                fail_closed_reason=_turn_memory_reason,
+                            )
                             _agent_sig = _compute_agent_cache_signature(
                                 resolved_model,
                                 resolved_api_key,
@@ -16565,6 +16740,8 @@ def _run_agent_streaming(
                                 profile_home=_profile_home,
                                 safe_profile_runtime_env=_safe_profile_runtime_env,
                             )
+                            if not _heal_cacheable:
+                                _agent_sig = None  # #8517: memory scope failed; never cache it
                             if not _register_agent_if_current(agent, _agent_sig):
                                 # Returned-error settlement already owns _agent_lock.
                                 _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
@@ -16867,10 +17044,19 @@ def _run_agent_streaming(
                         _compressed = True
                 # Notify the frontend that compression happened
                 if _compressed:
-                    s.context_messages = _prune_context_tool_results_after_compression(
-                        agent,
-                        s.context_messages,
-                    )
+                    # Only the native engine gets hard tool-result pruning;
+                    # external engines (e.g. lcm-x) own their budget/ref markers.
+                    if _should_prune_tool_results_after_compression(agent):
+                        s.context_messages = _prune_context_tool_results_after_compression(
+                            agent,
+                            s.context_messages,
+                        )
+                    else:
+                        logger.debug(
+                            "post-compression tool-result pruning skipped "
+                            "(active engine: %s)",
+                            type(getattr(agent, 'context_compressor', None)).__name__,
+                        )
                     s.post_compression_context_tokens_estimate = _estimate_post_compression_context_tokens(
                         agent,
                         s.context_messages,
@@ -17359,7 +17545,13 @@ def _run_agent_streaming(
                     # in-memory bookkeeping, not provider I/O, so keep it inside the
                     # per-session writeback lock to preserve completed-turn ordering.
                     try:
-                        from api.session_lifecycle import mark_turn_completed
+                        from api.session_lifecycle import mark_turn_completed, record_owner_profile_home
+                        try:
+                            _owner_profile_home = _profile_home
+                        except NameError:
+                            _owner_profile_home = ''
+                        # #8517: record the owner so boundary commits run as it.
+                        record_owner_profile_home(s.session_id, _owner_profile_home)
                         mark_turn_completed(s.session_id, agent=agent)
                     except Exception:
                         logger.debug("Memory lifecycle mark failed for session %s", s.session_id, exc_info=True)
@@ -18030,7 +18222,11 @@ def _run_agent_streaming(
                         _heal_kwargs['acp_args'] = _runtime_bundle['acp_args']
                     if 'credential_pool' in _agent_params:
                         _heal_kwargs['credential_pool'] = _runtime_bundle['credential_pool']
-                    _heal_agent = _AIAgent(**_heal_kwargs)
+                    _heal_agent, _heal_cacheable = construct_profile_scoped_agent(
+                        _AIAgent, _heal_kwargs, profile_home=_profile_home,
+                        agent_params=_agent_params, session_id=session_id,
+                        fail_closed_reason=_turn_memory_reason,
+                    )
                     # Delta callbacks close over `agent`; the replacement, not
                     # the failed original, owns any successful retry output.
                     agent = _heal_agent
@@ -18051,6 +18247,8 @@ def _run_agent_streaming(
                         profile_home=_profile_home,
                         safe_profile_runtime_env=_safe_profile_runtime_env,
                     )
+                    if not _heal_cacheable:
+                        _agent_sig = None  # #8517: memory scope failed; never cache it
                     if not _register_agent_if_current(_heal_agent, _agent_sig):
                         with _agent_lock:
                             _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
