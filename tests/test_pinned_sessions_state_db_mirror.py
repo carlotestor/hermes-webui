@@ -592,7 +592,6 @@ def test_pin_and_unpin_of_the_tip_reach_the_whole_compression_lineage(tmp_path, 
 
 
 def test_completed_delete_is_not_undone_by_the_mirror_acknowledgement(tmp_path, monkeypatch):
-    import api.models as models
     import api.state_sync as state_sync
 
     live, cache, sdir, post, _ = _real_session_pin_endpoint(tmp_path, monkeypatch)
