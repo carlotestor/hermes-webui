@@ -4,6 +4,7 @@ Extracted from server.py (Sprint 11) so server.py is a thin shell.
 """
 
 import html as _html
+import contextlib
 import copy
 import hashlib
 import inspect
@@ -40,6 +41,12 @@ from api.agent_runtime import (
     agent_runtime_stale_payload,
     ensure_agent_runtime_current,
     require_ai_agent_class,
+)
+from api.memory_profile_scope import (
+    construct_memoryless_helper_agent,
+    construct_profile_scoped_agent,
+    profile_home_turn_scope,
+    session_profile_home_or_empty,
 )
 from api.agent_sessions import (
     MESSAGING_SOURCES,
@@ -481,6 +488,7 @@ from api.profiles import (  # noqa: F401, E402  (re-export)
     _is_root_profile,
     _root_profile_names_snapshot,
     _SKILLS_STATS_CACHE,
+    invalidate_profile_skills_stats,
     get_active_profile_name,
     get_active_profile_name as _get_active_profile_name,
     get_active_hermes_home,
@@ -2499,6 +2507,71 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _prune_orphaned_desktop_sidecar_sessions(
+    rows,
+    *,
+    known_agent_ids=None,
+    diag_stage=None,
+):
+    """Prune Desktop sidecars only when their owning profile proves absence.
+
+    This pass is independent of ``show_cli_sessions``: the preference controls
+    CLI visibility, not whether stale Desktop sidecars are reconciled.  A
+    missing or unreadable profile DB is unknown and therefore retains the row.
+    """
+    if not rows:
+        return list(rows) if rows is not None else []
+    _diag = diag_stage if callable(diag_stage) else (lambda *_a, **_k: None)
+    known_ids = {
+        str(sid).strip() for sid in (known_agent_ids or set()) if str(sid or "").strip()
+    }
+    probe_rows = [
+        row for row in rows
+        if isinstance(row, dict)
+        and str(row.get("session_id") or "").strip()
+        and str(row.get("session_id") or "").strip() not in known_ids
+        and _is_desktop_sidecar_row(row)
+        and not _session_source_is_webui(row)
+    ]
+    if not probe_rows:
+        return list(rows)
+
+    rows_by_profile: dict[object, list[dict]] = defaultdict(list)
+    for row in probe_rows:
+        rows_by_profile[row.get("profile")].append(row)
+    missing_rows: set[tuple[object, str]] = set()
+    for profile_key, profile_rows in rows_by_profile.items():
+        probe_ids = [
+            str(row.get("session_id") or "").strip()
+            for row in profile_rows
+        ]
+        existing = agent_session_rows_existing_strict(
+            probe_ids,
+            profile=profile_key if isinstance(profile_key, str) and profile_key else None,
+        )
+        missing_rows.update(
+            (profile_key, sid) for sid in probe_ids if sid not in existing
+        )
+
+    kept = []
+    for row in rows:
+        sid = str(row.get("session_id") or "").strip() if isinstance(row, dict) else ""
+        profile_key = row.get("profile") if isinstance(row, dict) else None
+        if (profile_key, sid) not in missing_rows:
+            kept.append(row)
+            continue
+        try:
+            prune_session_from_index(sid)
+        except Exception:
+            logger.debug(
+                "Failed to prune orphaned Desktop sidecar %s",
+                sid,
+                exc_info=True,
+            )
+        _diag("prune_orphaned_desktop_sidecar")
+    return kept
+
+
 def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
     """#4985 second-pass orphan prune for native-WebUI rows whose ``state.db.messages`` is empty.
 
@@ -2799,6 +2872,11 @@ def _build_session_list_cache_payload(
             )
         diag_stage("merge_cli_sessions")
         cli_by_id = {s["session_id"]: s for s in cli}
+        webui_sessions = _prune_orphaned_desktop_sidecar_sessions(
+            webui_sessions,
+            known_agent_ids=cli_by_id,
+            diag_stage=diag_stage,
+        )
         # #3238/#4591: reconcile orphaned imported sidecars. When a CLI or
         # API-server session is clicked in WebUI it gets a WebUI-owned sidecar
         # that all_sessions() returns independently of state.db. If the user
@@ -2828,7 +2906,10 @@ def _build_session_list_cache_payload(
             _sid = s.get("session_id")
             if (
                 _sid
-                and (is_cli_session_row(s) or _is_api_server_sidecar_row(s))
+                and (
+                    is_cli_session_row(s)
+                    or _is_api_server_sidecar_row(s)
+                )
                 and not _session_source_is_webui(s)
                 and _sid not in cli_by_id
             ):
@@ -2931,6 +3012,10 @@ def _build_session_list_cache_payload(
             source_filter=source_filter,
         )
     else:
+        webui_sessions = _prune_orphaned_desktop_sidecar_sessions(
+            webui_sessions,
+            diag_stage=diag_stage,
+        )
         diag_stage("filter_webui_sessions")
         webui_sessions = [s for s in webui_sessions if not _is_cli_session_for_settings(s)]
         # #4985 second pass — see _prune_orphaned_webui_zero_message_sessions
@@ -7281,11 +7366,12 @@ def _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip: bool = Tru
         and then the raw peer. The local-origin gate, trusted-header SSO and other
         consumers that predate #7863 keep exactly the resolution they had.
       * ``False`` never reads ``X-Real-IP`` at all and goes straight to the raw
-        peer. This is the request-log path only: the structured log is a security
-        boundary (its ``forwarded_for`` feed fail2ban), and ``X-Real-IP`` is a
-        second client-writable header (nginx relays client-supplied values through
-        by default instead of overwriting it), so honoring it there would
-        reintroduce #7863 through a different header.
+        peer. The request log and the login rate limiter use it: the structured
+        log is a security boundary (its ``forwarded_for`` feed fail2ban), and
+        ``X-Real-IP`` is a second client-writable header (nginx relays
+        client-supplied values through by default instead of overwriting it), so
+        honoring it there would reintroduce #7863 through a different header, and
+        on the login limiter would let a client pick its bucket (#8591).
 
     The XFF walk is identical either way — the right-most hop was appended by the
     trusted peer itself, so it carries the same guarantee with or without the
@@ -7344,17 +7430,24 @@ def _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip: bool = Tru
         real_ip = handler.headers.get("X-Real-IP", "").strip()
         if real_ip:
             return real_ip
-    # Without a forwarded chain the trusted proxy is speaking for itself. On the
-    # request-log path (consult_real_ip=False) this is also the fail-closed
-    # fallback: no forwarded chain, no forwarded identity.
+    # Without a forwarded chain the trusted proxy is speaking for itself. With
+    # consult_real_ip=False (the request log, the login limiter) this is also the
+    # fail-closed fallback: no forwarded chain, no forwarded identity.
     return _request_client_ip(handler)
 
 
 def _login_client_ip(handler) -> str:
     """Client IP that the login rate limiter keys on.
 
-    Behind a reverse proxy the raw socket peer is the proxy, so every user
-    would share one bucket. Consult the forwarded chain only when
+    By default this is the raw socket peer, exactly as v0.52.544 keyed it
+    (#8595). Per-client buckets behind a reverse proxy are an explicit opt-in,
+    HERMES_WEBUI_LOGIN_RATE_LIMIT_PER_CLIENT=1, because they rest on a contract
+    the code cannot check: the listed proxy must append to or overwrite
+    X-Forwarded-For. A proxy that relays the client's own header unchanged (a
+    bare nginx proxy_pass) would let every client choose its bucket, and a
+    relayed hop looks exactly like an appended one.
+
+    With the opt-in, the forwarded chain is consulted only when
     HERMES_WEBUI_TRUST_FORWARDED_FOR=1 and the raw peer is listed in
     HERMES_WEBUI_TRUSTED_PROXY_CIDRS. Implicit loopback trust is not enough:
     a direct loopback or SSH-tunnel client could otherwise send a new
@@ -7369,6 +7462,10 @@ def _login_client_ip(handler) -> str:
     of both headers is checked, as the resolver reads them all: fall back to the
     raw peer when they differ, a field is empty, X-Real-IP is repeated with
     different values, or a value is not an IP address.
+
+    A request with no X-Forwarded-For keys on the raw peer even when X-Real-IP
+    is a valid address: X-Real-IP alone may be the client's own value relayed
+    by the proxy, so it never selects a bucket by itself.
     """
     import ipaddress
 
@@ -7379,14 +7476,26 @@ def _login_client_ip(handler) -> str:
             single = handler.headers.get(name)
             return [single] if single is not None else []
 
-    if _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_FOR"):
+    if _truthy_env("HERMES_WEBUI_LOGIN_RATE_LIMIT_PER_CLIENT") and _truthy_env(
+        "HERMES_WEBUI_TRUST_FORWARDED_FOR"
+    ):
         try:
             peer = ipaddress.ip_address(_request_client_ip(handler))
-            if _ip_in_networks(peer, _trusted_proxy_networks(include_loopback=False)):
-                client = ipaddress.ip_address(_forwarded_client_ip_from_trusted_proxy(handler))
-                xff = _fields("X-Forwarded-For")
+            xff = _fields("X-Forwarded-For")
+            # Only a non-empty X-Forwarded-For chain can name the client: its
+            # right-most hop is appended by the trusted proxy itself. X-Real-IP
+            # alone is client-writable (nginx relays a client-supplied value
+            # unless the config overwrites it), so with no XFF the resolver's
+            # X-Real-IP fallback would let every attempt pick a fresh bucket.
+            # Resolve with consult_real_ip=False, as the request log does.
+            if xff and all(v.strip() for v in xff) and _ip_in_networks(
+                peer, _trusted_proxy_networks(include_loopback=False)
+            ):
+                client = ipaddress.ip_address(
+                    _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip=False)
+                )
                 real_ips = {ipaddress.ip_address(v.strip()) for v in _fields("X-Real-IP")}
-                if all(v.strip() for v in xff) and real_ips <= {client}:
+                if real_ips <= {client}:
                     return str(client)
         except ValueError:
             pass
@@ -12066,6 +12175,30 @@ def _is_api_server_sidecar_row(session: dict) -> bool:
     return bool(markers & {"api", "api_server"})
 
 
+def _is_desktop_sidecar_row(session: dict) -> bool:
+    """Return True for Desktop-origin sidecars that need orphan pruning.
+
+    A conversation created in Hermes Desktop gets a WebUI-owned sidecar the
+    first time it is opened in the WebUI. If the user later deletes it from the
+    Desktop app, the ``state.db`` row disappears but the sidecar stays, so the
+    row lingers in the sidebar forever.
+
+    Such a row matches neither ``is_cli_session_row()`` (Desktop is not CLI and
+    its source marker is not ``cli``/``tui``) nor ``_is_api_server_sidecar_row()``
+    (Desktop is not API-server), so the #3238 existence probe never inspected it
+    and no prune path could reach it. Existence is still decided by
+    ``agent_session_rows_existing()``, which fails closed to "all present", so a
+    transient ``state.db`` read error never prunes a live Desktop session.
+    """
+    if not isinstance(session, dict) or _session_source_is_webui(session):
+        return False
+    markers = {
+        _normalized_source_marker(session.get(key))
+        for key in ("source", "source_tag", "raw_source", "session_source", "source_label")
+    }
+    return "desktop" in markers
+
+
 def _session_lineage_ids(session: dict) -> set[str]:
     """Return known ids that identify one logical sidebar lineage."""
     if not isinstance(session, dict):
@@ -12481,6 +12614,7 @@ from api.models import (
     _hide_from_default_sidebar,
     prune_session_from_index,
     agent_session_rows_existing,
+    agent_session_rows_existing_strict,
     agent_session_zero_message_sids,
     _load_webui_zero_message_orphan_tombstone,
     _record_webui_zero_message_orphan_tombstone,
@@ -12820,11 +12954,14 @@ from api.run_journal import (
     bound_run_journal_snapshot_args,
     find_run_file,
     find_run_summary,
+    journal_replay_prompt_visible,
     journal_replay_visible,
     read_run_events,
     read_session_run_events,
     session_journal_fingerprint,
+    settled_prompt_events,
     stale_interrupted_event,
+    terminal_settled_prompt_events,
     SSE_RELAY_CLOSE_EVENTS,
 )
 from api.todo_state import attach_todo_state
@@ -16837,6 +16974,22 @@ def handle_get(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
 
+    if parsed.path == "/api/session/delegations":
+        # #8019: advisory read-only live-delegation snapshot for one session.
+        # Counts only; an unreadable ledger is reported as unknown, never zero,
+        # so a pre-switch guard cannot mistake "could not check" for "safe".
+        sid = parse_qs(parsed.query).get("session_id", [""])[0]
+        if not sid:
+            return bad(handler, "Missing session_id")
+        from api.delegation_status import session_delegation_status
+        try:
+            profile = get_session_profile_readonly(sid)
+        except Exception:
+            # Unknown ownership falls back to the active profile's ledger; the
+            # result stays advisory either way.
+            profile = None
+        return j(handler, session_delegation_status(sid, profile=profile))
+
     if parsed.path == "/api/session/yolo":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]
         if not sid:
@@ -17803,16 +17956,20 @@ def _llm_update_summary(system_prompt: str, user_prompt: str, active_profile: st
 
         AIAgent = require_ai_agent_class()
 
-        agent = AIAgent(
-            model=_main_model,
-            provider=_main_provider,
-            base_url=_main_base_url,
-            api_key=_main_api_key,
-            platform="webui",
-            quiet_mode=True,
-            enabled_toolsets=[],
-            session_id=f"updates-summary-{uuid.uuid4().hex[:8]}",
-            **_agent_bundle_kwargs(AIAgent, _bundle),
+        agent = construct_memoryless_helper_agent(
+            AIAgent,
+            dict(
+                model=_main_model,
+                provider=_main_provider,
+                base_url=_main_base_url,
+                api_key=_main_api_key,
+                platform="webui",
+                quiet_mode=True,
+                enabled_toolsets=[],
+                session_id=f"updates-summary-{uuid.uuid4().hex[:8]}",
+                **_agent_bundle_kwargs(AIAgent, _bundle),
+            ),
+            purpose="update summary",
         )
         result = agent.run_conversation(
             user_message=user_prompt,
@@ -22277,8 +22434,30 @@ def _replay_run_journal(
         after_seq=after_seq,
         max_seq=max_seq,
     )
-    for entry in journal.get("events") or []:
+    events = journal.get("events") or []
+    # Settled prompts (clarify already answered / timed out / cancelled — see
+    # settled_prompt_events; approvals + any prompt in an ended run — see
+    # terminal_settled_prompt_events) must not replay: a reconnecting tab
+    # would re-show the dead card, then the terminal event in the same batch
+    # force-hides it (flash-of-stale-card). Prescan is bounded by the same
+    # event list the emit loop walks; any prescan failure fails OPEN (prompt
+    # still replays).
+    try:
+        settled_prompts = settled_prompt_events(events)
+        terminal_settled = terminal_settled_prompt_events(events)
+    except Exception:
+        logger.debug("Prompt-settle prescan failed; replaying prompts unfiltered", exc_info=True)
+        settled_prompts = None
+        terminal_settled = None
+    for entry in events:
         if not journal_replay_visible(entry):
+            continue
+        if (
+            settled_prompts is not None
+            and not journal_replay_prompt_visible(
+                entry, settled_prompts, terminal_settled=terminal_settled
+            )
+        ):
             continue
         _sse_with_id(
             handler,
@@ -22812,8 +22991,26 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
         return queue_, stream, snapshot, stream_id
 
     def emit_replay(events, stream_id, cutoff_seq):
+        # Same settled-prompt guard as _replay_run_journal: a clarify whose
+        # tool call already completed — and any prompt (incl. approval) in an
+        # ended run — must not re-surface as a live card on this session
+        # stream. Fail open when the prescan misbehaves.
+        try:
+            settled_prompts = settled_prompt_events(events)
+            terminal_settled = terminal_settled_prompt_events(events)
+        except Exception:
+            logger.debug("Prompt-settle prescan failed; replaying prompts unfiltered", exc_info=True)
+            settled_prompts = None
+            terminal_settled = None
         for entry in events:
             if not journal_replay_visible(entry):
+                continue
+            if (
+                settled_prompts is not None
+                and not journal_replay_prompt_visible(
+                    entry, settled_prompts, terminal_settled=terminal_settled
+                )
+            ):
                 continue
             event_id = str(entry.get("event_id") or "")
             event_seq = _run_journal_same_run_seq(event_id, stream_id)
@@ -25074,6 +25271,13 @@ def _handle_approval_inject(handler, parsed):
     sid = qs.get("session_id", [""])[0]
     key = qs.get("pattern_key", ["test_pattern"])[0]
     cmd = qs.get("command", ["rm -rf /tmp/test"])[0]
+    desc = qs.get("description", ["test pattern"])[0]
+    # The core stamps exactly one stable `request_id` per approval entry
+    # (`_ApprovalEntry.__init__`), and the frontend's logical identity requires a
+    # non-empty stable id. Mirror that contract here so seeded approvals carry
+    # the same identity as production ones; tests that need to model two
+    # identical-content approvals pass an explicit distinct `request_id`.
+    request_id = (qs.get("request_id", [""])[0] or "").strip() or uuid.uuid4().hex
     if sid:
         submit_pending(
             sid,
@@ -25081,10 +25285,11 @@ def _handle_approval_inject(handler, parsed):
                 "command": cmd,
                 "pattern_key": key,
                 "pattern_keys": [key],
-                "description": "test pattern",
+                "description": desc,
+                "request_id": request_id,
             },
         )
-        return j(handler, {"ok": True, "session_id": sid})
+        return j(handler, {"ok": True, "session_id": sid, "request_id": request_id})
     return j(handler, {"error": "session_id required"}, status=400)
 
 
@@ -26696,6 +26901,22 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
     if attachments:
         user_msg["attachments"] = list(attachments)
     s.messages.append(user_msg)
+    # #7882 cap follow-up: record the exact start timestamp of the row that
+    # materialises the CURRENT pending hidden turn. The sidebar overlay's
+    # capped-out branch cannot re-walk the transcript, so this is the only
+    # trusted evidence that the row it would discount is already excluded by the
+    # sidecar's own visible count. Bound to the turn, not to the text: a later
+    # same-text row (or a previous turn's row) carries a different timestamp and
+    # cannot vouch. Session.save re-validates it against the transcript and
+    # writes it into the metadata prefix.
+    if _checkpoint_source == "delegation_wakeup":
+        _materialized_at = user_msg.get("timestamp")
+        s._pending_hidden_wakeup_at = (
+            float(_materialized_at)
+            if isinstance(_materialized_at, (int, float))
+            and not isinstance(_materialized_at, bool)
+            else None
+        )
     # The new user turn is now committed to messages (#3831): advance the
     # truncation watermark to the new message's timestamp so that
     # merge_session_messages_append_only() still filters out replaced
@@ -26840,6 +27061,7 @@ def _rearm_process_wakeup_after_launch_failure(
     wakeup_prompt,
     process_id: str = "",
     retry_attempt: int = 0,
+    consumed_claimed_by_dispatch: bool = False,
 ) -> None:
     """Re-arm the process-wakeup drain after a launch-failure abort (#7680).
 
@@ -26868,6 +27090,17 @@ def _rearm_process_wakeup_after_launch_failure(
     so by the time a failure inside that drain reaches here the registry is
     already empty and the coalesce guard cannot fire — without this marker a
     persistent launch failure spun a new timer every 2s forever.
+
+    ``consumed_claimed_by_dispatch`` is the transport-claim provenance of the
+    shared registry consumed key (claimed by ``_process_one``'s idle dispatch,
+    not by an agent read), threaded down from
+    ``_start_server_side_wakeup_turn``. It is recorded on the queued entry
+    BEFORE the retry timer is scheduled, and that ordering is load-bearing: the
+    abort's exception can take longer than the 2s delay to reach the
+    dispatcher's handler, so the timer-fired drain may run first. If that drain
+    finds an untagged entry whose key is set, it reads the dispatch's own claim
+    as an agent read and drops the retry — no timer is left afterwards, so the
+    wakeup is lost (#8363 review, maintainer's stalled-unwind ordering).
     """
     wakeup_prompt = str(wakeup_prompt or "").strip()
     if not wakeup_prompt:
@@ -26896,7 +27129,12 @@ def _rearm_process_wakeup_after_launch_failure(
             except Exception:
                 _process_id = ""
         try:
-            record_deferred_wakeup(sid, _process_id, wakeup_prompt)
+            record_deferred_wakeup(
+                sid,
+                _process_id,
+                wakeup_prompt,
+                consumed_claimed_by_dispatch=consumed_claimed_by_dispatch,
+            )
         except Exception:
             logger.debug(
                 "Failed to record deferred wakeup for session %s", sid, exc_info=True,
@@ -27812,6 +28050,7 @@ def _start_chat_stream_for_session(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    consumed_claimed_by_dispatch: bool = False,
     on_admitted=None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn.
@@ -27828,6 +28067,13 @@ def _start_chat_stream_for_session(
     async-delegation completions share ``source="process_wakeup"`` but own a
     durable retry, so re-arming for them double-delivered one completion
     (#7680 CORE, maintainer 2026-10-01).
+
+    ``consumed_claimed_by_dispatch`` says the shared registry consumed key was
+    claimed by the DISPATCH that started this turn (transport dedupe), not by an
+    agent read. The launch-abort re-arm must record that provenance on the
+    retried entry, otherwise a timer-fired retry drains an untagged entry whose
+    key reads as "already read" and is dropped even though no process read and
+    no accepted turn happened (#8363 review).
     """
     if external_runtime_owned is None:
         external_runtime_owned = webui_gateway_chat_enabled(get_config())
@@ -28132,6 +28378,7 @@ def _start_chat_stream_for_session(
                             wakeup_prompt=msg,
                             process_id=process_id,
                             retry_attempt=retry_attempt,
+                            consumed_claimed_by_dispatch=consumed_claimed_by_dispatch,
                         )
                     raise
                 break
@@ -28307,6 +28554,7 @@ def _start_run(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    consumed_claimed_by_dispatch: bool = False,
     on_admitted=None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
@@ -28321,6 +28569,11 @@ def _start_run(
     ``source`` is the StartRunRequest.source (``"webui"`` for browser POSTs,
     ``"process_wakeup"`` for the drain-thread wakeup). ``route`` is the
     metadata.route label that lands on the run record for observability.
+
+    ``process_id``/``retry_attempt``/``rearm_deferred_wakeup``/
+    ``consumed_claimed_by_dispatch`` are passed through unchanged to the
+    in-process start: they carry the process-wakeup delivery identity and the
+    transport-claim provenance into the launch-abort re-arm (#8363 review).
 
     Returns a dict with ``_status`` plus the legacy chat-start response
     fields (``stream_id``, ``session_id``, etc.). Adapter selection that
@@ -28396,6 +28649,7 @@ def _start_run(
                 process_id=process_id,
                 retry_attempt=retry_attempt,
                 rearm_deferred_wakeup=rearm_deferred_wakeup,
+                consumed_claimed_by_dispatch=consumed_claimed_by_dispatch,
                 on_admitted=on_admitted,
             )
 
@@ -28449,6 +28703,7 @@ def _start_run(
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
+        consumed_claimed_by_dispatch=consumed_claimed_by_dispatch,
         on_admitted=on_admitted,
     )
 
@@ -28512,11 +28767,17 @@ def start_session_turn(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    consumed_claimed_by_dispatch: bool = False,
     on_admitted=None,
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
 
     ``on_admitted`` is forwarded to ``_start_chat_stream_for_session``.
+
+    ``consumed_claimed_by_dispatch`` is forwarded too: the process-completion
+    dispatch claims the shared registry consumed key as a transport dedupe, and
+    a launch-abort re-arm must preserve that provenance so the retry is not
+    dropped as if the agent had read the completion (#8363 review).
 
     Option Z primary wakeup entrypoint. This is the minimal, HTTP-handler-free
     core that ``/api/chat/start`` already reaches via ``_handle_chat_start`` →
@@ -28716,6 +28977,7 @@ def start_session_turn(
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
+        consumed_claimed_by_dispatch=consumed_claimed_by_dispatch,
         on_admitted=on_admitted,
     )
 
@@ -29773,6 +30035,9 @@ def _handle_chat_sync(handler, body):
         old_session_key = os.environ.get("HERMES_SESSION_KEY")
         os.environ["HERMES_EXEC_ASK"] = "1"
         os.environ["HERMES_SESSION_KEY"] = s.session_id
+    # #8517 all-r1 finding 4: the session's profile home is held from agent
+    # construction through the end of run_conversation (closed in ``finally``).
+    _sync_turn_scope = contextlib.ExitStack()
     try:
         AIAgent = require_ai_agent_class()
 
@@ -29884,19 +30149,38 @@ def _handle_chat_sync(handler, body):
             # rotation (agent.session_id advancing to a fresh continuation) is
             # visible to the settle below.
             _sync_session_id = s.session_id
-            agent = AIAgent(
-                model=_model,
-                provider=_provider,
-                base_url=_base_url,
-                api_key=_api_key,
-                # Identify browser-originated sessions as WebUI so Hermes Agent
-                # does not inject CLI-specific terminal/output guidance.
-                platform="webui",
-                quiet_mode=True,
-                enabled_toolsets=_resolve_cli_toolsets(),
+            # #8517: this agent uses memory, so it is built inside the session's own
+            # profile home (fails closed to no memory if that cannot be set). The
+            # agent is not cached, so the cacheable flag is unused.
+            # all-r1 finding 4: the home stays held for the whole synchronous turn,
+            # not just construction. The Agent's providers check the caller's home on
+            # every hook and the built-in MEMORY.md store resolves the home on every
+            # write, so a turn run after the scope is restored follows the shared env
+            # mirror (another profile after a UI switch). If the home cannot be held
+            # for the turn, the agent is built without memory.
+            _sync_profile_home = session_profile_home_or_empty(s)
+            _sync_turn_scope_reason = _sync_turn_scope.enter_context(
+                profile_home_turn_scope(_sync_profile_home)
+            )
+            agent, _ = construct_profile_scoped_agent(
+                AIAgent,
+                dict(
+                    model=_model,
+                    provider=_provider,
+                    base_url=_base_url,
+                    api_key=_api_key,
+                    # Identify browser-originated sessions as WebUI so Hermes Agent
+                    # does not inject CLI-specific terminal/output guidance.
+                    platform="webui",
+                    quiet_mode=True,
+                    enabled_toolsets=_resolve_cli_toolsets(),
+                    session_id=s.session_id,
+                    **_routing_kwargs,
+                    **_agent_bundle_kwargs(AIAgent, _bundle),
+                ),
+                profile_home=_sync_profile_home,
                 session_id=s.session_id,
-                **_routing_kwargs,
-                **_agent_bundle_kwargs(AIAgent, _bundle),
+                fail_closed_reason=_sync_turn_scope_reason,
             )
             from api.streaming import (
                 _WEBUI_PROGRESS_PROMPT,
@@ -30008,6 +30292,8 @@ def _handle_chat_sync(handler, body):
             )
             result = agent.run_conversation(**_sync_run_kwargs)
     finally:
+        # #8517 all-r1 finding 4: the turn is over; release the session's profile home.
+        _sync_turn_scope.close()
         # Same as the streaming worker's teardown: mirror the workspace into the
         # Agent-created state.db row on every exit, including a raised turn.
         try:
@@ -30694,16 +30980,20 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
 
         AIAgent = require_ai_agent_class()
 
-        agent = AIAgent(
-            model=_main_model,
-            provider=_main_provider,
-            base_url=_main_base_url,
-            api_key=_main_api_key,
-            platform="webui",
-            quiet_mode=True,
-            enabled_toolsets=[],
-            session_id=f"git-commit-message-{uuid.uuid4().hex[:8]}",
-            **_agent_bundle_kwargs(AIAgent, _bundle),
+        agent = construct_memoryless_helper_agent(
+            AIAgent,
+            dict(
+                model=_main_model,
+                provider=_main_provider,
+                base_url=_main_base_url,
+                api_key=_main_api_key,
+                platform="webui",
+                quiet_mode=True,
+                enabled_toolsets=[],
+                session_id=f"git-commit-message-{uuid.uuid4().hex[:8]}",
+                **_agent_bundle_kwargs(AIAgent, _bundle),
+            ),
+            purpose="git commit message",
         )
         result = agent.run_conversation(
             user_message=user_prompt,
@@ -32931,18 +33221,25 @@ def _handle_session_compress(handler, body):
         )
         approx_tokens = _estimate_messages_tokens_rough(original_messages)
 
-        agent = AIAgent(
-            model=resolved_model,
-            provider=resolved_provider,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            # Identify browser-originated sessions as WebUI so Hermes Agent
-            # does not inject CLI-specific terminal/output guidance.
-            platform="webui",
-            quiet_mode=True,
-            enabled_toolsets=_resolve_cli_toolsets(),
-            session_id=sid,
-            **_agent_bundle_kwargs(AIAgent, _bundle),
+        # #8517: compression only needs the model. Building it with memory would
+        # re-initialise a shared provider instance for whatever profile the UI is
+        # on now, and this session's next cached turn would write into that bank.
+        agent = construct_memoryless_helper_agent(
+            AIAgent,
+            dict(
+                model=resolved_model,
+                provider=resolved_provider,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                # Identify browser-originated sessions as WebUI so Hermes Agent
+                # does not inject CLI-specific terminal/output guidance.
+                platform="webui",
+                quiet_mode=True,
+                enabled_toolsets=_resolve_cli_toolsets(),
+                session_id=sid,
+                **_agent_bundle_kwargs(AIAgent, _bundle),
+            ),
+            purpose="manual compression",
         )
         compressed = agent.context_compressor.compress(
             original_messages,
@@ -33627,16 +33924,20 @@ def _handle_handoff_summary(handler, body):
                 "fallback": True,
             })
 
-        agent = AIAgent(
-            model=resolved_model,
-            provider=resolved_provider,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            platform="webui",
-            quiet_mode=True,
-            enabled_toolsets=[],
-            session_id=sid,
-            **_agent_bundle_kwargs(AIAgent, _bundle),
+        agent = construct_memoryless_helper_agent(
+            AIAgent,
+            dict(
+                model=resolved_model,
+                provider=resolved_provider,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                platform="webui",
+                quiet_mode=True,
+                enabled_toolsets=[],
+                session_id=sid,
+                **_agent_bundle_kwargs(AIAgent, _bundle),
+            ),
+            purpose="handoff summary",
         )
 
         summary_system_prompt = (
@@ -33770,7 +34071,7 @@ def _handle_skill_save(handler, body):
     if skill_file.is_symlink():
         return bad(handler, "Cannot save to a symlinked skill file")
     skill_file.write_text(body["content"], encoding="utf-8")
-    _SKILLS_STATS_CACHE.clear()
+    invalidate_profile_skills_stats()
     return j(handler, {"ok": True, "name": skill_name, "path": str(skill_file)})
 
 
@@ -33790,7 +34091,7 @@ def _handle_skill_delete(handler, body):
         return bad(handler, "Skill not found", 404)
     skill_dir = matches[0].parent
     shutil.rmtree(str(skill_dir))
-    _SKILLS_STATS_CACHE.clear()
+    invalidate_profile_skills_stats()
     return j(handler, {"ok": True, "name": body["name"]})
 
 
@@ -33865,7 +34166,7 @@ def _handle_skill_toggle(handler, body):
         _save_yaml_config_file(config_path, cfg)
 
     reload_config()  # outside with block — reload_config() acquires the lock itself
-    _SKILLS_STATS_CACHE.clear()
+    invalidate_profile_skills_stats()
     return j(handler, {"ok": True, "name": name, "enabled": enabled})
 
 
