@@ -28151,6 +28151,15 @@ def _start_chat_stream_for_session(
                 return "goal_inactive"
         except Exception:
             return "goal_state_unknown"
+        # A compression can commit between the detached preflight and dispatch:
+        # never write pending state on a sealed parent (browser path: session_rotated).
+        try:
+            from api.compression_continuation import durable_compression_continuation
+
+            if durable_compression_continuation(s)[0]:
+                return "sealed_parent"
+        except Exception:
+            return "lineage_unknown"
         return ""
 
     def consume_continuation_markers() -> None:

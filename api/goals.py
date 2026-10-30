@@ -704,7 +704,8 @@ def _gather_goal_turn_background_state(
             gather_background_processes,
         )
     except Exception:
-        return None, 0
+        # No Agent CLI on this install: the durable state.db count is still authoritative.
+        count_active_delegations = gather_background_processes = None
     context_api = _native_profile_context_api(profile_home) if profile_home else None
     token = None
     if context_api is not None:
@@ -715,14 +716,16 @@ def _gather_goal_turn_background_state(
     try:
         bg_procs = None
         active_deleg = 0
-        try:
-            bg_procs = gather_background_processes(owner_task_id=sid)
-        except Exception:
-            bg_procs = None
-        try:
-            active_deleg = int(count_active_delegations(sid) or 0)
-        except Exception:
-            active_deleg = 0
+        if gather_background_processes is not None:
+            try:
+                bg_procs = gather_background_processes(owner_task_id=sid)
+            except Exception:
+                bg_procs = None
+        if count_active_delegations is not None:
+            try:
+                active_deleg = int(count_active_delegations(sid) or 0)
+            except Exception:
+                active_deleg = 0
         active_deleg = max(active_deleg, _state_db_live_delegations(sid, profile_home))
         return bg_procs, active_deleg
     finally:
@@ -1241,6 +1244,44 @@ def detached_goal_continuation_skip_reason(session_id: str, continuation_id: str
     return ""
 
 
+def retire_continuation_for_sealed_parent(session_id: str) -> None:
+    """Retire a continuation whose session was compressed, and say so.
+
+    The record is dropped (a turn must never start on the sealed parent), but the
+    goal must not stop silently: pause it on the continuation tip with a reason
+    naming the compression and the child, so the status line explains the stop.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    tip = None
+    profile_home = None
+    try:
+        from api.compression_continuation import durable_compression_continuation
+        from api.models import get_session
+        from api.profiles import get_hermes_home_for_profile
+
+        s = get_session(sid)
+        tip = durable_compression_continuation(s)[1]
+        profile_home = get_hermes_home_for_profile(getattr(s, "profile", None) or "default")
+    except Exception:
+        logger.debug("sealed-parent lineage lookup failed for session=%s", sid, exc_info=True)
+    clear_pending_goal_continuation(sid)
+    target = tip or sid
+    try:
+        mgr = _manager(target, profile_home=profile_home)
+        if mgr is not None and mgr.is_active():
+            child = f" Continue in session {tip}." if tip else ""
+            mgr.pause(
+                reason=(
+                    f"session {sid} was compressed; its pending goal continuation was "
+                    f"stopped.{child} Use /goal resume to continue."
+                )
+            )
+    except Exception:
+        logger.warning("could not record stopped goal continuation for session=%s", sid, exc_info=True)
+
+
 def start_detached_goal_continuation(
     session_id: str,
     continuation_prompt: str,
@@ -1269,7 +1310,7 @@ def start_detached_goal_continuation(
                 )
                 if reason == "sealed_parent":
                     # A turn must never start on the compressed parent; retries would loop.
-                    clear_pending_goal_continuation(sid)
+                    retire_continuation_for_sealed_parent(sid)
                 return
             result = start_session_turn(
                 sid, prompt, source="goal_wakeup", goal_continuation_id=cid

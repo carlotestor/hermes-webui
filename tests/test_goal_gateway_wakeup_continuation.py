@@ -1660,3 +1660,58 @@ def test_client_keeps_server_text_when_template_renders_undefined():
     src = (Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text()
     body = src[src.index("function _resolveGoalMessage"):][:700]
     assert "undefined" in body and "return raw" in body
+
+
+@pytest.mark.parametrize("lineage", ["sealed", "raises"])
+def test_goal_wakeup_admission_rejects_parent_compressed_after_preflight(
+    _admission_env, tmp_path, monkeypatch, lineage
+):
+    """A compression committed between preflight and dispatch must not start a turn on the parent."""
+    from api import compression_continuation
+
+    s, _ = _admission_env
+    cid = webui_goals.register_pending_goal_continuation(s.session_id, "continue the goal")
+
+    def _lineage(_s):
+        if lineage == "raises":
+            raise RuntimeError("state.db locked")
+        return True, "tip-sid"
+
+    monkeypatch.setattr(compression_continuation, "durable_compression_continuation", _lineage)
+    resp = _admit(s, tmp_path, cid)
+    assert resp["_status"] == 409
+    assert resp["error"] == "goal_continuation_rejected"
+    assert resp["reason"] == ("sealed_parent" if lineage == "sealed" else "lineage_unknown")
+    assert not getattr(s, "active_stream_id", None)
+    assert not getattr(s, "pending_user_message", None)
+    # Rejected before the token was consumed: the record is untouched.
+    assert webui_goals.peek_pending_goal_continuation_id(s.session_id) == cid
+
+
+def test_sealed_parent_retirement_leaves_visible_stopped_outcome(monkeypatch):
+    """Dropping the parent's record must pause the tip's goal with a reason naming compression + child."""
+    from api import compression_continuation
+
+    s = _sess(session_id="sid-parent")
+    _detached_env(monkeypatch, s)
+    monkeypatch.setattr(
+        compression_continuation, "durable_compression_continuation", lambda _s: (True, "sid-child")
+    )
+    paused = []
+
+    class Mgr:
+        def is_active(self):
+            return True
+
+        def pause(self, reason=""):
+            paused.append(reason)
+
+    managers = []
+    monkeypatch.setattr(
+        webui_goals, "_manager", lambda sid, profile_home=None: managers.append(sid) or Mgr()
+    )
+    webui_goals.retire_continuation_for_sealed_parent(s.session_id)
+    assert not webui_goals.pending_goal_continuation_matches(s.session_id, s.cid)
+    assert managers == ["sid-child"]
+    assert len(paused) == 1
+    assert "compressed" in paused[0] and "sid-parent" in paused[0] and "sid-child" in paused[0]

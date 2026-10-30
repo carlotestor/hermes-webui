@@ -59,3 +59,14 @@ def test_evaluate_goal_after_turn_holds_with_live_delegation(tmp_path, monkeypat
     assert seen and seen[0] >= 1
     assert out["verdict"] == "wait"
     assert out["should_continue"] is False
+
+
+def test_gather_background_state_falls_through_to_state_db_without_agent_cli(tmp_path, monkeypatch):
+    """No importable hermes_cli.goals must not hide delegations recorded in state.db."""
+    import sys
+
+    _db(tmp_path, [("d1", "k", "sid", "sid", "running")])
+    monkeypatch.setitem(sys.modules, "hermes_cli.goals", None)  # forces ImportError
+    bg, active = goals._gather_goal_turn_background_state("sid", profile_home=tmp_path)
+    assert bg is None
+    assert active == 1
